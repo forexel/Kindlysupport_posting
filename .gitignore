@@ -1,0 +1,27 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# SQLite database
+kindlysupport.db
+
+# macOS
+.DS_Store
+
+# Docker
+docker-compose.override.yml
+
+# IDEs
+.vscode/

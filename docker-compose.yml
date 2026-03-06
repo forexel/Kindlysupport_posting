@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kindlysupport_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-kindlysupport}
+      POSTGRES_USER: ${POSTGRES_USER:-kindly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kindlypass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kindly} -d ${POSTGRES_DB:-kindlysupport}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Host port is intentionally not published to avoid conflicts with other local Postgres instances.
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kindlysupport_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kindly}:${POSTGRES_PASSWORD:-kindlypass}@postgres:5432/${POSTGRES_DB:-kindlysupport}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:
