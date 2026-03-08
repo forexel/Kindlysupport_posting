@@ -8,6 +8,7 @@ import { RadioGroup, RadioGroupItem } from '../components/ui/radio-group';
 import { Progress } from '../components/ui/progress';
 import { Input } from '../components/ui/input';
 import { Card } from '../components/ui/card';
+import { Checkbox } from '../components/ui/checkbox';
 import { ArrowLeft, Upload, FileText, Image, Loader2, Check, X, Edit2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { api, toDataUrl } from '../lib/api';
@@ -18,6 +19,7 @@ interface OCRResult {
   fileName: string;
   status: 'processing' | 'completed' | 'error';
   editable: boolean;
+  selected: boolean;
   error?: string;
 }
 
@@ -53,6 +55,7 @@ export function PhrasesImportPage() {
       fileName: file.name,
       status: 'processing',
       editable: false,
+      selected: false,
     }));
     setFiles((prev) => [...prev, ...initial]);
 
@@ -70,6 +73,7 @@ export function PhrasesImportPage() {
             status: 'completed',
             text: (item.phrase || '').trim(),
             editable: false,
+            selected: Boolean((item.phrase || '').trim()),
           };
         })
       );
@@ -89,9 +93,14 @@ export function PhrasesImportPage() {
   const handleEditPhrase = (id: string, newText: string) => setFiles(files.map((f) => (f.id === id ? { ...f, text: newText } : f)));
   const handleToggleEdit = (id: string) => setFiles(files.map((f) => (f.id === id ? { ...f, editable: !f.editable } : f)));
   const handleRemoveFile = (id: string) => setFiles(files.filter((f) => f.id !== id));
+  const handleToggleSelected = (id: string, checked: boolean) => setFiles(files.map((f) => (f.id === id ? { ...f, selected: checked } : f)));
+  const handleSelectAllCompleted = (checked: boolean) =>
+    setFiles(files.map((f) => (f.status === 'completed' && f.text.trim() ? { ...f, selected: checked } : f)));
 
   const handleAcceptAll = async () => {
-    const phrases = files.filter((f) => f.status === 'completed' && f.text.trim()).map((f) => f.text.trim());
+    const phrases = files
+      .filter((f) => f.status === 'completed' && f.selected && f.text.trim())
+      .map((f) => f.text.trim());
     if (!phrases.length) return toast.error('Нет распознанных фраз');
     try {
       const res = await api<{ parsed: number; inserted: number; updated: number }>('/api/phrases/import-text', 'POST', {
@@ -108,6 +117,7 @@ export function PhrasesImportPage() {
   const linesCount = textInput.split('\n').filter((line) => line.trim()).length;
   const processedCount = files.filter((f) => f.status === 'completed').length;
   const totalCount = files.length;
+  const selectedCount = files.filter((f) => f.status === 'completed' && f.selected && f.text.trim()).length;
 
   return (
     <div className="space-y-6">
@@ -163,10 +173,12 @@ export function PhrasesImportPage() {
             {files.length > 0 && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
-                  <p className="text-sm text-zinc-300">Распознано {processedCount} из {totalCount}</p>
+                  <p className="text-sm text-zinc-300">Распознано {processedCount} из {totalCount} • Выбрано {selectedCount}</p>
                   <div className="flex gap-2">
+                    <Button size="sm" variant="outline" onClick={() => handleSelectAllCompleted(true)} className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700">Отметить все</Button>
+                    <Button size="sm" variant="outline" onClick={() => handleSelectAllCompleted(false)} className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700">Снять все</Button>
                     <Button size="sm" variant="outline" onClick={() => setFiles([])} className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700">Отменить</Button>
-                    <Button size="sm" onClick={handleAcceptAll} disabled={processedCount === 0} className="bg-green-600 hover:bg-green-700 text-white"><Check className="mr-2 h-4 w-4" />Принять все</Button>
+                    <Button size="sm" onClick={handleAcceptAll} disabled={selectedCount === 0} className="bg-green-600 hover:bg-green-700 text-white"><Check className="mr-2 h-4 w-4" />Принять все</Button>
                   </div>
                 </div>
 
@@ -177,6 +189,13 @@ export function PhrasesImportPage() {
                     <div key={file.id} className="bg-zinc-800 border border-zinc-700 rounded-lg p-4 space-y-2">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
+                          {file.status === 'completed' && (
+                            <Checkbox
+                              checked={file.selected}
+                              onCheckedChange={(checked) => handleToggleSelected(file.id, Boolean(checked))}
+                              className="border-zinc-600"
+                            />
+                          )}
                           {file.status === 'processing' && <Loader2 className="h-4 w-4 text-blue-400 animate-spin" />}
                           {file.status === 'completed' && <Check className="h-4 w-4 text-green-400" />}
                           {file.status === 'error' && <X className="h-4 w-4 text-red-400" />}
