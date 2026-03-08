@@ -1050,6 +1050,31 @@ def openrouter_extract_text_from_image(image_url: str) -> str:
     return (res.get("choices") or [{}])[0].get("message", {}).get("content", "")
 
 
+def openrouter_extract_main_quote_from_image(image_url: str) -> str:
+    res = openrouter_chat(
+        runtime_openrouter_vision_model(),
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Найди на изображении ОСНОВНУЮ мотивирующую фразу/цитату.\n"
+                            "Обычно это крупный текст по центру экрана.\n"
+                            "Игнорируй: время, дату, шапку приложения, имя пользователя, кнопки, иконки, подписи типа 'Подробнее'.\n"
+                            "Верни только саму цитату одной строкой без markdown и пояснений.\n"
+                            "Если цитаты нет — верни пустую строку."
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+    )
+    return (res.get("choices") or [{}])[0].get("message", {}).get("content", "")
+
+
 def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024") -> dict[str, Any]:
     started = time.time()
     model = runtime_openrouter_image_model()
@@ -1123,7 +1148,8 @@ def extract_from_url(url: str) -> tuple[str, str]:
     if lower.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF не поддерживается. Только ссылка на HTML или картинку.")
     if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        return "url_image", openrouter_extract_text_from_image(url)
+        ocr_text, _ = extract_phrases_from_image(url)
+        return "url_image", ocr_text
     # MVP stub for HTML extraction. Replace with readability parser later.
     return "url_html", f"Текст, извлечённый из HTML-ссылки (заглушка)\nИсточник: {url}"
 
@@ -1148,7 +1174,14 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
         r"^text\b[:：]?\s*$",
         r"^answer\b[:：]?\s*$",
         r"^поделиться$",
+        r"^подробнее$",
+        r"^узнать больше$",
         r"^вопрос сессии$",
+        r"^ежедневное вдохновение$",
+        r"^привет[, ]",
+        r"^\d{1,2}:\d{2}$",
+        r"^\d{1,2}$",
+        r"^\d{1,2}\s+[а-я]{3,}\.?\s*\d{4}\s*г?\.?$",
     ]
 
     cleaned_lines: list[str] = []
@@ -1195,13 +1228,44 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
         # Drop leftovers if response is still meta text.
         if "extracted text" in low or "visible text" in low:
             continue
-        if low in {"поделиться", "вопрос сессии"}:
+        if low in {"поделиться", "подробнее", "узнать больше", "вопрос сессии", "ежедневное вдохновение"}:
             continue
         if c.endswith(":"):
             continue
         seen.add(low)
         phrases.append(c)
     return phrases
+
+
+def looks_like_noise_phrase(text: str) -> bool:
+    s = (text or "").strip().lower()
+    if not s:
+        return True
+    noise_patterns = [
+        r"^ежедневное вдохновение$",
+        r"^привет[, ]",
+        r"^\d{1,2}:\d{2}$",
+        r"^подробнее$",
+        r"^узнать больше$",
+        r"^\d{1,2}$",
+        r"^\d{1,2}\s+[а-я]{3,}\.?\s*\d{4}\s*г?\.?$",
+    ]
+    return any(re.match(p, s) for p in noise_patterns)
+
+
+def extract_phrases_from_image(image_url: str) -> tuple[str, list[str]]:
+    primary_text = openrouter_extract_text_from_image(image_url)
+    primary_phrases = [p for p in extract_phrases_from_ocr_text(primary_text) if not looks_like_noise_phrase(p)]
+
+    # Fallback to central-quote extraction if primary result is empty/noisy.
+    if primary_phrases:
+        return primary_text, primary_phrases
+
+    fallback_text = openrouter_extract_main_quote_from_image(image_url)
+    fallback_phrases = [p for p in extract_phrases_from_ocr_text(fallback_text) if not looks_like_noise_phrase(p)]
+    if fallback_phrases:
+        return fallback_text, fallback_phrases
+    return primary_text, []
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -2305,8 +2369,7 @@ async def import_phrases_image_url(request: Request, session_id: Optional[str] =
     ensure_auth(session_id)
     payload = await request.json()
     image_url = validate_public_http_url(payload.get("image_url") or "")
-    ocr_text = openrouter_extract_text_from_image(image_url)
-    phrases = extract_phrases_from_ocr_text(ocr_text)
+    ocr_text, phrases = extract_phrases_from_image(image_url)
     return {"ok": True, "image_url": image_url, "ocr_text": ocr_text, "phrases": phrases}
 
 
@@ -2317,8 +2380,7 @@ async def ocr_phrase_image_base64(request: Request, session_id: Optional[str] = 
     image_data_url = (payload.get("image_data_url") or "").strip()
     if not image_data_url.startswith("data:image/"):
         raise HTTPException(status_code=400, detail="image_data_url must be a data:image/* base64 URL")
-    ocr_text = openrouter_extract_text_from_image(image_data_url)
-    phrases = extract_phrases_from_ocr_text(ocr_text)
+    ocr_text, phrases = extract_phrases_from_image(image_data_url)
     return {"ok": True, "ocr_text": ocr_text, "phrases": phrases}
 
 
@@ -2340,8 +2402,7 @@ async def ocr_phrase_images_base64(request: Request, session_id: Optional[str] =
             items.append({"name": name, "ok": False, "error": "invalid image_data_url"})
             continue
         try:
-            ocr_text = openrouter_extract_text_from_image(data_url)
-            phrases = extract_phrases_from_ocr_text(ocr_text)
+            ocr_text, phrases = extract_phrases_from_image(data_url)
             items.append(
                 {
                     "name": name,
@@ -2366,8 +2427,7 @@ async def import_phrase_image_base64(request: Request, session_id: Optional[str]
     if not image_data_url.startswith("data:image/"):
         raise HTTPException(status_code=400, detail="image_data_url must be a data:image/* base64 URL")
     is_published = int(payload.get("is_published", 0) or 0)
-    ocr_text = openrouter_extract_text_from_image(image_data_url)
-    phrases = extract_phrases_from_ocr_text(ocr_text)
+    ocr_text, phrases = extract_phrases_from_image(image_data_url)
     raw_text = "\n".join(phrases)
     res = await import_phrases_text(_mock_request({"raw_text": raw_text, "is_published": is_published}), session_id=session_id)  # type: ignore[arg-type]
     return {"ok": True, "ocr_text": ocr_text, "phrases": phrases, **res}
@@ -2661,8 +2721,7 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
                 return {"ok": True}
             try:
                 data_url = telegram_file_data_url(file_id)
-                ocr_text = openrouter_extract_text_from_image(data_url)
-                phrases = extract_phrases_from_ocr_text(ocr_text)
+                ocr_text, phrases = extract_phrases_from_image(data_url)
                 phrase_text = (phrases[0] if phrases else "").strip()
                 if not phrase_text:
                     send_telegram_text(chat.get("id"), "Не удалось распознать фразу. Отправь другую картинку.")
