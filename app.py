@@ -1,21 +1,31 @@
 import json
+import logging
 import os
 import secrets
 import sqlite3
 import time
+import ipaddress
 import base64
-import io
 import urllib.parse
 import urllib.error
 import urllib.request
+import csv
+import io
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from threading import Thread
 from typing import Any, Optional
+from uuid import uuid4
+from pathlib import Path
 
-from fastapi import Cookie, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from PIL import Image
+from fastapi import Cookie, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -28,10 +38,52 @@ DB_PATH = os.getenv("APP_DB_PATH", "kindlysupport.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_BACKEND = "postgres" if DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite"
 UTC = timezone.utc
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("kindlysupport")
 
 
 def now_iso() -> str:
     return datetime.now(tz=UTC).isoformat()
+
+
+def now_msk() -> datetime:
+    return datetime.now(tz=MOSCOW_TZ)
+
+
+def parse_to_utc_iso(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="scheduled_for required")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="scheduled_for must be ISO datetime, e.g. 2026-03-08T10:00:00+03:00")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=MOSCOW_TZ)
+    return dt.astimezone(UTC).isoformat()
+
+
+def validate_public_http_url(value: str) -> str:
+    raw = (value or "").strip()
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Only public http/https URLs are allowed")
+    host = (parsed.hostname or "").strip().lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        raise HTTPException(status_code=400, detail="localhost URLs are not allowed")
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+            raise HTTPException(status_code=400, detail="Private IP URLs are not allowed")
+    except ValueError:
+        pass
+    return raw
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -52,12 +104,8 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me").strip()
 SESSION_COOKIE = "session_id"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_TEXT_MODEL = os.getenv("OPENROUTER_TEXT_MODEL", "openai/gpt-4o-mini").strip()
-OPENROUTER_OCR_MODEL = os.getenv("OPENROUTER_OCR_MODEL", "openai/gpt-4.1-mini").strip()
-OPENROUTER_PROMPT_MODEL = os.getenv("OPENROUTER_PROMPT_MODEL", "openai/gpt-4o-mini").strip()
-OPENROUTER_IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "black-forest-labs/flux.2-pro").strip()
-IMAGE_WORK_SIZE = os.getenv("IMAGE_WORK_SIZE", "1536x1024").strip()
-IMAGE_FINAL_SIZE = int(os.getenv("IMAGE_FINAL_SIZE", "1024").strip() or "1024")
-MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "generated_media")).resolve()
+OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "meta-llama/llama-4-scout").strip()
+OPENROUTER_IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "openai/gpt-5-image-mini").strip()
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "http://localhost:8000").strip()
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "KindlySupport Posting").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -65,6 +113,9 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 TELEGRAM_PREVIEW_CHAT = os.getenv("TELEGRAM_PREVIEW_CHAT", "@Yudin_Finance").strip()
 TELEGRAM_PUBLISH_CHAT = os.getenv("TELEGRAM_PUBLISH_CHAT", "-1002383010494").strip()
 TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "@ForCreatingTestsBot").strip()
+VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "").strip()
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
+VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
 INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v22.0").strip()
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
 INSTAGRAM_IG_USER_ID = os.getenv("INSTAGRAM_IG_USER_ID", "").strip()
@@ -72,6 +123,20 @@ PINTEREST_ACCESS_TOKEN = os.getenv("PINTEREST_ACCESS_TOKEN", "").strip()
 PINTEREST_BOARD_ID = os.getenv("PINTEREST_BOARD_ID", "").strip()
 ENABLE_INSTAGRAM = os.getenv("ENABLE_INSTAGRAM", "0").strip() in {"1", "true", "yes"}
 ENABLE_PINTEREST = os.getenv("ENABLE_PINTEREST", "0").strip() in {"1", "true", "yes"}
+ENABLE_VK = os.getenv("ENABLE_VK", "0").strip() in {"1", "true", "yes"}
+SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Moscow").strip()
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").strip()
+APP_SECURE_COOKIES = os.getenv("APP_SECURE_COOKIES", "0").strip() in {"1", "true", "yes"}
+TRUSTED_HOSTS = [x.strip() for x in os.getenv("TRUSTED_HOSTS", "localhost,127.0.0.1").split(",") if x.strip()]
+CORS_ALLOW_ORIGINS = [x.strip() for x in os.getenv("CORS_ALLOW_ORIGINS", APP_BASE_URL).split(",") if x.strip()]
+ENABLE_DAILY_AUTOPREVIEW = os.getenv("ENABLE_DAILY_AUTOPREVIEW", "1").strip() in {"1", "true", "yes"}
+DAILY_AUTOPREVIEW_HOUR_MSK = int(os.getenv("DAILY_AUTOPREVIEW_HOUR_MSK", "9"))
+DAILY_AUTOPREVIEW_MINUTE_MSK = int(os.getenv("DAILY_AUTOPREVIEW_MINUTE_MSK", "0"))
+TELEGRAM_MODE = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()
+FRONTEND_DIST_DIR = Path(os.getenv("FRONTEND_DIST_DIR", "Content Platform Web App/dist")).resolve()
+
+rate_bucket: dict[str, list[float]] = {}
 
 
 class DBCursorProxy:
@@ -162,6 +227,7 @@ def init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
+                    csrf_token TEXT,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
@@ -216,10 +282,26 @@ def init_db() -> None:
                 CREATE TABLE IF NOT EXISTS phrases (
                     id BIGSERIAL PRIMARY KEY,
                     text_body TEXT NOT NULL UNIQUE,
+                    topic TEXT,
                     is_published INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS films (
+                    id BIGSERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    year INTEGER,
+                    country TEXT,
+                    description TEXT,
+                    tags TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_posts_status_updated ON posts(status, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_posts_scheduled_for ON posts(scheduled_for);
+                CREATE INDEX IF NOT EXISTS idx_phrases_published_id ON phrases(is_published, id);
+                CREATE INDEX IF NOT EXISTS idx_image_logs_post_created ON image_generation_logs(post_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_films_title ON films(title);
                 """
             )
         else:
@@ -227,6 +309,7 @@ def init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
+                    csrf_token TEXT,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
@@ -282,21 +365,55 @@ def init_db() -> None:
                 CREATE TABLE IF NOT EXISTS phrases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     text_body TEXT NOT NULL UNIQUE,
+                    topic TEXT,
                     is_published INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS films (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    year INTEGER,
+                    country TEXT,
+                    description TEXT,
+                    tags TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_posts_status_updated ON posts(status, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_posts_scheduled_for ON posts(scheduled_for);
+                CREATE INDEX IF NOT EXISTS idx_phrases_published_id ON phrases(is_published, id);
+                CREATE INDEX IF NOT EXISTS idx_image_logs_post_created ON image_generation_logs(post_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_films_title ON films(title);
                 """
             )
             # lightweight migration for older sqlite db
             for col_def in (
                 "preview_message_id TEXT",
                 "published_message_id TEXT",
+                "csrf_token TEXT",
             ):
                 try:
-                    conn.execute(f"ALTER TABLE posts ADD COLUMN {col_def}")
+                    if "token" in col_def:
+                        conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_def}")
+                    else:
+                        conn.execute(f"ALTER TABLE posts ADD COLUMN {col_def}")
                 except Exception:
                     pass
+        if DB_BACKEND == "postgres":
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN csrf_token TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE phrases ADD COLUMN topic TEXT")
+            except Exception:
+                pass
+        else:
+            try:
+                conn.execute("ALTER TABLE phrases ADD COLUMN topic TEXT")
+            except Exception:
+                pass
 
 
 def ensure_auth(session_id: Optional[str]) -> None:
@@ -333,6 +450,103 @@ def kv_set(key: str, value: str) -> None:
                 "INSERT INTO app_kv(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 (key, value, now_iso()),
             )
+
+
+def settings_key(name: str) -> str:
+    return f"setting:{name}"
+
+
+def setting_get(name: str, default: str = "") -> str:
+    value = kv_get(settings_key(name))
+    if value is None:
+        return default
+    return value
+
+
+def setting_set(name: str, value: str) -> None:
+    kv_set(settings_key(name), value or "")
+
+
+def bool_from_str(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_openrouter_key() -> str:
+    return setting_get("openrouter_api_key", OPENROUTER_API_KEY)
+
+
+def runtime_openrouter_text_model() -> str:
+    return setting_get("openrouter_text_model", OPENROUTER_TEXT_MODEL)
+
+
+def runtime_openrouter_vision_model() -> str:
+    return setting_get("openrouter_vision_model", OPENROUTER_VISION_MODEL)
+
+
+def runtime_openrouter_image_model() -> str:
+    return setting_get("openrouter_image_model", OPENROUTER_IMAGE_MODEL)
+
+
+def runtime_telegram_token() -> str:
+    return setting_get("telegram_bot_token", TELEGRAM_BOT_TOKEN)
+
+
+def runtime_telegram_preview_chat() -> str:
+    return setting_get("telegram_preview_chat", TELEGRAM_PREVIEW_CHAT)
+
+
+def runtime_telegram_publish_chat() -> str:
+    return setting_get("telegram_publish_chat", TELEGRAM_PUBLISH_CHAT)
+
+
+def runtime_telegram_webhook_secret() -> str:
+    return setting_get("telegram_webhook_secret", TELEGRAM_WEBHOOK_SECRET)
+
+
+def runtime_instagram_token() -> str:
+    return setting_get("instagram_access_token", INSTAGRAM_ACCESS_TOKEN)
+
+
+def runtime_instagram_user_id() -> str:
+    return setting_get("instagram_ig_user_id", INSTAGRAM_IG_USER_ID)
+
+
+def runtime_instagram_graph_version() -> str:
+    return setting_get("instagram_graph_version", INSTAGRAM_GRAPH_VERSION)
+
+
+def runtime_pinterest_token() -> str:
+    return setting_get("pinterest_access_token", PINTEREST_ACCESS_TOKEN)
+
+
+def runtime_pinterest_board_id() -> str:
+    return setting_get("pinterest_board_id", PINTEREST_BOARD_ID)
+
+
+def runtime_vk_token() -> str:
+    return setting_get("vk_access_token", VK_ACCESS_TOKEN)
+
+
+def runtime_vk_group_id() -> str:
+    return setting_get("vk_group_id", VK_GROUP_ID)
+
+
+def runtime_vk_version() -> str:
+    return setting_get("vk_api_version", VK_API_VERSION)
+
+
+def runtime_enable_instagram() -> bool:
+    return bool_from_str(setting_get("enable_instagram", "1" if ENABLE_INSTAGRAM else "0"))
+
+
+def runtime_enable_pinterest() -> bool:
+    return bool_from_str(setting_get("enable_pinterest", "1" if ENABLE_PINTEREST else "0"))
+
+
+def runtime_enable_vk() -> bool:
+    return bool_from_str(setting_get("enable_vk", "1" if ENABLE_VK else "0"))
 
 
 def tg_admin_user_id() -> Optional[int]:
@@ -377,6 +591,49 @@ def tg_state_get(user_id: int) -> Optional[dict[str, Any]]:
 def tg_state_clear(user_id: int) -> None:
     with db() as conn:
         conn.execute("DELETE FROM telegram_user_states WHERE user_id = ?", (user_id,))
+
+
+def upsert_phrase_text(text: str, is_published: int = 0) -> dict[str, Any]:
+    phrase = (text or "").strip()
+    if not phrase:
+        raise HTTPException(status_code=400, detail="empty phrase")
+    now = now_iso()
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id, text_body, topic, is_published, created_at, updated_at FROM phrases WHERE text_body = ?",
+            (phrase,),
+        ).fetchone()
+        if existing:
+            if int(existing["is_published"]) != int(is_published):
+                conn.execute(
+                    "UPDATE phrases SET is_published = ?, updated_at = ? WHERE id = ?",
+                    (int(is_published), now, existing["id"]),
+                )
+            row = conn.execute(
+                "SELECT id, text_body, topic, is_published, created_at, updated_at FROM phrases WHERE id = ?",
+                (existing["id"],),
+            ).fetchone()
+            return dict(row)
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO phrases(text_body, topic, is_published, created_at, updated_at)
+                VALUES (?, NULL, ?, ?, ?)
+                RETURNING id, text_body, topic, is_published, created_at, updated_at
+                """,
+                (phrase, int(is_published), now, now),
+            ).fetchone()
+            return dict(row)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO phrases(text_body, topic, is_published, created_at, updated_at) VALUES (?, NULL, ?, ?, ?)",
+            (phrase, int(is_published), now, now),
+        )
+        phrase_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT id, text_body, topic, is_published, created_at, updated_at FROM phrases WHERE id = ?",
+            (phrase_id,),
+        ).fetchone()
+        return dict(row)
 
 
 def row_to_post(row: Any) -> dict[str, Any]:
@@ -428,7 +685,8 @@ def http_json(
     url: str,
     payload: Optional[dict[str, Any]] = None,
     headers: Optional[dict[str, str]] = None,
-    timeout: int = 60,
+    timeout: int = 30,
+    retries: int = 2,
 ) -> dict[str, Any]:
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method.upper())
@@ -436,24 +694,34 @@ def http_json(
         req.add_header(k, v)
     if body is not None and "Content-Type" not in (headers or {}):
         req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="ignore")
-        raise HTTPException(status_code=502, detail=f"HTTP {e.code}: {detail[:1200]}")
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="ignore")
+            if e.code in {429, 500, 502, 503, 504} and attempt < retries:
+                time.sleep(0.35 * (attempt + 1))
+                continue
+            raise HTTPException(status_code=502, detail=f"HTTP {e.code}: {detail[:1200]}")
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(0.35 * (attempt + 1))
+                continue
+            raise HTTPException(status_code=502, detail=f"HTTP request failed: {str(e)[:800]}")
 
 
 def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if not TELEGRAM_BOT_TOKEN:
+    tg_token = runtime_telegram_token()
+    if not tg_token:
         raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN not set")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    url = f"https://api.telegram.org/bot{tg_token}/{method}"
     return http_json("POST", url, payload)
 
 
 def answer_callback(callback_query_id: str, text: str = "") -> None:
-    if not TELEGRAM_BOT_TOKEN:
+    if not runtime_telegram_token():
         return
     try:
         telegram_api("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text[:200]})
@@ -480,10 +748,42 @@ def build_preview_keyboard(post_id: int) -> dict[str, Any]:
     )
 
 
+def build_manual_create_keyboard() -> dict[str, Any]:
+    return tg_keyboard(
+        [
+            [("Сгенерить пост вручную", "ks:manual:0")],
+            [("Добавить фразы", "ks:addphrases:0")],
+        ]
+    )
+
+
+def telegram_file_data_url(file_id: str) -> str:
+    tg_token = runtime_telegram_token()
+    if not tg_token:
+        raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN not set")
+    file_meta = telegram_api("getFile", {"file_id": file_id})
+    file_path = ((file_meta.get("result") or {}).get("file_path") or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=502, detail="Telegram getFile: empty file_path")
+    file_url = f"https://api.telegram.org/file/bot{tg_token}/{file_path}"
+    with urllib.request.urlopen(file_url, timeout=30) as resp:
+        content = resp.read()
+    ext = (file_path.rsplit(".", 1)[-1] if "." in file_path else "jpg").lower()
+    mime = "image/jpeg"
+    if ext == "png":
+        mime = "image/png"
+    elif ext == "webp":
+        mime = "image/webp"
+    elif ext in {"jpg", "jpeg"}:
+        mime = "image/jpeg"
+    b64 = base64.b64encode(content).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
-    if not TELEGRAM_BOT_TOKEN:
+    if not runtime_telegram_token():
         return None
-    chat_id = TELEGRAM_PREVIEW_CHAT
+    chat_id = runtime_telegram_preview_chat()
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
     keyboard = build_preview_keyboard(int(post["id"]))
     if post.get("final_image_url"):
@@ -503,9 +803,9 @@ def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
 
 
 def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
-    if not TELEGRAM_BOT_TOKEN:
+    if not runtime_telegram_token():
         return None
-    chat_id = TELEGRAM_PUBLISH_CHAT
+    chat_id = runtime_telegram_publish_chat()
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
     if post.get("final_image_url"):
         return telegram_api(
@@ -516,7 +816,7 @@ def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
 
 
 def send_telegram_text(chat_id: str | int, text: str, reply_markup: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
-    if not TELEGRAM_BOT_TOKEN:
+    if not runtime_telegram_token():
         return None
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -525,18 +825,21 @@ def send_telegram_text(chat_id: str | int, text: str, reply_markup: Optional[dic
 
 
 def instagram_publish_post(post: dict[str, Any]) -> dict[str, Any]:
-    if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_IG_USER_ID:
+    instagram_token = runtime_instagram_token()
+    instagram_user_id = runtime_instagram_user_id()
+    graph_version = runtime_instagram_graph_version()
+    if not instagram_token or not instagram_user_id:
         raise HTTPException(status_code=400, detail="Instagram credentials not configured")
     if not post.get("final_image_url"):
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
-    base = f"https://graph.facebook.com/{INSTAGRAM_GRAPH_VERSION}/{INSTAGRAM_IG_USER_ID}"
+    base = f"https://graph.facebook.com/{graph_version}/{instagram_user_id}"
     create = http_json(
         "POST",
         f"{base}/media",
         {
             "image_url": post["final_image_url"],
             "caption": (post.get("telegram_caption") or "")[:2200],
-            "access_token": INSTAGRAM_ACCESS_TOKEN,
+            "access_token": instagram_token,
         },
     )
     creation_id = create.get("id")
@@ -545,20 +848,22 @@ def instagram_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     publish = http_json(
         "POST",
         f"{base}/media_publish",
-        {"creation_id": creation_id, "access_token": INSTAGRAM_ACCESS_TOKEN},
+        {"creation_id": creation_id, "access_token": instagram_token},
     )
     return {"create": create, "publish": publish}
 
 
 def pinterest_publish_post(post: dict[str, Any]) -> dict[str, Any]:
-    if not ENABLE_PINTEREST:
+    if not runtime_enable_pinterest():
         raise HTTPException(status_code=503, detail="Pinterest publishing temporarily disabled")
-    if not PINTEREST_ACCESS_TOKEN or not PINTEREST_BOARD_ID:
+    pinterest_token = runtime_pinterest_token()
+    pinterest_board_id = runtime_pinterest_board_id()
+    if not pinterest_token or not pinterest_board_id:
         raise HTTPException(status_code=400, detail="Pinterest credentials not configured")
     if not post.get("final_image_url"):
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     payload = {
-        "board_id": PINTEREST_BOARD_ID,
+        "board_id": pinterest_board_id,
         "title": post["title"][:100],
         "description": (post.get("telegram_caption") or "")[:500],
         "link": post.get("source_url") or OPENROUTER_SITE_URL,
@@ -571,9 +876,35 @@ def pinterest_publish_post(post: dict[str, Any]) -> dict[str, Any]:
         "POST",
         "https://api.pinterest.com/v5/pins",
         payload,
-        headers={"Authorization": f"Bearer {PINTEREST_ACCESS_TOKEN}"},
+        headers={"Authorization": f"Bearer {pinterest_token}"},
     )
     return res
+
+
+def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
+    if not runtime_enable_vk():
+        raise HTTPException(status_code=503, detail="VK publishing temporarily disabled")
+    vk_token = runtime_vk_token()
+    vk_group_id = runtime_vk_group_id()
+    vk_version = runtime_vk_version()
+    if not vk_token or not vk_group_id:
+        raise HTTPException(status_code=400, detail="VK credentials not configured")
+    if not post.get("final_image_url"):
+        raise HTTPException(status_code=400, detail="Post has no final_image_url")
+    caption = (post.get("telegram_caption") or generate_post_caption(post))[:3500]
+    wall_post = http_json(
+        "POST",
+        "https://api.vk.com/method/wall.post",
+        {
+            "owner_id": f"-{vk_group_id}",
+            "from_group": 1,
+            "message": caption,
+            "attachments": post["final_image_url"],
+            "v": vk_version,
+            "access_token": vk_token,
+        },
+    )
+    return wall_post
 
 
 def generate_caption(title: str, text_body: str) -> str:
@@ -628,34 +959,6 @@ def default_image_prompt(title: str, scenario: str, extra_instruction: str = "")
     return prompt
 
 
-def llm_image_prompt(title: str, text_body: str, scenario: str, extra_instruction: str = "") -> str:
-    prompt = (
-        "You are preparing a production image-generation prompt for Flux.2 Pro. "
-        "Return only the final prompt text, no markdown, no explanations.\\n\\n"
-        f"Post title: {title}\\n"
-        f"Post body (context): {text_body[:2500]}\\n"
-        f"Visual scenario: {scenario}\\n"
-        f"Editor note: {extra_instruction or 'none'}\\n\\n"
-        "Requirements:\\n"
-        "- Cinematic photorealistic style, natural lighting, rich realistic textures.\\n"
-        "- Absolutely no text, letters, symbols, watermark, logo, UI, signature.\\n"
-        "- No people, no hands, no fingers, no faces.\\n"
-        "- Strong center-safe composition for future square crop 1024x1024.\\n"
-        "- Image should work as a calm inspirational background for Russian quote overlay.\\n"
-    )
-    raw = openrouter_chat(OPENROUTER_PROMPT_MODEL, [{"role": "user", "content": prompt}])
-    return ((raw.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
-
-
-def generate_post_text_from_phrase(phrase: str) -> str:
-    prompt = (
-        "Write a Russian inspirational post based on the phrase. "
-        "Output exactly 2 paragraphs, each 3-5 sentences. "
-        "No emojis, no hashtags, no markdown.\\n\\n"
-        f"Phrase: {phrase}"
-    )
-    raw = openrouter_chat(OPENROUTER_TEXT_MODEL, [{"role": "user", "content": prompt}])
-    return ((raw.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
 def estimate_cost_usd(model: str, usage: dict[str, Any]) -> Optional[float]:
     input_t = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
     output_t = usage.get("output_tokens") or usage.get("completion_tokens") or 0
@@ -675,7 +978,8 @@ def estimate_cost_usd(model: str, usage: dict[str, Any]) -> Optional[float]:
 
 
 def openrouter_chat(model: str, messages: list[dict[str, Any]], extra_body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    if not OPENROUTER_API_KEY:
+    api_key = runtime_openrouter_key()
+    if not api_key:
         raise HTTPException(status_code=400, detail="OPENROUTER_API_KEY not set")
     body = {
         "model": model,
@@ -688,26 +992,34 @@ def openrouter_chat(model: str, messages: list[dict[str, Any]], extra_body: Opti
         "https://openrouter.ai/api/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": OPENROUTER_SITE_URL,
             "X-Title": OPENROUTER_APP_NAME,
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="ignore")
-        raise HTTPException(status_code=502, detail=f"OpenRouter HTTPError: {detail[:1000]}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OpenRouter error: {e}")
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="ignore")
+            if e.code in {429, 500, 502, 503, 504} and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise HTTPException(status_code=502, detail=f"OpenRouter HTTP {e.code}: {detail[:800]}")
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise HTTPException(status_code=502, detail=f"OpenRouter network error: {str(e)[:600]}")
+    raise HTTPException(status_code=502, detail="OpenRouter request failed")
 
 
 def openrouter_generate_text(prompt: str) -> str:
     res = openrouter_chat(
-        OPENROUTER_TEXT_MODEL,
+        runtime_openrouter_text_model(),
         [{"role": "user", "content": prompt}],
     )
     return (res.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -715,7 +1027,7 @@ def openrouter_generate_text(prompt: str) -> str:
 
 def openrouter_extract_text_from_image(image_url: str) -> str:
     res = openrouter_chat(
-        OPENROUTER_OCR_MODEL,
+        runtime_openrouter_vision_model(),
         [
             {
                 "role": "user",
@@ -731,63 +1043,36 @@ def openrouter_extract_text_from_image(image_url: str) -> str:
 
 def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024") -> dict[str, Any]:
     started = time.time()
-    model = OPENROUTER_IMAGE_MODEL
+    model = runtime_openrouter_image_model()
     status = "ok"
     error = None
     raw = {}
     usage = {}
     image_url = None
     try:
-        try:
-            raw = openrouter_chat(
-                model,
-                [{"role": "user", "content": prompt}],
-                extra_body={
-                    "modalities": ["image", "text"],
-                    "image": {"size": size},
-                },
-            )
-        except HTTPException as e:
-            detail = str(getattr(e, "detail", ""))
-            if "modalit" not in detail.lower() and "output" not in detail.lower():
-                raise
-            raw = openrouter_chat(
-                model,
-                [{"role": "user", "content": prompt}],
-                extra_body={
-                    "modalities": ["image"],
-                    "image": {"size": size},
-                },
-            )
-
+        raw = openrouter_chat(
+            model,
+            [{"role": "user", "content": prompt}],
+            extra_body={
+                "modalities": ["image", "text"],
+                "image": {"size": size},
+            },
+        )
         usage = raw.get("usage") or {}
         msg = (raw.get("choices") or [{}])[0].get("message", {})
         content = msg.get("content")
-
-        images = msg.get("images")
-        if isinstance(images, list):
-            for img in images:
-                if isinstance(img, dict) and img.get("image_url", {}).get("url"):
-                    image_url = img["image_url"]["url"]
-                    break
-
-        if not image_url and isinstance(content, list):
+        # Providers vary; try common shapes.
+        if isinstance(content, list):
             for item in content:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "image_url" and item.get("image_url", {}).get("url"):
-                    image_url = item["image_url"]["url"]
-                    break
-                if item.get("type") == "output_image" and item.get("url"):
-                    image_url = item["url"]
-                    break
-
-        if not image_url and isinstance(content, str) and content.startswith("data:image/"):
-            image_url = content
-
+                if isinstance(item, dict):
+                    if item.get("type") == "image_url" and item.get("image_url", {}).get("url"):
+                        image_url = item["image_url"]["url"]
+                        break
+                    if item.get("type") == "output_image" and item.get("url"):
+                        image_url = item["url"]
+                        break
         if not image_url:
-            image_url = raw.get("image_url") or (raw.get("output") or {}).get("image_url")
-
+            image_url = raw.get("image_url") or raw.get("output", {}).get("image_url")
         if not image_url:
             raise RuntimeError("No image URL in response")
         return {"image_url": image_url, "raw": raw, "usage": usage, "latency_sec": round(time.time() - started, 2)}
@@ -823,59 +1108,8 @@ def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024"
             )
 
 
-def _fetch_image_bytes(url_or_data: str) -> bytes:
-    if url_or_data.startswith("data:image/"):
-        try:
-            payload = url_or_data.split(",", 1)[1]
-            return base64.b64decode(payload)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Failed to decode generated data image: {e}")
-
-    req = urllib.request.Request(url_or_data, headers={"User-Agent": "KindlySupport/1.0"}, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return resp.read()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to download generated image: {e}")
-
-
-def _square_crop_png(image_bytes: bytes, final_size: int = IMAGE_FINAL_SIZE) -> bytes:
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            rgb = img.convert("RGB")
-            w, h = rgb.size
-            side = min(w, h)
-            left = max(0, (w - side) // 2)
-            top = max(0, (h - side) // 2)
-            cropped = rgb.crop((left, top, left + side, top + side)).resize((final_size, final_size), Image.LANCZOS)
-            out = io.BytesIO()
-            cropped.save(out, format="PNG")
-            return out.getvalue()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to crop generated image: {e}")
-
-
-def _save_generated_media(post_id: int, image_bytes: bytes, suffix: str = "square") -> str:
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time())
-    filename = f"post_{post_id}_{suffix}_{ts}.png"
-    full = MEDIA_DIR / filename
-    full.write_bytes(image_bytes)
-    return f"{OPENROUTER_SITE_URL.rstrip('/')}/media/{filename}"
-
-
-def generate_square_image_for_post(post_id: int, image_prompt: str) -> dict[str, Any]:
-    raw_img = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size=IMAGE_WORK_SIZE)
-    source_image_url = raw_img["image_url"]
-    source_bytes = _fetch_image_bytes(source_image_url)
-    square_png = _square_crop_png(source_bytes, IMAGE_FINAL_SIZE)
-    final_image_url = _save_generated_media(post_id, square_png)
-    return {
-        "final_image_url": final_image_url,
-        "source_image_url": source_image_url,
-    }
-
 def extract_from_url(url: str) -> tuple[str, str]:
+    url = validate_public_http_url(url)
     lower = url.lower()
     if lower.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF не поддерживается. Только ссылка на HTML или картинку.")
@@ -885,46 +1119,217 @@ def extract_from_url(url: str) -> tuple[str, str]:
     return "url_html", f"Текст, извлечённый из HTML-ссылки (заглушка)\nИсточник: {url}"
 
 
+def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
+    phrases: list[str] = []
+    for line in (ocr_text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        s = s.lstrip("•-—* \t").strip()
+        if s:
+            phrases.append(s)
+    return phrases
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self'; "
+            "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        )
+        return response
+
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        req_id = request.headers.get("x-request-id") or str(uuid4())
+        request.state.request_id = req_id
+        path = request.url.path
+        if path.startswith("/api/") and path not in {"/api/login", "/api/telegram/webhook"}:
+            check_rate_limit(request, f"api:{request.method}:{path}", per_minute=240)
+        if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and path.startswith("/api/"):
+            if path not in {"/api/login", "/api/telegram/webhook"}:
+                csrf_cookie = request.cookies.get("csrf_token", "")
+                csrf_header = request.headers.get("x-csrf-token", "")
+                if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
+                    return JSONResponse(status_code=403, content={"detail": "csrf token mismatch"})
+        start = time.time()
+        try:
+            response = await call_next(request)
+        except HTTPException:
+            logger.exception("http_error request_id=%s path=%s", req_id, request.url.path)
+            raise
+        except Exception:
+            logger.exception("unhandled request_id=%s path=%s", req_id, request.url.path)
+            raise
+        latency_ms = int((time.time() - start) * 1000)
+        response.headers["X-Request-ID"] = req_id
+        logger.info("request_id=%s method=%s path=%s status=%s latency_ms=%s", req_id, request.method, request.url.path, response.status_code, latency_ms)
+        return response
+
+
+def check_rate_limit(request: Request, key_suffix: str = "default", per_minute: int = 120) -> None:
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    bucket_key = f"{ip}:{key_suffix}"
+    arr = [x for x in rate_bucket.get(bucket_key, []) if now - x <= 60]
+    if len(arr) >= per_minute:
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    arr.append(now)
+    rate_bucket[bucket_key] = arr
+
+
+def ensure_csrf(request: Request, session_id: Optional[str], allow_telegram_internal: bool = False) -> None:
+    if allow_telegram_internal and session_id == "telegram-internal":
+        return
+    if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return
+    csrf_cookie = request.cookies.get("csrf_token", "")
+    csrf_header = request.headers.get("x-csrf-token", "")
+    if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
+        raise HTTPException(status_code=403, detail="csrf token mismatch")
+
+
 app = FastAPI(title="Kindlysupport Posting MVP")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS or ["localhost", "127.0.0.1"])
+app.add_middleware(GZipMiddleware, minimum_size=1200)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-CSRF-Token", "X-Request-ID"],
+)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestContextMiddleware)
+if (FRONTEND_DIST_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST_DIR / "assets")), name="frontend-assets")
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    start_background_scheduler()
 
 
+def run_scheduled_publications() -> int:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id FROM posts
+            WHERE status = 'scheduled'
+              AND scheduled_for IS NOT NULL
+              AND scheduled_for <= ?
+            ORDER BY scheduled_for ASC
+            LIMIT 20
+            """,
+            (now_iso(),),
+        ).fetchall()
+    processed = 0
+    for row in rows:
+        try:
+            publish_now_internal(int(row["id"]))
+            processed += 1
+        except Exception:
+            logger.exception("scheduled_publish_failed post_id=%s", row["id"])
+    return processed
 
-@app.get("/media/{filename}")
-def media_file(filename: str) -> FileResponse:
-    safe_name = os.path.basename(filename)
-    path = MEDIA_DIR / safe_name
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="media file not found")
-    return FileResponse(path)
+
+def run_daily_phrase_preview() -> bool:
+    if not ENABLE_DAILY_AUTOPREVIEW:
+        return False
+    now_local = now_msk()
+    if (now_local.hour, now_local.minute) < (DAILY_AUTOPREVIEW_HOUR_MSK, DAILY_AUTOPREVIEW_MINUTE_MSK):
+        return False
+    today_key = now_local.strftime("%Y-%m-%d")
+    if kv_get("daily_preview_last_date") == today_key:
+        return False
+    with db() as conn:
+        phrase = conn.execute(
+            "SELECT id FROM phrases WHERE coalesce(is_published,0)=0 ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+    if not phrase:
+        kv_set("daily_preview_last_date", today_key)
+        return False
+    try:
+        post = create_post_from_phrase(int(phrase["id"]), session_id="telegram-internal")
+        preview_req = _mock_request({"scenario": "", "regen_instruction": ""})
+        import asyncio
+        asyncio.run(create_preview(int(post["id"]), preview_req, session_id="telegram-internal"))
+        kv_set("daily_preview_last_date", today_key)
+        return True
+    except Exception:
+        logger.exception("daily_preview_failed phrase_id=%s", phrase["id"])
+        return False
+
+
+def scheduler_loop() -> None:
+    while True:
+        try:
+            run_scheduled_publications()
+            run_daily_phrase_preview()
+        except Exception:
+            logger.exception("scheduler_loop_error")
+        time.sleep(20)
+
+
+def start_background_scheduler() -> None:
+    if getattr(start_background_scheduler, "_started", False):
+        return
+    thread = Thread(target=scheduler_loop, daemon=True, name="ks-scheduler")
+    thread.start()
+    start_background_scheduler._started = True
+
+
 @app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return INDEX_HTML
+def index() -> Any:
+    index_file = FRONTEND_DIST_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    raise HTTPException(status_code=503, detail="Frontend dist not found")
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "time": now_iso(), "db": DB_PATH, "db_backend": DB_BACKEND}
+    return {
+        "ok": True,
+        "time_utc": now_iso(),
+        "time_msk": now_msk().isoformat(),
+        "timezone": APP_TIMEZONE,
+        "db": DB_PATH,
+        "db_backend": DB_BACKEND,
+        "telegram_mode": TELEGRAM_MODE,
+    }
 
 
 @app.post("/api/login")
 async def login(request: Request, response: Response) -> dict[str, Any]:
+    check_rate_limit(request, "login", per_minute=20)
     payload = await request.json()
     if payload.get("email") != ADMIN_EMAIL or payload.get("password") != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="invalid credentials")
     sid = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(24)
     created = now_iso()
-    expires = datetime.now(tz=UTC).timestamp() + 30 * 24 * 3600
+    expires = datetime.now(tz=UTC).timestamp() + SESSION_TTL_DAYS * 24 * 3600
     expires_iso = datetime.fromtimestamp(expires, tz=UTC).isoformat()
     with db() as conn:
-        conn.execute("INSERT INTO sessions(session_id, created_at, expires_at) VALUES (?, ?, ?)", (sid, created, expires_iso))
-    response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="lax", secure=False)
-    return {"ok": True}
+        conn.execute(
+            "INSERT INTO sessions(session_id, csrf_token, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (sid, csrf_token, created, expires_iso),
+        )
+    response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="lax", secure=APP_SECURE_COOKIES)
+    response.set_cookie("csrf_token", csrf_token, httponly=False, samesite="lax", secure=APP_SECURE_COOKIES)
+    return {"ok": True, "expires_at": expires_iso}
 
 
 @app.post("/api/logout")
@@ -933,6 +1338,7 @@ async def logout(response: Response, session_id: Optional[str] = Cookie(default=
         with db() as conn:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
     response.delete_cookie(SESSION_COOKIE)
+    response.delete_cookie("csrf_token")
     return {"ok": True}
 
 
@@ -941,24 +1347,97 @@ def get_config(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
     ensure_auth(session_id)
     return {
         "models": {
-            "ocr": OPENROUTER_OCR_MODEL,
-            "text": OPENROUTER_TEXT_MODEL,
-            "prompt": OPENROUTER_PROMPT_MODEL,
-            "image": OPENROUTER_IMAGE_MODEL,
-            "work_size": IMAGE_WORK_SIZE,
-            "final_size": IMAGE_FINAL_SIZE,
+            "vision": runtime_openrouter_vision_model(),
+            "text": runtime_openrouter_text_model(),
+            "image": runtime_openrouter_image_model(),
         },
-        "openrouter_key_configured": bool(OPENROUTER_API_KEY),
+        "openrouter_key_configured": bool(runtime_openrouter_key()),
         "db_backend": DB_BACKEND,
         "telegram": {
-            "bot_configured": bool(TELEGRAM_BOT_TOKEN),
+            "bot_configured": bool(runtime_telegram_token()),
             "admin_user_id": tg_admin_user_id(),
-            "preview_chat": TELEGRAM_PREVIEW_CHAT,
-            "publish_chat": TELEGRAM_PUBLISH_CHAT,
+            "preview_chat": runtime_telegram_preview_chat(),
+            "publish_chat": runtime_telegram_publish_chat(),
+            "mode": TELEGRAM_MODE,
         },
-        "instagram_configured": bool(ENABLE_INSTAGRAM and INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_IG_USER_ID),
-        "pinterest_configured": bool(ENABLE_PINTEREST and PINTEREST_ACCESS_TOKEN and PINTEREST_BOARD_ID),
+        "timezone": APP_TIMEZONE,
+        "instagram_configured": bool(runtime_enable_instagram() and runtime_instagram_token() and runtime_instagram_user_id()),
+        "pinterest_configured": bool(runtime_enable_pinterest() and runtime_pinterest_token() and runtime_pinterest_board_id()),
+        "vk_configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
     }
+
+
+@app.get("/api/settings")
+def get_settings(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    return {
+        "openrouter_api_key": "***" if runtime_openrouter_key() else "",
+        "openrouter_text_model": runtime_openrouter_text_model(),
+        "openrouter_vision_model": runtime_openrouter_vision_model(),
+        "openrouter_image_model": runtime_openrouter_image_model(),
+        "telegram_bot_token": "***" if runtime_telegram_token() else "",
+        "telegram_admin_user_id": tg_admin_user_id(),
+        "telegram_preview_chat": runtime_telegram_preview_chat(),
+        "telegram_publish_chat": runtime_telegram_publish_chat(),
+        "telegram_webhook_secret": "***" if runtime_telegram_webhook_secret() else "",
+        "enable_vk": runtime_enable_vk(),
+        "vk_access_token": "***" if runtime_vk_token() else "",
+        "vk_group_id": runtime_vk_group_id(),
+        "vk_api_version": runtime_vk_version(),
+        "enable_instagram": runtime_enable_instagram(),
+        "instagram_access_token": "***" if runtime_instagram_token() else "",
+        "instagram_ig_user_id": runtime_instagram_user_id(),
+        "instagram_graph_version": runtime_instagram_graph_version(),
+        "enable_pinterest": runtime_enable_pinterest(),
+        "pinterest_access_token": "***" if runtime_pinterest_token() else "",
+        "pinterest_board_id": runtime_pinterest_board_id(),
+    }
+
+
+@app.put("/api/settings")
+async def update_settings(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    allowed = {
+        "openrouter_api_key",
+        "openrouter_text_model",
+        "openrouter_vision_model",
+        "openrouter_image_model",
+        "telegram_bot_token",
+        "telegram_admin_user_id",
+        "telegram_preview_chat",
+        "telegram_publish_chat",
+        "telegram_webhook_secret",
+        "enable_vk",
+        "vk_access_token",
+        "vk_group_id",
+        "vk_api_version",
+        "enable_instagram",
+        "instagram_access_token",
+        "instagram_ig_user_id",
+        "instagram_graph_version",
+        "enable_pinterest",
+        "pinterest_access_token",
+        "pinterest_board_id",
+    }
+    updated = []
+    for key, value in payload.items():
+        if key not in allowed:
+            continue
+        if key == "telegram_admin_user_id":
+            if str(value).strip():
+                kv_set("telegram_admin_user_id", str(int(value)))
+            else:
+                kv_set("telegram_admin_user_id", "")
+            updated.append(key)
+            continue
+        if key.startswith("enable_"):
+            setting_set(key, "1" if bool(value) else "0")
+        else:
+            setting_set(key, str(value or "").strip())
+        updated.append(key)
+    return {"ok": True, "updated": updated}
+
 
 @app.post("/api/posts")
 async def create_post(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
@@ -1009,11 +1488,79 @@ async def create_post(request: Request, session_id: Optional[str] = Cookie(defau
     return fetch_post(int(post_id))
 
 
-@app.get("/api/posts")
-def list_posts(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> list[dict[str, Any]]:
+@app.post("/api/parables")
+async def create_parable(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    mode = (payload.get("mode") or "manual").strip().lower()
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title required")
+    created_at = now_iso()
+    if mode == "manual":
+        text_body = (payload.get("text_body") or "").strip()
+        if not text_body:
+            raise HTTPException(status_code=400, detail="text_body required")
+        source_kind = "parable_manual"
+        source_url = None
+        recognized_text = text_body
+    elif mode == "link":
+        url = (payload.get("url") or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url required")
+        _, recognized_text = extract_from_url(url)
+        text_body = (payload.get("text_body") or recognized_text or "").strip()
+        source_kind = "parable_link"
+        source_url = url
+    else:
+        raise HTTPException(status_code=400, detail="mode must be manual|link")
+    with db() as conn:
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
+                RETURNING id
+                """,
+                (title, text_body, source_url, source_kind, recognized_text, created_at, created_at),
+            ).fetchone()
+            post_id = row["id"]
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
+                """,
+                (title, text_body, source_url, source_kind, recognized_text, created_at, created_at),
+            )
+            post_id = cur.lastrowid
+    return fetch_post(int(post_id))
+
+
+@app.get("/api/parables")
+def list_parables(
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=10000),
+) -> list[dict[str, Any]]:
     ensure_auth(session_id)
     with db() as conn:
-        rows = conn.execute("SELECT * FROM posts ORDER BY id DESC LIMIT 100").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE source_kind IN ('parable_manual','parable_link') ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+    return [row_to_post(r) for r in rows]
+
+
+@app.get("/api/posts")
+def list_posts(
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=10000),
+) -> list[dict[str, Any]]:
+    ensure_auth(session_id)
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM posts ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
     return [row_to_post(r) for r in rows]
 
 
@@ -1083,33 +1630,25 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
     caption = generate_caption(post["title"], post["text_body"])
     if post.get("source_kind") == "phrase":
         caption = generate_post_caption(post)
-
     image_prompt = default_image_prompt(post["title"], scenario, regen_instruction)
-    try:
-        image_prompt = llm_image_prompt(post["title"], post["text_body"], scenario, regen_instruction)
-    except Exception:
-        pass
 
     image_url = None
-    source_image_url = None
     image_error = None
     try:
-        result = generate_square_image_for_post(post_id=post_id, image_prompt=image_prompt)
-        image_url = result["final_image_url"]
-        source_image_url = result.get("source_image_url")
+        result = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size="1024x1024")
+        image_url = result["image_url"]
     except HTTPException as e:
         image_error = e.detail
     except Exception as e:
         image_error = str(e)
 
     preview = {
-        "chat": TELEGRAM_PREVIEW_CHAT,
+        "chat": runtime_telegram_preview_chat(),
         "buttons": ["Опубликовать", "Перегенерировать", "Отмена"],
         "publish_options": ["Сейчас", "В указанное время и дату", "Заменить фразу"],
         "regenerate_options": ["Текст", "Картинку", "И то и то"],
-        "note": "При перегенерации админ присылает текст-инструкцию, она учитывается в prompt изображения.",
+        "note": "При перегенерации админ присылает текст-инструкцию, он учитывается в prompt изображения.",
         "image_error": image_error,
-        "source_image_url": source_image_url,
     }
     update_post(
         post_id,
@@ -1141,6 +1680,7 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
         post = fetch_post(post_id)
     return post
 
+
 @app.post("/api/posts/{post_id}/regenerate")
 async def regenerate_preview(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
@@ -1155,40 +1695,22 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
     scenario = post.get("selected_scenario") or "Стандартный реалистичный природный фон, квадратный"
 
     if target in ("text", "both") and instruction:
-        try:
-            rewrite_prompt = (
-                "Rewrite this Russian post body into exactly 2 paragraphs. "
-                "Keep the core meaning and style. No hashtags, no emojis.\n\n"
-                f"Current text:\n{post['text_body']}\n\n"
-                f"Editor instruction: {instruction}"
-            )
-            text_body = openrouter_generate_text(rewrite_prompt).strip() or post["text_body"]
-        except Exception:
-            text_body = post["text_body"]
+        # MVP: keep structure strict, but allow short refinement by appending admin note to the body.
+        text_body = f"{post['text_body']}\n\nP.S. Уточнение редактора: {instruction}"
         update_post(post_id, text_body=text_body)
-
     if target in ("image", "both"):
         image_prompt = default_image_prompt(title, scenario, instruction)
-        try:
-            image_prompt = llm_image_prompt(title, text_body, scenario, instruction)
-        except Exception:
-            pass
-
         image_url = None
-        source_image_url = None
         image_error = None
         try:
-            result = generate_square_image_for_post(post_id=post_id, image_prompt=image_prompt)
-            image_url = result["final_image_url"]
-            source_image_url = result.get("source_image_url")
+            result = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size="1024x1024")
+            image_url = result["image_url"]
         except HTTPException as e:
             image_error = e.detail
         except Exception as e:
             image_error = str(e)
-
         preview = post.get("preview_payload") or {}
         preview["image_error"] = image_error
-        preview["source_image_url"] = source_image_url
         update_post(
             post_id,
             image_prompt=image_prompt,
@@ -1201,6 +1723,7 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
     update_post(post_id, telegram_caption=generate_post_caption(latest))
     return fetch_post(post_id)
 
+
 @app.post("/api/posts/{post_id}/publish")
 async def publish(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
@@ -1208,27 +1731,9 @@ async def publish(post_id: int, request: Request, session_id: Optional[str] = Co
     mode = payload.get("mode")
     post = fetch_post(post_id)
     if mode == "now":
-        tg_res = None
-        tg_err = None
-        try:
-            tg_res = telegram_send_publish(post)
-        except HTTPException as e:
-            tg_err = e.detail
-        except Exception as e:
-            tg_err = str(e)
-        preview = post.get("preview_payload") or {}
-        preview["published"] = {"mode": "now", "at": now_iso(), "telegram": bool(tg_res), "telegram_error": tg_err}
-        pub_message_id = None
-        if tg_res and (tg_res.get("result") or {}).get("message_id") is not None:
-            pub_message_id = str(tg_res["result"]["message_id"])
-        update_post(post_id, status="published", preview_payload_json=preview, published_message_id=pub_message_id)
-        post_after = fetch_post(post_id)
-        mark_phrase_published_if_linked(post_after)
-        return fetch_post(post_id)
+        return publish_now_internal(post_id)
     if mode == "schedule":
-        scheduled_for = (payload.get("scheduled_for") or "").strip()
-        if not scheduled_for:
-            raise HTTPException(status_code=400, detail="scheduled_for required")
+        scheduled_for = parse_to_utc_iso(payload.get("scheduled_for") or "")
         update_post(post_id, status="scheduled", scheduled_for=scheduled_for)
         return fetch_post(post_id)
     if mode == "replace_phrase":
@@ -1259,6 +1764,27 @@ def _mock_request(payload: dict[str, Any]) -> _MockRequest:
     return _MockRequest(payload)
 
 
+def publish_now_internal(post_id: int) -> dict[str, Any]:
+    post = fetch_post(post_id)
+    tg_res = None
+    tg_err = None
+    try:
+        tg_res = telegram_send_publish(post)
+    except HTTPException as e:
+        tg_err = e.detail
+    except Exception as e:
+        tg_err = str(e)
+    preview = post.get("preview_payload") or {}
+    preview["published"] = {"mode": "now", "at": now_iso(), "telegram": bool(tg_res), "telegram_error": tg_err}
+    pub_message_id = None
+    if tg_res and (tg_res.get("result") or {}).get("message_id") is not None:
+        pub_message_id = str(tg_res["result"]["message_id"])
+    update_post(post_id, status="published", preview_payload_json=preview, published_message_id=pub_message_id)
+    post_after = fetch_post(post_id)
+    mark_phrase_published_if_linked(post_after)
+    return post_after
+
+
 @app.get("/api/logs/image")
 def image_logs(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> list[dict[str, Any]]:
     ensure_auth(session_id)
@@ -1278,31 +1804,50 @@ def image_logs(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
 @app.get("/api/integrations/readiness")
 def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
+    missing = []
+    if not runtime_openrouter_key():
+        missing.append("OPENROUTER_API_KEY")
+    if not runtime_telegram_token():
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if TELEGRAM_MODE == "webhook" and not runtime_telegram_webhook_secret():
+        missing.append("TELEGRAM_WEBHOOK_SECRET")
+    if runtime_enable_instagram() and (not runtime_instagram_token() or not runtime_instagram_user_id()):
+        missing.extend([x for x in ["INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_IG_USER_ID"] if x not in missing])
+    if runtime_enable_pinterest() and (not runtime_pinterest_token() or not runtime_pinterest_board_id()):
+        missing.extend([x for x in ["PINTEREST_ACCESS_TOKEN", "PINTEREST_BOARD_ID"] if x not in missing])
+    if runtime_enable_vk() and (not runtime_vk_token() or not runtime_vk_group_id()):
+        missing.extend([x for x in ["VK_ACCESS_TOKEN", "VK_GROUP_ID"] if x not in missing])
     return {
         "telegram": {
-            "bot_token": bool(TELEGRAM_BOT_TOKEN),
+            "bot_token": bool(runtime_telegram_token()),
             "admin_user_id": tg_admin_user_id(),
-            "preview_chat": TELEGRAM_PREVIEW_CHAT,
-            "publish_chat": TELEGRAM_PUBLISH_CHAT,
+            "preview_chat": runtime_telegram_preview_chat(),
+            "publish_chat": runtime_telegram_publish_chat(),
         },
         "instagram": {
-            "enabled": ENABLE_INSTAGRAM,
-            "configured": bool(ENABLE_INSTAGRAM and INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_IG_USER_ID),
+            "enabled": runtime_enable_instagram(),
+            "configured": bool(runtime_enable_instagram() and runtime_instagram_token() and runtime_instagram_user_id()),
             "needs": ["INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_IG_USER_ID"],
         },
         "pinterest": {
-            "enabled": ENABLE_PINTEREST,
-            "configured": bool(ENABLE_PINTEREST and PINTEREST_ACCESS_TOKEN and PINTEREST_BOARD_ID),
+            "enabled": runtime_enable_pinterest(),
+            "configured": bool(runtime_enable_pinterest() and runtime_pinterest_token() and runtime_pinterest_board_id()),
             "needs": ["PINTEREST_ACCESS_TOKEN", "PINTEREST_BOARD_ID"],
         },
+        "vk": {
+            "enabled": runtime_enable_vk(),
+            "configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
+            "needs": ["VK_ACCESS_TOKEN", "VK_GROUP_ID"],
+        },
         "database": {"backend": DB_BACKEND, "database_url_set": bool(DATABASE_URL)},
+        "missing_required": missing,
     }
 
 
 @app.post("/api/posts/{post_id}/publish/instagram")
 def publish_instagram_endpoint(post_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
-    if not ENABLE_INSTAGRAM:
+    if not runtime_enable_instagram():
         raise HTTPException(status_code=503, detail="Instagram publishing temporarily disabled")
     post = fetch_post(post_id)
     res = instagram_publish_post(post)
@@ -1312,11 +1857,58 @@ def publish_instagram_endpoint(post_id: int, session_id: Optional[str] = Cookie(
 @app.post("/api/posts/{post_id}/publish/pinterest")
 def publish_pinterest_endpoint(post_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
-    if not ENABLE_PINTEREST:
+    if not runtime_enable_pinterest():
         raise HTTPException(status_code=503, detail="Pinterest publishing temporarily disabled")
     post = fetch_post(post_id)
     res = pinterest_publish_post(post)
     return {"ok": True, "post_id": post_id, "pinterest": res}
+
+
+@app.post("/api/posts/{post_id}/publish/vk")
+def publish_vk_endpoint(post_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    if not runtime_enable_vk():
+        raise HTTPException(status_code=503, detail="VK publishing temporarily disabled")
+    post = fetch_post(post_id)
+    res = vk_publish_post(post)
+    return {"ok": True, "post_id": post_id, "vk": res}
+
+
+@app.post("/api/posts/{post_id}/publish/multi")
+async def publish_multi(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    targets = payload.get("targets") or []
+    if not isinstance(targets, list) or not targets:
+        raise HTTPException(status_code=400, detail="targets[] required")
+    post = fetch_post(post_id)
+    result: dict[str, Any] = {"post_id": post_id, "targets": {}, "ok": True}
+    for target in targets:
+        t = str(target).strip().lower()
+        try:
+            if t == "telegram":
+                tg_res = telegram_send_publish(post)
+                result["targets"]["telegram"] = {"ok": True, "result": tg_res}
+            elif t == "vk":
+                result["targets"]["vk"] = {"ok": True, "result": vk_publish_post(post)}
+            elif t == "instagram":
+                if not runtime_enable_instagram():
+                    raise HTTPException(status_code=503, detail="Instagram disabled")
+                result["targets"]["instagram"] = {"ok": True, "result": instagram_publish_post(post)}
+            elif t == "pinterest":
+                if not runtime_enable_pinterest():
+                    raise HTTPException(status_code=503, detail="Pinterest disabled")
+                result["targets"]["pinterest"] = {"ok": True, "result": pinterest_publish_post(post)}
+            else:
+                result["targets"][t] = {"ok": False, "error": "unsupported target"}
+                result["ok"] = False
+        except Exception as e:
+            result["targets"][t] = {"ok": False, "error": str(e)}
+            result["ok"] = False
+    if result["targets"].get("telegram", {}).get("ok"):
+        update_post(post_id, status="published")
+        mark_phrase_published_if_linked(fetch_post(post_id))
+    return result
 
 
 @app.post("/api/phrases/{phrase_id}/create-post")
@@ -1331,15 +1923,6 @@ def create_post_from_phrase(phrase_id: int, session_id: Optional[str] = Cookie(d
             raise HTTPException(status_code=400, detail="empty phrase")
         created_at = now_iso()
         title = text
-        post_text = text
-        if OPENROUTER_API_KEY:
-            try:
-                candidate = generate_post_text_from_phrase(text).strip()
-                if candidate:
-                    post_text = candidate
-            except Exception:
-                post_text = text
-
         if DB_BACKEND == "postgres":
             cur = conn.execute(
                 """
@@ -1347,7 +1930,7 @@ def create_post_from_phrase(phrase_id: int, session_id: Optional[str] = Cookie(d
                 VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
                 RETURNING id
                 """,
-                (title, post_text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
+                (title, text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
             )
             row = cur.fetchone()
             post_id = row["id"]
@@ -1357,19 +1940,60 @@ def create_post_from_phrase(phrase_id: int, session_id: Optional[str] = Cookie(d
                 INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
                 """,
-                (title, post_text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
+                (title, text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
             )
             post_id = cur.lastrowid
     return fetch_post(int(post_id))
 
+
 @app.get("/api/phrases")
-def list_phrases(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> list[dict[str, Any]]:
+def list_phrases(
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+    limit: int = Query(default=1000, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0, le=20000),
+    status: str = Query(default="all"),
+    search: str = Query(default=""),
+    topic: str = Query(default=""),
+) -> list[dict[str, Any]]:
     ensure_auth(session_id)
+    where = []
+    params: list[Any] = []
+    status = (status or "all").strip().lower()
+    if status in {"0", "new", "unpublished"}:
+        where.append("coalesce(is_published,0)=0")
+    elif status in {"1", "published"}:
+        where.append("coalesce(is_published,0)=1")
+    if search.strip():
+        where.append("lower(text_body) LIKE ?")
+        params.append(f"%{search.strip().lower()}%")
+    if topic.strip():
+        where.append("lower(coalesce(topic,'')) LIKE ?")
+        params.append(f"%{topic.strip().lower()}%")
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     with db() as conn:
         rows = conn.execute(
-            "SELECT id, text_body, is_published, created_at, updated_at FROM phrases ORDER BY id ASC LIMIT 5000"
+            f"SELECT id, text_body, topic, is_published, created_at, updated_at FROM phrases {where_sql} ORDER BY id ASC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.post("/api/phrases/create-post-random")
+def create_post_from_random_phrase(
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+    only_new: bool = Query(default=True),
+) -> dict[str, Any]:
+    ensure_auth(session_id)
+    with db() as conn:
+        if only_new:
+            row = conn.execute(
+                "SELECT id FROM phrases WHERE coalesce(is_published,0)=0 ORDER BY RANDOM() LIMIT 1"
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT id FROM phrases ORDER BY RANDOM() LIMIT 1").fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="phrases not found")
+    return create_post_from_phrase(int(row["id"]), session_id=session_id)
 
 
 @app.post("/api/phrases/import-tsv")
@@ -1466,20 +2090,191 @@ async def import_phrases_text(request: Request, session_id: Optional[str] = Cook
     return {"ok": True, "parsed": len(phrases), "inserted": inserted, "updated": updated}
 
 
+@app.post("/api/phrases/import-csv")
+async def import_phrases_csv(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    raw_csv = (payload.get("raw_csv") or "").strip()
+    if not raw_csv:
+        raise HTTPException(status_code=400, detail="raw_csv is required")
+    reader = csv.DictReader(io.StringIO(raw_csv))
+    inserted = 0
+    updated = 0
+    skipped = 0
+    parsed = 0
+    now = now_iso()
+    with db() as conn:
+        for row in reader:
+            phrase = (row.get("Текст ru") or row.get("text_ru") or row.get("text") or "").strip()
+            if not phrase:
+                skipped += 1
+                continue
+            status_raw = (row.get("0/1") or row.get("status") or "0").strip()
+            is_pub = 1 if status_raw == "1" else 0
+            topic = (row.get("Тема") or row.get("topic") or "").strip() or None
+            parsed += 1
+            existing = conn.execute("SELECT id, is_published, topic FROM phrases WHERE text_body = ?", (phrase,)).fetchone()
+            if existing:
+                if int(existing["is_published"]) != is_pub or (existing.get("topic") if isinstance(existing, dict) else existing["topic"]) != topic:
+                    conn.execute(
+                        "UPDATE phrases SET is_published = ?, topic = ?, updated_at = ? WHERE id = ?",
+                        (is_pub, topic, now, existing["id"]),
+                    )
+                    updated += 1
+                continue
+            if DB_BACKEND == "postgres":
+                conn.execute(
+                    "INSERT INTO phrases(text_body, topic, is_published, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (text_body) DO NOTHING",
+                    (phrase, topic, is_pub, now, now),
+                )
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO phrases(text_body, topic, is_published, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (phrase, topic, is_pub, now, now),
+                )
+            inserted += 1
+    return {"ok": True, "parsed": parsed, "inserted": inserted, "updated": updated, "skipped": skipped}
+
+
+@app.put("/api/phrases/{phrase_id}")
+async def update_phrase(phrase_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    text_body = (payload.get("text_body") or "").strip()
+    topic = (payload.get("topic") or "").strip() or None
+    is_published = payload.get("is_published")
+    sets = []
+    params: list[Any] = []
+    if text_body:
+        sets.append("text_body = ?")
+        params.append(text_body)
+    if "topic" in payload:
+        sets.append("topic = ?")
+        params.append(topic)
+    if is_published is not None:
+        sets.append("is_published = ?")
+        params.append(int(is_published))
+    if not sets:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    sets.append("updated_at = ?")
+    params.append(now_iso())
+    params.append(phrase_id)
+    with db() as conn:
+        conn.execute(f"UPDATE phrases SET {', '.join(sets)} WHERE id = ?", params)
+        row = conn.execute(
+            "SELECT id, text_body, topic, is_published, created_at, updated_at FROM phrases WHERE id = ?",
+            (phrase_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="phrase not found")
+    return dict(row)
+
+
+@app.delete("/api/phrases/{phrase_id}")
+def delete_phrase(phrase_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    with db() as conn:
+        conn.execute("DELETE FROM phrases WHERE id = ?", (phrase_id,))
+    return {"ok": True, "phrase_id": phrase_id}
+
+
+@app.put("/api/phrases/bulk-status")
+async def bulk_update_phrases_status(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    ids = payload.get("ids") or []
+    is_published = payload.get("is_published")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="ids[] required")
+    if is_published not in {0, 1, "0", "1"}:
+        raise HTTPException(status_code=400, detail="is_published must be 0 or 1")
+    status_val = int(is_published)
+    updated = 0
+    with db() as conn:
+        for phrase_id in ids:
+            conn.execute(
+                "UPDATE phrases SET is_published = ?, updated_at = ? WHERE id = ?",
+                (status_val, now_iso(), int(phrase_id)),
+            )
+            updated += 1
+    return {"ok": True, "updated": updated}
+
+
+@app.delete("/api/phrases/bulk-delete")
+async def bulk_delete_phrases(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="ids[] required")
+    deleted = 0
+    with db() as conn:
+        for phrase_id in ids:
+            conn.execute("DELETE FROM phrases WHERE id = ?", (int(phrase_id),))
+            deleted += 1
+    return {"ok": True, "deleted": deleted}
+
+
 @app.post("/api/phrases/import-image-url")
 async def import_phrases_image_url(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
     payload = await request.json()
-    image_url = (payload.get("image_url") or "").strip()
-    if not image_url:
-        raise HTTPException(status_code=400, detail="image_url is required")
+    image_url = validate_public_http_url(payload.get("image_url") or "")
     ocr_text = openrouter_extract_text_from_image(image_url)
-    # First version: one line = one phrase. User can edit OCR result in UI and re-import as text if needed.
-    return {"ok": True, "image_url": image_url, "ocr_text": ocr_text}
+    phrases = extract_phrases_from_ocr_text(ocr_text)
+    return {"ok": True, "image_url": image_url, "ocr_text": ocr_text, "phrases": phrases}
+
+
+@app.post("/api/phrases/ocr-image-base64")
+async def ocr_phrase_image_base64(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    image_data_url = (payload.get("image_data_url") or "").strip()
+    if not image_data_url.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="image_data_url must be a data:image/* base64 URL")
+    ocr_text = openrouter_extract_text_from_image(image_data_url)
+    phrases = extract_phrases_from_ocr_text(ocr_text)
+    return {"ok": True, "ocr_text": ocr_text, "phrases": phrases}
+
+
+@app.post("/api/phrases/ocr-images-base64")
+async def ocr_phrase_images_base64(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    images = payload.get("images") or []
+    if not isinstance(images, list) or not images:
+        raise HTTPException(status_code=400, detail="images[] required")
+    if len(images) > 20:
+        raise HTTPException(status_code=400, detail="max 20 images per batch")
+
+    items: list[dict[str, Any]] = []
+    for idx, item in enumerate(images, start=1):
+        data_url = str((item or {}).get("image_data_url") or "").strip()
+        name = str((item or {}).get("name") or f"image_{idx}.png").strip()
+        if not data_url.startswith("data:image/"):
+            items.append({"name": name, "ok": False, "error": "invalid image_data_url"})
+            continue
+        try:
+            ocr_text = openrouter_extract_text_from_image(data_url)
+            phrases = extract_phrases_from_ocr_text(ocr_text)
+            items.append(
+                {
+                    "name": name,
+                    "ok": True,
+                    "ocr_text": ocr_text,
+                    "phrase": phrases[0] if phrases else "",
+                    "phrases": phrases,
+                }
+            )
+        except Exception as e:
+            items.append({"name": name, "ok": False, "error": str(e)})
+    recognized = sum(1 for x in items if x.get("ok") and x.get("phrase"))
+    return {"ok": True, "items": items, "recognized": recognized, "total": len(items)}
 
 
 @app.post("/api/phrases/import-image-base64")
-async def import_phrases_image_base64(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+async def import_phrase_image_base64_legacy(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    """Backward compatible endpoint: OCR + auto-import."""
     ensure_auth(session_id)
     payload = await request.json()
     image_data_url = (payload.get("image_data_url") or "").strip()
@@ -1487,48 +2282,10 @@ async def import_phrases_image_base64(request: Request, session_id: Optional[str
         raise HTTPException(status_code=400, detail="image_data_url must be a data:image/* base64 URL")
     is_published = int(payload.get("is_published", 0) or 0)
     ocr_text = openrouter_extract_text_from_image(image_data_url)
-
-    phrases: list[str] = []
-    for line in ocr_text.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        # Remove common list prefixes from OCR dumps
-        s = s.lstrip("•-—* \t").strip()
-        if s:
-            phrases.append(s)
-
-    now = now_iso()
-    inserted = 0
-    updated = 0
-    with db() as conn:
-        for phrase in phrases:
-            existing = conn.execute("SELECT id, is_published FROM phrases WHERE text_body = ?", (phrase,)).fetchone()
-            if existing:
-                if int(existing["is_published"]) != is_published:
-                    conn.execute("UPDATE phrases SET is_published = ?, updated_at = ? WHERE id = ?", (is_published, now, existing["id"]))
-                    updated += 1
-                continue
-            if DB_BACKEND == "postgres":
-                conn.execute(
-                    "INSERT INTO phrases(text_body, is_published, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (text_body) DO NOTHING",
-                    (phrase, is_published, now, now),
-                )
-            else:
-                conn.execute(
-                    "INSERT OR IGNORE INTO phrases(text_body, is_published, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                    (phrase, is_published, now, now),
-                )
-            inserted += 1
-
-    return {
-        "ok": True,
-        "ocr_text": ocr_text,
-        "parsed": len(phrases),
-        "inserted": inserted,
-        "updated": updated,
-        "is_published": is_published,
-    }
+    phrases = extract_phrases_from_ocr_text(ocr_text)
+    raw_text = "\n".join(phrases)
+    res = await import_phrases_text(_mock_request({"raw_text": raw_text, "is_published": is_published}), session_id=session_id)  # type: ignore[arg-type]
+    return {"ok": True, "ocr_text": ocr_text, "phrases": phrases, **res}
 
 
 @app.post("/api/phrases/daily-preview")
@@ -1544,6 +2301,158 @@ async def create_daily_phrase_preview(session_id: Optional[str] = Cookie(default
     # Auto-build preview and send to Telegram admin/preview chat.
     built = await create_preview(int(post["id"]), _mock_request({"scenario": "", "regen_instruction": ""}), session_id=session_id)
     return {"ok": True, "phrase_id": int(phrase["id"]), "post": built}
+
+
+@app.get("/api/films")
+def list_films(
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+    search: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, le=20000),
+) -> list[dict[str, Any]]:
+    ensure_auth(session_id)
+    with db() as conn:
+        if search.strip():
+            rows = conn.execute(
+                """
+                SELECT id, title, year, country, description, tags, created_at, updated_at
+                FROM films
+                WHERE lower(title) LIKE ? OR lower(coalesce(description,'')) LIKE ? OR lower(coalesce(tags,'')) LIKE ?
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (
+                    f"%{search.strip().lower()}%",
+                    f"%{search.strip().lower()}%",
+                    f"%{search.strip().lower()}%",
+                    limit,
+                    offset,
+                ),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, title, year, country, description, tags, created_at, updated_at FROM films ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/films")
+async def create_film(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title required")
+    year = payload.get("year")
+    country = (payload.get("country") or "").strip() or None
+    description = (payload.get("description") or "").strip() or None
+    tags = (payload.get("tags") or "").strip() or None
+    created = now_iso()
+    with db() as conn:
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO films(title, year, country, description, tags, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                RETURNING id, title, year, country, description, tags, created_at, updated_at
+                """,
+                (title, year, country, description, tags, created, created),
+            ).fetchone()
+            return dict(row)
+        cur = conn.execute(
+            """
+            INSERT INTO films(title, year, country, description, tags, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (title, year, country, description, tags, created, created),
+        )
+        row = conn.execute(
+            "SELECT id, title, year, country, description, tags, created_at, updated_at FROM films WHERE id = ?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return dict(row)
+
+
+@app.put("/api/films/{film_id}")
+async def update_film(film_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    fields: dict[str, Any] = {}
+    for k in ("title", "year", "country", "description", "tags"):
+        if k in payload:
+            if k == "year":
+                fields[k] = payload.get(k)
+            else:
+                fields[k] = (payload.get(k) or "").strip() or None
+    if not fields:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    fields["updated_at"] = now_iso()
+    with db() as conn:
+        sets = ", ".join(f"{k} = ?" for k in fields.keys())
+        conn.execute(f"UPDATE films SET {sets} WHERE id = ?", (*fields.values(), film_id))
+        row = conn.execute(
+            "SELECT id, title, year, country, description, tags, created_at, updated_at FROM films WHERE id = ?",
+            (film_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="film not found")
+    return dict(row)
+
+
+@app.delete("/api/films/{film_id}")
+def delete_film(film_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    with db() as conn:
+        conn.execute("DELETE FROM films WHERE id = ?", (film_id,))
+    return {"ok": True, "film_id": film_id}
+
+
+@app.post("/api/films/{film_id}/create-post")
+async def create_post_from_film(film_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    with db() as conn:
+        film = conn.execute(
+            "SELECT id, title, year, country, description, tags FROM films WHERE id = ?",
+            (film_id,),
+        ).fetchone()
+    if not film:
+        raise HTTPException(status_code=404, detail="film not found")
+    title = str(film["title"]).strip()
+    prompt = (
+        "Сделай короткий вдохновляющий пост о фильме для Telegram-канала. "
+        "Нужно 2-5 предложений, без спойлеров, на русском.\n"
+        f"Название: {title}\n"
+        f"Год: {film.get('year')}\n"
+        f"Страна: {film.get('country')}\n"
+        f"Описание: {film.get('description')}\n"
+        f"Теги: {film.get('tags')}\n"
+    )
+    text_body = (openrouter_generate_text(prompt) or "").strip()
+    if not text_body:
+        text_body = f"Фильм: {title}. Рекомендуем к просмотру."
+    created = now_iso()
+    with db() as conn:
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO posts(title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
+                RETURNING id
+                """,
+                (title, text_body, f"film:{film_id}", "film", text_body, created, created),
+            ).fetchone()
+            post_id = row["id"]
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO posts(title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
+                """,
+                (title, text_body, f"film:{film_id}", "film", text_body, created, created),
+            )
+            post_id = cur.lastrowid
+    return fetch_post(int(post_id))
 
 
 @app.post("/api/telegram/admin/bind")
@@ -1589,7 +2498,22 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
     if text == "/start":
         kv_set("telegram_admin_user_id", str(user_id))
-        send_telegram_text(chat.get("id"), "Админ привязан. Теперь сюда будут приходить инструкции по перегенерации/публикации.")
+        send_telegram_text(
+            chat.get("id"),
+            "Админ привязан. Теперь сюда будут приходить инструкции по перегенерации/публикации.",
+            reply_markup=build_manual_create_keyboard(),
+        )
+        return {"ok": True}
+    if text == "/new_post":
+        tg_state_set(int(user_id), "await_manual_phrase_text", {})
+        send_telegram_text(chat.get("id"), "Пришли текст фразы одним сообщением. Потом подтверждение Да/Нет.")
+        return {"ok": True}
+    if text == "/add_phrases":
+        tg_state_set(int(user_id), "await_add_phrase_input", {})
+        send_telegram_text(
+            chat.get("id"),
+            "Режим добавления фраз: отправь текст (по одной фразе в строке) или картинку с фразой. После распознавания подтверждение Да/Нет.",
+        )
         return {"ok": True}
 
     state = tg_state_get(int(user_id))
@@ -1597,22 +2521,102 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "message": "no pending state"}
     st = state["state"]
     payload = state["payload"] or {}
-    post_id = int(payload.get("post_id"))
+    post_id_raw = payload.get("post_id")
+    post_id = int(post_id_raw) if post_id_raw is not None else None
     if st == "await_regen_instruction":
+        if not post_id:
+            tg_state_clear(int(user_id))
+            send_telegram_text(chat.get("id"), "Не найден post_id. Начни заново с кнопок превью.")
+            return {"ok": True}
         target = payload.get("target", "both")
         tg_state_clear(int(user_id))
         await regenerate_preview(post_id, _mock_request({"target": target, "instruction": text}), session_id="telegram-internal")  # type: ignore[arg-type]
         send_telegram_text(chat.get("id"), "Перегенерация выполнена. Новое превью отправлено.")
         return {"ok": True}
     if st == "await_schedule_datetime":
+        if not post_id:
+            tg_state_clear(int(user_id))
+            send_telegram_text(chat.get("id"), "Не найден post_id. Начни заново с кнопок превью.")
+            return {"ok": True}
         tg_state_clear(int(user_id))
         await publish(post_id, _mock_request({"mode": "schedule", "scheduled_for": text}), session_id="telegram-internal")  # type: ignore[arg-type]
         send_telegram_text(chat.get("id"), f"Публикация запланирована: {text}")
         return {"ok": True}
     if st == "await_replace_phrase":
+        if not post_id:
+            tg_state_clear(int(user_id))
+            send_telegram_text(chat.get("id"), "Не найден post_id. Начни заново с кнопок превью.")
+            return {"ok": True}
         tg_state_clear(int(user_id))
         await publish(post_id, _mock_request({"mode": "replace_phrase", "replacement_phrase": text}), session_id="telegram-internal")  # type: ignore[arg-type]
         send_telegram_text(chat.get("id"), "Фраза заменена, картинка и описание пересобраны, новое превью отправлено.")
+        return {"ok": True}
+    if st == "await_manual_phrase_text":
+        phrase_text = text.strip()
+        if not phrase_text:
+            send_telegram_text(chat.get("id"), "Пустой текст. Пришли фразу ещё раз.")
+            return {"ok": True}
+        tg_state_set(int(user_id), "await_manual_phrase_confirm", {"phrase_text": phrase_text})
+        send_telegram_text(
+            chat.get("id"),
+            f'Создать новую фразу?\n\n"{phrase_text}"',
+            reply_markup=tg_keyboard([[("Да", "ks:manualsave:0:yes"), ("Нет", "ks:manualsave:0:no")]]),
+        )
+        return {"ok": True}
+    if st == "await_manual_phrase_confirm":
+        send_telegram_text(chat.get("id"), "Нажми кнопку Да/Нет под сообщением, чтобы продолжить.")
+        return {"ok": True}
+    if st == "await_add_phrase_input":
+        photos = msg.get("photo") or []
+        if photos:
+            best = photos[-1]
+            file_id = best.get("file_id")
+            if not file_id:
+                send_telegram_text(chat.get("id"), "Не нашёл file_id у картинки. Попробуй ещё раз.")
+                return {"ok": True}
+            try:
+                data_url = telegram_file_data_url(file_id)
+                ocr_text = openrouter_extract_text_from_image(data_url)
+                phrases = extract_phrases_from_ocr_text(ocr_text)
+                phrase_text = (phrases[0] if phrases else "").strip()
+                if not phrase_text:
+                    send_telegram_text(chat.get("id"), "Не удалось распознать фразу. Отправь другую картинку.")
+                    return {"ok": True}
+                tg_state_set(int(user_id), "await_add_phrase_confirm", {"phrase_text": phrase_text})
+                send_telegram_text(
+                    chat.get("id"),
+                    f'Распознано: "{phrase_text}"\nСоздать новую фразу?',
+                    reply_markup=tg_keyboard([[("Да", "ks:addphrase:0:yes"), ("Нет", "ks:addphrase:0:no")]]),
+                )
+                return {"ok": True}
+            except Exception as e:
+                send_telegram_text(chat.get("id"), f"Ошибка OCR: {str(e)[:300]}")
+                return {"ok": True}
+        raw = (text or "").strip()
+        if not raw:
+            send_telegram_text(chat.get("id"), "Пришли текст фразы (или список фраз) или картинку.")
+            return {"ok": True}
+        lines = [x.strip() for x in raw.splitlines() if x.strip()]
+        if len(lines) == 1:
+            tg_state_set(int(user_id), "await_add_phrase_confirm", {"phrase_text": lines[0]})
+            send_telegram_text(
+                chat.get("id"),
+                f'Создать новую фразу?\n\n"{lines[0]}"',
+                reply_markup=tg_keyboard([[("Да", "ks:addphrase:0:yes"), ("Нет", "ks:addphrase:0:no")]]),
+            )
+            return {"ok": True}
+        tg_state_set(int(user_id), "await_add_bulk_confirm", {"phrases": lines})
+        send_telegram_text(
+            chat.get("id"),
+            f"Получено {len(lines)} фраз. Добавить в общий список?",
+            reply_markup=tg_keyboard([[("Да", "ks:addbulk:0:yes"), ("Нет", "ks:addbulk:0:no")]]),
+        )
+        return {"ok": True}
+    if st == "await_add_phrase_confirm":
+        send_telegram_text(chat.get("id"), "Нажми Да/Нет под сообщением для добавления фразы.")
+        return {"ok": True}
+    if st == "await_add_bulk_confirm":
+        send_telegram_text(chat.get("id"), "Нажми Да/Нет под сообщением для пакетного добавления.")
         return {"ok": True}
     return {"ok": True}
 
@@ -1632,9 +2636,118 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             answer_callback(cb_id, "Нет доступа")
         return {"ok": True}
     action, post_id, extra = _parse_callback_data(data)
-    if not post_id:
+    if action in {"manual", "manualsave", "addphrases", "addphrase", "addbulk"}:
+        pass
+    elif not post_id:
         if cb_id:
             answer_callback(cb_id, "Некорректная кнопка")
+        return {"ok": True}
+    if action == "manual":
+        tg_state_set(int(user_id), "await_manual_phrase_text", {})
+        if cb_id:
+            answer_callback(cb_id, "Пришли фразу текстом")
+        if chat_id:
+            send_telegram_text(chat_id, "Пришли текст фразы одним сообщением. После этого спрошу подтверждение Да/Нет.")
+        return {"ok": True}
+    if action == "manualsave":
+        decision = (extra or "").strip().lower()
+        state = tg_state_get(int(user_id))
+        if not state or state.get("state") != "await_manual_phrase_confirm":
+            if cb_id:
+                answer_callback(cb_id, "Нет ожидающей фразы")
+            if chat_id:
+                send_telegram_text(chat_id, "Нет ожидающей фразы. Нажми «Сгенерить пост вручную» и отправь фразу заново.")
+            return {"ok": True}
+        phrase_text = str((state.get("payload") or {}).get("phrase_text") or "").strip()
+        if decision != "yes":
+            tg_state_clear(int(user_id))
+            if cb_id:
+                answer_callback(cb_id, "Отменено")
+            if chat_id:
+                send_telegram_text(chat_id, "Создание фразы отменено. Задача отброшена.")
+            return {"ok": True}
+        if not phrase_text:
+            tg_state_clear(int(user_id))
+            if cb_id:
+                answer_callback(cb_id, "Пустая фраза")
+            if chat_id:
+                send_telegram_text(chat_id, "Не удалось взять текст фразы. Нажми «Сгенерить пост вручную» снова.")
+            return {"ok": True}
+        try:
+            phrase = upsert_phrase_text(phrase_text, is_published=0)
+            post = create_post_from_phrase(int(phrase["id"]), session_id="telegram-internal")
+            await create_preview(int(post["id"]), _mock_request({"scenario": "", "regen_instruction": ""}), session_id="telegram-internal")  # type: ignore[arg-type]
+            tg_state_clear(int(user_id))
+            if cb_id:
+                answer_callback(cb_id, "Создано")
+            if chat_id:
+                send_telegram_text(chat_id, f"Создано: фраза #{phrase['id']}, пост #{post['id']}. Превью отправлено.")
+            return {"ok": True}
+        except Exception as e:
+            tg_state_clear(int(user_id))
+            if cb_id:
+                answer_callback(cb_id, "Ошибка")
+            if chat_id:
+                send_telegram_text(chat_id, f"Ошибка создания: {str(e)[:300]}")
+            return {"ok": True}
+    if action == "addphrases":
+        tg_state_set(int(user_id), "await_add_phrase_input", {})
+        if cb_id:
+            answer_callback(cb_id, "Отправь текст или картинку")
+        if chat_id:
+            send_telegram_text(
+                chat_id,
+                "Режим добавления фраз: отправь текст (по строкам) или картинку. После этого подтверждение Да/Нет.",
+            )
+        return {"ok": True}
+    if action == "addphrase":
+        decision = (extra or "").strip().lower()
+        state = tg_state_get(int(user_id))
+        if not state or state.get("state") != "await_add_phrase_confirm":
+            if cb_id:
+                answer_callback(cb_id, "Нет ожидающей фразы")
+            return {"ok": True}
+        phrase_text = str((state.get("payload") or {}).get("phrase_text") or "").strip()
+        tg_state_set(int(user_id), "await_add_phrase_input", {})
+        if decision != "yes":
+            if cb_id:
+                answer_callback(cb_id, "Отменено")
+            if chat_id:
+                send_telegram_text(chat_id, "Добавление отменено.")
+            return {"ok": True}
+        if not phrase_text:
+            if cb_id:
+                answer_callback(cb_id, "Пустая фраза")
+            return {"ok": True}
+        phrase = upsert_phrase_text(phrase_text, is_published=0)
+        if cb_id:
+            answer_callback(cb_id, "Добавлено")
+        if chat_id:
+            send_telegram_text(chat_id, f"Фраза добавлена: #{phrase['id']}")
+        return {"ok": True}
+    if action == "addbulk":
+        decision = (extra or "").strip().lower()
+        state = tg_state_get(int(user_id))
+        if not state or state.get("state") != "await_add_bulk_confirm":
+            if cb_id:
+                answer_callback(cb_id, "Нет ожидающего пакета")
+            return {"ok": True}
+        phrases = [x.strip() for x in ((state.get("payload") or {}).get("phrases") or []) if str(x).strip()]
+        tg_state_set(int(user_id), "await_add_phrase_input", {})
+        if decision != "yes":
+            if cb_id:
+                answer_callback(cb_id, "Отменено")
+            if chat_id:
+                send_telegram_text(chat_id, "Пакетное добавление отменено.")
+            return {"ok": True}
+        inserted = 0
+        for phrase_text in phrases:
+            upsert_phrase_text(phrase_text, is_published=0)
+            inserted += 1
+        if cb_id:
+            answer_callback(cb_id, "Добавлено")
+        if chat_id:
+            send_telegram_text(chat_id, f"Добавлено фраз: {inserted}")
         return {"ok": True}
     if action == "cancel":
         update_post(post_id, status="cancelled")
@@ -1712,8 +2825,11 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/telegram/webhook")
 async def telegram_webhook(request: Request) -> dict[str, Any]:
+    if TELEGRAM_MODE != "webhook":
+        raise HTTPException(status_code=409, detail="Telegram mode is not webhook")
     secret = request.headers.get("x-telegram-bot-api-secret-token")
-    if TELEGRAM_WEBHOOK_SECRET and secret != TELEGRAM_WEBHOOK_SECRET:
+    expected = runtime_telegram_webhook_secret()
+    if expected and secret != expected:
         raise HTTPException(status_code=403, detail="Invalid telegram webhook secret")
     update = await request.json()
     if update.get("callback_query"):
@@ -1724,12 +2840,21 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/telegram/set-webhook")
-def telegram_set_webhook(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+async def telegram_set_webhook(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
-    if not TELEGRAM_BOT_TOKEN:
+    if not runtime_telegram_token():
         raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN not set")
-    # The actual public URL must be passed by client app via query param or body in a future iteration.
-    raise HTTPException(status_code=400, detail="Use Telegram setWebhook manually with your public URL + /api/telegram/webhook")
+    payload = await request.json()
+    public_url = (payload.get("public_url") or "").strip().rstrip("/")
+    if not public_url:
+        raise HTTPException(status_code=400, detail="public_url required, e.g. https://posting.example.com")
+    hook_url = f"{public_url}/api/telegram/webhook"
+    req: dict[str, Any] = {"url": hook_url}
+    secret = runtime_telegram_webhook_secret()
+    if secret:
+        req["secret_token"] = secret
+    res = telegram_api("setWebhook", req)
+    return {"ok": True, "hook_url": hook_url, "telegram": res}
 
 
 @app.get("/api/openrouter/pricing-note")
@@ -1746,702 +2871,11 @@ def pricing_note(session_id: Optional[str] = Cookie(default=None, alias=SESSION_
     }
 
 
-INDEX_HTML = """
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>KindlySupport Admin</title>
-  <style>
-    :root {
-      --bg: #eee7da;
-      --panel: #f8f4ec;
-      --panel2: #f4efe6;
-      --ink: #1f1a17;
-      --muted: #71685f;
-      --line: #d8cdbd;
-      --accent: #2f6b57;
-      --danger: #9f4c45;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      color: var(--ink);
-      font-family: Georgia, "Iowan Old Style", serif;
-      background:
-        radial-gradient(circle at 0% 0%, #fff7e5, transparent 35%),
-        radial-gradient(circle at 100% 0%, #efe2c8, transparent 40%),
-        linear-gradient(180deg, #ece4d5, #f4efe7);
-    }
-    .shell { max-width: 1360px; margin: 0 auto; padding: 20px; }
-    .card {
-      background: color-mix(in srgb, var(--panel) 92%, white);
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      box-shadow: 0 8px 30px rgba(50, 35, 18, .05);
-    }
-    .auth-wrap { max-width: 520px; margin: 36px auto; padding: 18px; }
-    h1 { margin: 0 0 8px; font-size: 30px; }
-    h2 { margin: 0 0 8px; font-size: 20px; }
-    h3 { margin: 0 0 8px; font-size: 16px; }
-    .small { font-size: 12px; color: var(--muted); }
-    .status { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
-    label { display:block; margin-top: 10px; font-size: 12px; color: var(--muted); }
-    input, textarea, select, button {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 10px;
-      font: inherit;
-      background: #fffdfa;
-      color: var(--ink);
-    }
-    textarea { min-height: 88px; resize: vertical; }
-    button { cursor: pointer; background: var(--ink); color: #fff; border-color: var(--ink); }
-    button.secondary { background: transparent; color: var(--ink); }
-    button.accent { background: var(--accent); border-color: var(--accent); }
-    button.danger { background: var(--danger); border-color: var(--danger); }
-    .row2 { display:grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .layout { display:grid; grid-template-columns: 1fr; gap: 16px; }
-    .side { padding: 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .side h2 { margin: 0 6px 0 0; font-size: 18px; }
-    .side hr { display: none; }
-    .main { padding: 14px; min-height: 70vh; }
-    .nav-btn { text-align: center; margin: 0; width: auto; }
-    .nav-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .module { display: none; }
-    .module.active { display: block; }
-    .grid { display:grid; grid-template-columns: 380px 1fr; gap: 12px; }
-    .panel { border: 1px solid var(--line); border-radius: 12px; background: var(--panel2); padding: 12px; }
-    .posts { max-height: 260px; overflow:auto; border:1px dashed var(--line); border-radius:12px; padding: 8px; background: #fffdf9; }
-    .post-item { padding: 8px; border-radius: 8px; border:1px solid transparent; cursor:pointer; }
-    .post-item:hover { background:#fff; border-color: var(--line); }
-    .post-item.selected { border-color: var(--accent); background: #fff; }
-    .toolbar { display:flex; gap:8px; flex-wrap:wrap; }
-    .toolbar button { width:auto; }
-    .chips { display:flex; gap:6px; flex-wrap:wrap; margin-top: 8px; }
-    .chips button { width:auto; }
-    .clickable-row { cursor: pointer; }
-    .clickable-row:hover { background: #f6efdf; }
-    .preview-card {
-      position: relative;
-      width: 100%;
-      aspect-ratio: 1 / 1;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      overflow: hidden;
-      background: linear-gradient(180deg, #d7d0c0, #c7bba4);
-      margin-top: 10px;
-    }
-    .preview-card img {
-      position: absolute; inset: 0;
-      width: 100%; height: 100%;
-      object-fit: cover;
-    }
-    .preview-card .shade {
-      position: absolute; inset: 0;
-      background: rgba(20, 16, 12, .45);
-    }
-    .preview-card .phrase {
-      position: absolute;
-      inset: 10% 8% 16% 8%;
-      display: grid;
-      place-items: center;
-      text-align: center;
-      color: #fffdf8;
-      font-weight: 700;
-      line-height: 1.22;
-      font-size: clamp(18px, 2vw, 30px);
-      text-shadow: 0 2px 16px rgba(0,0,0,.45);
-      white-space: pre-wrap;
-    }
-    .preview-card .wm {
-      position: absolute;
-      bottom: 12px;
-      width: 100%;
-      text-align: center;
-      color: rgba(255,255,255,.7);
-      font-size: 14px;
-      letter-spacing: .4px;
-    }
-    .dropzone {
-      border: 2px dashed var(--line);
-      border-radius: 12px;
-      padding: 14px;
-      background: #fffdf8;
-      color: var(--muted);
-      text-align: center;
-      transition: .15s ease;
-      margin-top: 8px;
-    }
-    .dropzone.dragover {
-      border-color: var(--accent);
-      background: #f3fbf7;
-      color: var(--ink);
-    }
-    pre { white-space: pre-wrap; word-break: break-word; background:#fffcf6; border:1px solid var(--line); padding:10px; border-radius:10px; max-height: 220px; overflow:auto; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; background: #fffdf9; border-radius: 12px; overflow:hidden; }
-    th, td { border-bottom: 1px solid var(--line); padding: 8px; vertical-align: top; text-align: left; }
-    .muted-box { border: 1px dashed var(--line); border-radius: 12px; padding: 12px; color: var(--muted); background: #fbf7ef; }
-    .hidden { display:none !important; }
-    @media (max-width: 980px) {
-      .grid { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <section id="authView" class="card auth-wrap">
-      <h1>KindlySupport</h1>
-      <div class="small">Авторизация закрывает все модули. После входа откроются разделы.</div>
-      <div id="authStatus" class="status">Не авторизован.</div>
-      <label>Email</label>
-      <input id="loginEmail" placeholder="admin@example.com" />
-      <label>Password</label>
-      <input id="loginPassword" type="password" placeholder="Пароль" />
-      <div style="margin-top:10px">
-        <button onclick="login()">Войти</button>
-      </div>
-    </section>
-
-    <section id="appView" class="layout hidden">
-      <aside class="card side">
-        <h2 style="margin-bottom:4px">Модули</h2>
-        <div id="configInfo" class="small" style="margin-bottom:10px">Загрузка...</div>
-        <button id="tab-phrases-content" class="nav-btn active" onclick="switchTab('phrases-content')">Фразы</button>
-        <button id="tab-phrases" class="nav-btn secondary" onclick="switchTab('phrases')">База фраз</button>
-        <button id="tab-parables" class="nav-btn secondary" onclick="switchTab('parables')">Притчи</button>
-        <button id="tab-films" class="nav-btn secondary" onclick="switchTab('films')">Фильмы</button>
-        <hr style="border:none;border-top:1px solid var(--line);margin:12px 0" />
-        <button class="secondary" onclick="logout()">Выйти</button>
-      </aside>
-
-      <main class="card main">
-        <section id="module-phrases-content" class="module active">
-          <h2>Фразы</h2>
-          <div class="small">Постинг идёт от контента: фраза → текст/картинка → превью → публикация.</div>
-          <div class="grid" style="margin-top:12px">
-            <div class="panel">
-              <h3>Работа с фразами</h3>
-              <div class="small">Основной сценарий: кликнуть по фразе в модуле <b>База фраз</b>. Ниже ручной ввод оставлен как резервный путь.</div>
-              <div class="toolbar" style="margin:8px 0 4px">
-                <button onclick="dailyPhrasePreview()">Утренний пост из неопубликованной</button>
-              </div>
-              <div id="dailyPhraseResult" class="small">Создаёт пост из первой фразы со статусом `0`, собирает превью и отправляет в Telegram.</div>
-              <label>Заголовок</label>
-              <input id="phrasePostTitle" placeholder="Например: Фраза дня" />
-              <label>Текст фразы</label>
-              <textarea id="phrasePostText" placeholder="Вставь фразу для публикации"></textarea>
-              <label>Режим источника</label>
-              <select id="modeSel" onchange="toggleMode()">
-                <option value="manual">Вручную</option>
-                <option value="link">По ссылке (для притч/текста)</option>
-              </select>
-              <div id="linkFields" class="hidden">
-                <label>Ссылка</label>
-                <input id="urlInput" placeholder="https://..." />
-              </div>
-              <button class="accent" style="margin-top:10px" onclick="createPhrasePost()">Создать пост</button>
-
-              <h3 style="margin-top:14px">Посты (фразы)</h3>
-              <div class="posts" id="postsList"></div>
-              <button class="secondary" style="margin-top:8px" onclick="loadPosts()">Обновить список</button>
-            </div>
-
-            <div class="panel">
-              <h3>Редактор, превью и публикация</h3>
-              <div id="emptyState" class="small">Выбери пост слева.</div>
-              <div id="editorArea" class="hidden">
-                <label>ID</label>
-                <input id="postId" disabled />
-                <label>Заголовок</label>
-                <input id="editTitle" />
-                <label>Текст</label>
-                <textarea id="editText" style="min-height:150px"></textarea>
-                <button class="secondary" onclick="savePost()">Сохранить текст</button>
-
-                <label>Сценарий картинки</label>
-                <textarea id="scenarioInput" style="min-height:80px"></textarea>
-                <div class="toolbar" style="margin-top:8px">
-                  <button onclick="generateScenarios(false)">Сгенерить сценарии</button>
-                  <button class="secondary" onclick="generateScenarios(true)">Стандартные</button>
-                </div>
-                <div class="chips" id="scenarioChips"></div>
-
-                <label>Инструкция для перегенерации</label>
-                <textarea id="regenInstruction" placeholder="Что учесть при перегенерации текста/картинки"></textarea>
-                <div class="toolbar" style="margin-top:8px">
-                  <button class="accent" onclick="buildPreview()">Собрать превью</button>
-                  <button class="secondary" onclick="regen('text')">Переген текст</button>
-                  <button class="secondary" onclick="regen('image')">Переген картинку</button>
-                  <button class="secondary" onclick="regen('both')">Переген оба</button>
-                </div>
-
-                <label>Статус</label>
-                <input id="statusInput" disabled />
-                <label>Дата/время публикации (ISO, MSK UTC+3)</label>
-                <input id="scheduledAt" placeholder="2026-02-23T10:00:00+03:00" />
-                <label>Текст для замены фразы</label>
-                <textarea id="replacementText"></textarea>
-                <div class="toolbar" style="margin-top:8px">
-                  <button onclick="publishNow()">Опубликовать сейчас</button>
-                  <button class="secondary" onclick="publishSchedule()">В указанное время</button>
-                  <button class="secondary" onclick="replacePhrase()">Заменить фразу</button>
-                </div>
-
-                <label>Подпись Telegram</label>
-                <pre id="captionPre"></pre>
-                <label>Prompt изображения</label>
-                <pre id="promptPre"></pre>
-                <label>Preview payload</label>
-                <pre id="previewPre"></pre>
-                <label>Визуальный пост (авто-сборка)</label>
-                <div id="visualPostCard" class="preview-card">
-                  <div class="shade"></div>
-                  <div class="phrase" id="visualPostPhrase">Выбери фразу и собери превью</div>
-                  <div class="wm" id="visualPostWm">@kindlysupport</div>
-                </div>
-                <label>Логи генерации изображений</label>
-                <button class="secondary" onclick="loadImageLogs()">Обновить логи</button>
-                <pre id="imgLogsPre"></pre>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section id="module-phrases" class="module">
-          <h2>База фраз</h2>
-          <div class="small">Здесь хранятся все фразы: опубликованные (`1`) и новые (`0`). Клик по строке создаёт пост по этой фразе.</div>
-          <div id="phrasesListView" style="margin-top:12px">
-            <div class="panel">
-              <div class="toolbar">
-                <button class="accent" onclick="openPhrasesImport()">Импорт фраз</button>
-                <button onclick="loadPhrases()">Обновить базу фраз</button>
-              </div>
-              <div class="small" id="phrasesStats" style="margin:8px 0">Нет данных</div>
-              <div style="max-height:620px; overflow:auto;">
-                <table>
-                  <thead><tr><th>ID</th><th>Статус</th><th>Фраза</th></tr></thead>
-                  <tbody id="phrasesTableBody"></tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-
-          <div id="phrasesImportView" class="hidden" style="margin-top:12px">
-            <div class="panel">
-              <div class="toolbar">
-                <button class="secondary" onclick="closePhrasesImport()">Назад к списку</button>
-              </div>
-              <h3 style="margin-top:8px">Импорт фраз</h3>
-
-              <h3 style="margin-top:14px">Загрузка фраз (текст)</h3>
-              <div class="small">Одна строка = одна фраза. Можно загрузить сразу как новые (`0`) или как опубликованные (`1`).</div>
-              <textarea id="phrasesTextInput" style="min-height:120px" placeholder="Каждая строка = отдельная фраза"></textarea>
-              <div class="toolbar" style="margin-top:8px">
-                <button class="accent" onclick="importPhrasesText(0)">Загрузить как новые (0)</button>
-                <button class="secondary" onclick="importPhrasesText(1)">Загрузить как опубликованные (1)</button>
-              </div>
-
-              <h3 style="margin-top:14px">Загрузка фраз (картинка)</h3>
-              <div class="small">Вставь ссылку на картинку с фразами или перетащи файл. OCR распознает текст и запишет фразы в БД.</div>
-              <div id="phrasesDropzone" class="dropzone"
-                   ondragover="onPhraseImageDragOver(event)"
-                   ondragleave="onPhraseImageDragLeave(event)"
-                   ondrop="onPhraseImageDrop(event)">
-                Перетащи картинку с рабочего стола сюда
-                <div class="small" style="margin-top:6px">PNG / JPG / WEBP. Картинка уйдёт на распознавание и фразы запишутся в БД автоматически.</div>
-              </div>
-              <div id="phrasesDropResult" class="status"></div>
-              <label>Ссылка на картинку</label>
-              <input id="phrasesImageUrl" placeholder="https://...png/jpg/webp" />
-              <div class="toolbar" style="margin-top:8px">
-                <button onclick="ocrPhrasesImage()">Распознать</button>
-                <button class="secondary" onclick="useOcrAsTextImport()">Перенести OCR в текстовый импорт</button>
-              </div>
-              <label>OCR результат</label>
-              <textarea id="phrasesOcrText" style="min-height:110px" placeholder="Сюда попадет распознанный текст"></textarea>
-
-              <h3 style="margin-top:14px">Импорт TSV</h3>
-              <div class="small">Формат строки: `1<TAB>текст` или `0<TAB>текст`.</div>
-              <textarea id="phrasesTsvInput" style="min-height:260px" placeholder="Вставь список фраз сюда"></textarea>
-              <button class="accent" style="margin-top:8px" onclick="importPhrasesTsv()">Импортировать в БД</button>
-              <div id="phrasesImportResult" class="status"></div>
-            </div>
-          </div>
-        </section>
-
-        <section id="module-parables" class="module">
-          <h2>Притчи</h2>
-          <div class="small">Отдельный модуль притч. Сейчас использует тот же backend-пайплайн (создание/превью/публикация), но UI будет выделен отдельно.</div>
-          <div class="muted-box" style="margin-top:12px">
-            В следующем шаге сюда вынесем отдельный интерфейс: ручной ввод притчи, вставка ссылки, распознавание, редактор и превью.
-            Пока для теста используй модуль <b>Фразы</b>.
-          </div>
-        </section>
-
-        <section id="module-films" class="module">
-          <h2>Фильмы</h2>
-          <div class="small">Отдельный модуль для будущего сценария "фильмы".</div>
-          <div class="muted-box" style="margin-top:12px">
-            Заглушка. Добавим отдельные сущности, импорты и шаблоны публикаций после завершения Telegram-потока для фраз/притч.
-          </div>
-        </section>
-      </main>
-    </section>
-  </div>
-
-  <script>
-    let selectedPostId = null;
-    let isAuthorized = false;
-
-    async function api(url, method='GET', body) {
-      const res = await fetch(url, {
-        method,
-        headers: {'Content-Type': 'application/json'},
-        credentials: 'include',
-        body: body ? JSON.stringify(body) : undefined
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
-      return data;
-    }
-
-    function toggleMode() {
-      const mode = document.getElementById('modeSel').value;
-      document.getElementById('linkFields').classList.toggle('hidden', mode !== 'link');
-    }
-
-    function setAuthUI(auth) {
-      isAuthorized = auth;
-      document.getElementById('authView').classList.toggle('hidden', auth);
-      document.getElementById('appView').classList.toggle('hidden', !auth);
-      document.getElementById('authStatus').textContent = auth ? 'Авторизован.' : 'Не авторизован.';
-    }
-
-    function openPhrasesImport() {
-      document.getElementById('phrasesListView').classList.add('hidden');
-      document.getElementById('phrasesImportView').classList.remove('hidden');
-    }
-
-    function closePhrasesImport() {
-      document.getElementById('phrasesImportView').classList.add('hidden');
-      document.getElementById('phrasesListView').classList.remove('hidden');
-    }
-
-    function switchTab(tab) {
-      ['phrases-content','phrases','parables','films'].forEach(t => {
-        document.getElementById(`module-${t}`).classList.toggle('active', t === tab);
-        const btn = document.getElementById(`tab-${t}`);
-        btn.classList.toggle('active', t === tab);
-        btn.classList.toggle('secondary', t !== tab);
-      });
-      if (tab === 'phrases') {
-        closePhrasesImport();
-      }
-    }
-
-    async function loadConfig() {
-      try {
-        const cfg = await api('/api/config');
-        setAuthUI(true);
-        document.getElementById('configInfo').textContent =
-          `DB=${cfg.db_backend} | Telegram=${cfg.telegram?.bot_configured ? 'ok' : 'off'} | image=${cfg.models.image}`;
-      } catch (e) {
-        setAuthUI(false);
-      }
-    }
-
-    async function login() {
-      await api('/api/login', 'POST', {
-        email: document.getElementById('loginEmail').value.trim(),
-        password: document.getElementById('loginPassword').value
-      });
-      await loadConfig();
-      await Promise.all([loadPosts(), loadPhrases()]);
-    }
-
-    async function logout() {
-      try { await api('/api/logout', 'POST', {}); } catch (e) {}
-      selectedPostId = null;
-      setAuthUI(false);
-      document.getElementById('postsList').innerHTML = '';
-      document.getElementById('phrasesTableBody').innerHTML = '';
-      document.getElementById('emptyState').classList.remove('hidden');
-      document.getElementById('editorArea').classList.add('hidden');
-    }
-
-    async function createPhrasePost() {
-      const mode = document.getElementById('modeSel').value;
-      const body = {
-        mode,
-        title: (document.getElementById('phrasePostTitle').value || 'Фраза дня').trim()
-      };
-      if (mode === 'manual') body.text_body = document.getElementById('phrasePostText').value;
-      if (mode === 'link') body.url = document.getElementById('urlInput').value;
-      const post = await api('/api/posts', 'POST', body);
-      await loadPosts();
-      await selectPost(post.id);
-      switchTab('phrases-content');
-    }
-
-    async function createPostFromPhraseId(phraseId) {
-      const post = await api(`/api/phrases/${phraseId}/create-post`, 'POST', {});
-      switchTab('phrases-content');
-      await loadPosts();
-      await selectPost(post.id);
-    }
-
-    async function dailyPhrasePreview() {
-      try {
-        const res = await api('/api/phrases/daily-preview', 'POST', {});
-        document.getElementById('dailyPhraseResult').textContent =
-          `Создан пост #${res.post.id} из фразы #${res.phrase_id}. Превью отправлено.`;
-        switchTab('phrases-content');
-        await loadPosts();
-        await selectPost(res.post.id);
-        await loadPhrases();
-      } catch (e) {
-        document.getElementById('dailyPhraseResult').textContent = String(e.message || e);
-      }
-    }
-
-    async function loadPosts() {
-      if (!isAuthorized) return;
-      const posts = await api('/api/posts');
-      const el = document.getElementById('postsList');
-      el.innerHTML = '';
-      posts.forEach(p => {
-        const item = document.createElement('div');
-        item.className = 'post-item' + (p.id === selectedPostId ? ' selected' : '');
-        item.innerHTML = `<div><b>#${p.id}</b> ${escapeHtml(p.title)}</div><div class="small">${escapeHtml(p.status)} · ${escapeHtml(p.source_kind)}</div>`;
-        item.onclick = () => selectPost(p.id);
-        el.appendChild(item);
-      });
-    }
-
-    async function selectPost(id) {
-      selectedPostId = id;
-      const p = await api(`/api/posts/${id}`);
-      document.getElementById('emptyState').classList.add('hidden');
-      document.getElementById('editorArea').classList.remove('hidden');
-      document.getElementById('postId').value = p.id;
-      document.getElementById('editTitle').value = p.title || '';
-      document.getElementById('editText').value = p.text_body || '';
-      document.getElementById('scenarioInput').value = p.selected_scenario || (p.image_scenarios?.[0] || '');
-      document.getElementById('statusInput').value = p.status || '';
-      document.getElementById('captionPre').textContent = p.telegram_caption || '';
-      document.getElementById('promptPre').textContent = p.image_prompt || '';
-      document.getElementById('previewPre').textContent = p.preview_payload ? JSON.stringify(p.preview_payload, null, 2) : '';
-      renderScenarioChips(p.image_scenarios || []);
-      renderVisualPostCard(p);
-      document.getElementById('replacementText').value = '';
-      await loadImageLogs();
-      await loadPosts();
-    }
-
-    function renderVisualPostCard(post) {
-      const box = document.getElementById('visualPostCard');
-      const phraseEl = document.getElementById('visualPostPhrase');
-      const wmEl = document.getElementById('visualPostWm');
-      const phrase = (post.title || post.text_body || '').trim() || 'Фраза';
-      phraseEl.textContent = phrase;
-      wmEl.textContent = '@kindlysupport';
-      const existingImg = box.querySelector('img');
-      if (existingImg) existingImg.remove();
-      if (post.final_image_url) {
-        const img = document.createElement('img');
-        img.src = post.final_image_url;
-        img.alt = 'generated';
-        box.prepend(img);
-      }
-    }
-
-    function renderScenarioChips(scenarios) {
-      const wrap = document.getElementById('scenarioChips');
-      wrap.innerHTML = '';
-      scenarios.forEach(s => {
-        const b = document.createElement('button');
-        b.className = 'secondary';
-        b.textContent = s;
-        b.onclick = () => { document.getElementById('scenarioInput').value = s; };
-        wrap.appendChild(b);
-      });
-    }
-
-    async function savePost() {
-      if (!selectedPostId) return;
-      await api(`/api/posts/${selectedPostId}`, 'PUT', {
-        title: document.getElementById('editTitle').value,
-        text_body: document.getElementById('editText').value
-      });
-      await selectPost(selectedPostId);
-    }
-
-    async function generateScenarios(forceDefault) {
-      if (!selectedPostId) return;
-      await api(`/api/posts/${selectedPostId}/image-scenarios`, 'POST', {force_default: forceDefault});
-      await selectPost(selectedPostId);
-    }
-
-    async function buildPreview() {
-      if (!selectedPostId) return;
-      await api(`/api/posts/${selectedPostId}/preview`, 'POST', {
-        scenario: document.getElementById('scenarioInput').value,
-        regen_instruction: document.getElementById('regenInstruction').value
-      });
-      await selectPost(selectedPostId);
-    }
-
-    async function regen(target) {
-      if (!selectedPostId) return;
-      await api(`/api/posts/${selectedPostId}/regenerate`, 'POST', {
-        target,
-        instruction: document.getElementById('regenInstruction').value
-      });
-      await selectPost(selectedPostId);
-    }
-
-    async function publishNow() {
-      if (!selectedPostId) return;
-      await api(`/api/posts/${selectedPostId}/publish`, 'POST', { mode: 'now' });
-      await selectPost(selectedPostId);
-    }
-
-    async function publishSchedule() {
-      if (!selectedPostId) return;
-      await api(`/api/posts/${selectedPostId}/publish`, 'POST', {
-        mode: 'schedule',
-        scheduled_for: document.getElementById('scheduledAt').value
-      });
-      await selectPost(selectedPostId);
-    }
-
-    async function replacePhrase() {
-      if (!selectedPostId) return;
-      await api(`/api/posts/${selectedPostId}/publish`, 'POST', {
-        mode: 'replace_phrase',
-        replacement_phrase: document.getElementById('replacementText').value
-      });
-      await selectPost(selectedPostId);
-    }
-
-    async function loadImageLogs() {
-      try {
-        const logs = await api('/api/logs/image');
-        document.getElementById('imgLogsPre').textContent = JSON.stringify(logs.slice(0, 20), null, 2);
-      } catch (e) {
-        document.getElementById('imgLogsPre').textContent = String(e.message || e);
-      }
-    }
-
-    async function loadPhrases() {
-      if (!isAuthorized) return;
-      try {
-        const rows = await api('/api/phrases');
-        const body = document.getElementById('phrasesTableBody');
-        body.innerHTML = '';
-        let pub = 0;
-        let unpub = 0;
-        rows.forEach(r => {
-          if (Number(r.is_published) === 1) pub += 1; else unpub += 1;
-          const tr = document.createElement('tr');
-          tr.className = 'clickable-row';
-          tr.innerHTML = `<td>${r.id}</td><td>${Number(r.is_published) ? '1 (опубл.)' : '0 (не опубл.)'}</td><td>${escapeHtml(r.text_body || '')}</td>`;
-          tr.onclick = () => createPostFromPhraseId(r.id);
-          body.appendChild(tr);
-        });
-        document.getElementById('phrasesStats').textContent = `Всего: ${rows.length} | Опубликовано: ${pub} | Не опубликовано: ${unpub}`;
-        if (rows.length === 0) {
-          document.getElementById('phrasesImportResult').textContent = 'База фраз пустая. Загрузи фразы текстом, по картинке (OCR) или TSV.';
-        }
-      } catch (e) {
-        document.getElementById('phrasesStats').textContent = String(e.message || e);
-      }
-    }
-
-    async function importPhrasesTsv() {
-      const raw = document.getElementById('phrasesTsvInput').value;
-      const res = await api('/api/phrases/import-tsv', 'POST', { raw_tsv: raw });
-      document.getElementById('phrasesImportResult').textContent = `Импорт завершен: parsed=${res.parsed}, inserted=${res.inserted}, updated=${res.updated}, skipped=${res.skipped}`;
-      await loadPhrases();
-      closePhrasesImport();
-    }
-
-    async function importPhrasesText(isPublished) {
-      const raw = document.getElementById('phrasesTextInput').value;
-      const res = await api('/api/phrases/import-text', 'POST', { raw_text: raw, is_published: isPublished });
-      document.getElementById('phrasesImportResult').textContent = `Текстовый импорт: parsed=${res.parsed}, inserted=${res.inserted}, updated=${res.updated}`;
-      await loadPhrases();
-      closePhrasesImport();
-    }
-
-    async function ocrPhrasesImage() {
-      const imageUrl = (document.getElementById('phrasesImageUrl').value || '').trim();
-      const res = await api('/api/phrases/import-image-url', 'POST', { image_url: imageUrl });
-      document.getElementById('phrasesOcrText').value = res.ocr_text || '';
-    }
-
-    function useOcrAsTextImport() {
-      document.getElementById('phrasesTextInput').value = document.getElementById('phrasesOcrText').value || '';
-    }
-
-    function onPhraseImageDragOver(ev) {
-      ev.preventDefault();
-      document.getElementById('phrasesDropzone').classList.add('dragover');
-    }
-
-    function onPhraseImageDragLeave(ev) {
-      ev.preventDefault();
-      document.getElementById('phrasesDropzone').classList.remove('dragover');
-    }
-
-    async function onPhraseImageDrop(ev) {
-      ev.preventDefault();
-      const dz = document.getElementById('phrasesDropzone');
-      dz.classList.remove('dragover');
-      const files = ev.dataTransfer?.files;
-      if (!files || !files.length) return;
-      const file = files[0];
-      if (!file.type.startsWith('image/')) {
-        document.getElementById('phrasesDropResult').textContent = 'Нужен файл-картинка (image/*).';
-        return;
-      }
-      document.getElementById('phrasesDropResult').textContent = `Загрузка и распознавание: ${file.name}...`;
-      try {
-        const dataUrl = await fileToDataUrl(file);
-        const res = await api('/api/phrases/import-image-base64', 'POST', {
-          image_data_url: dataUrl,
-          is_published: 0
-        });
-        document.getElementById('phrasesOcrText').value = res.ocr_text || '';
-        document.getElementById('phrasesDropResult').textContent =
-          `Готово: parsed=${res.parsed}, inserted=${res.inserted}, updated=${res.updated}`;
-        await loadPhrases();
-        closePhrasesImport();
-      } catch (e) {
-        document.getElementById('phrasesDropResult').textContent = String(e.message || e);
-      }
-    }
-
-    function fileToDataUrl(file) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-    }
-
-    function escapeHtml(s='') {
-      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
-
-    toggleMode();
-    switchTab('phrases-content');
-    loadConfig();
-  </script>
-</body>
-</html>
-"""
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+def spa_fallback(full_path: str) -> Any:
+    if full_path.startswith("api/") or full_path in {"health"}:
+        raise HTTPException(status_code=404, detail="not found")
+    index_file = FRONTEND_DIST_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    raise HTTPException(status_code=503, detail="Frontend dist not found")

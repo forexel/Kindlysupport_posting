@@ -27,12 +27,23 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-kindly}:${POSTGRES_PASSWORD:-kindlypass}@postgres:5432/${POSTGRES_DB:-kindlysupport}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+      APP_SECURE_COOKIES: ${APP_SECURE_COOKIES:-0}
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-18210}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
   postgres_data:

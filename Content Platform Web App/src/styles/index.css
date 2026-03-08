@@ -1,0 +1,12 @@
+@import './fonts.css';
+@import './tailwind.css';
+@import './theme.css';
+
+/* Force dark theme */
+:root {
+  color-scheme: dark;
+}
+
+html {
+  min-height: 100%;
+}

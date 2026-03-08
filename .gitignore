@@ -25,3 +25,12 @@ docker-compose.override.yml
 
 # IDEs
 .vscode/
+
+# Frontend local deps/build cache
+Content Platform Web App/node_modules/
+
+# Local editor artifacts
+*.swp
+
+# Optional local archive
+Content Platform Web App.zip
