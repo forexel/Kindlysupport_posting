@@ -2273,7 +2273,7 @@ async def ocr_phrase_images_base64(request: Request, session_id: Optional[str] =
 
 
 @app.post("/api/phrases/import-image-base64")
-async def import_phrase_image_base64_legacy(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+async def import_phrase_image_base64(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     """Backward compatible endpoint: OCR + auto-import."""
     ensure_auth(session_id)
     payload = await request.json()
