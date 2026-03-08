@@ -2087,8 +2087,20 @@ async def import_phrases_text(request: Request, session_id: Optional[str] = Cook
 @app.post("/api/phrases/import-csv")
 async def import_phrases_csv(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
-    payload = await request.json()
-    raw_csv = (payload.get("raw_csv") or "").strip()
+    raw_csv = ""
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        upload = form.get("file")
+        if upload and hasattr(upload, "read"):
+            file_bytes = await upload.read()
+            raw_csv = file_bytes.decode("utf-8-sig", errors="ignore").strip()
+    else:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON payload") from exc
+        raw_csv = (payload.get("raw_csv") or "").strip()
     if not raw_csv:
         raise HTTPException(status_code=400, detail="raw_csv is required")
     reader = csv.DictReader(io.StringIO(raw_csv))
