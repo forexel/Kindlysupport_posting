@@ -28,7 +28,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu';
-import { Upload, Search, MoreVertical, Trash2, Check, Sparkles } from 'lucide-react';
+import { Upload, Search, MoreVertical, Trash2, Check, Sparkles, WandSparkles } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../lib/api';
 
@@ -199,15 +199,25 @@ export function PhrasesPage() {
                   </TableCell>
                   <TableCell className="text-zinc-400">{(phrase.created_at || '').slice(0, 10)}</TableCell>
                   <TableCell>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="sm" className="text-zinc-400 hover:text-zinc-200"><MoreVertical className="h-4 w-4" /></Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="bg-zinc-900 border-zinc-800">
-                        <DropdownMenuItem className="text-zinc-300 focus:bg-zinc-800" onClick={() => handleGenerateForPhrase(phrase.id)}>Генерировать пост</DropdownMenuItem>
-                        <DropdownMenuItem className="text-red-400 focus:bg-zinc-800" onClick={async () => { await api(`/api/phrases/${phrase.id}`, 'DELETE', {}); await loadPhrases(); }}>Удалить</DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+                    <div className="flex items-center justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-blue-300 hover:text-blue-200 hover:bg-zinc-800"
+                        title="Генерировать пост"
+                        onClick={() => handleGenerateForPhrase(phrase.id)}
+                      >
+                        <WandSparkles className="h-4 w-4" />
+                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="sm" className="text-zinc-400 hover:text-zinc-200"><MoreVertical className="h-4 w-4" /></Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="bg-zinc-900 border-zinc-800">
+                          <DropdownMenuItem className="text-red-400 focus:bg-zinc-800" onClick={async () => { await api(`/api/phrases/${phrase.id}`, 'DELETE', {}); await loadPhrases(); }}>Удалить</DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))
