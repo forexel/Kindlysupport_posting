@@ -401,14 +401,8 @@ def init_db() -> None:
                 except Exception:
                     pass
         if DB_BACKEND == "postgres":
-            try:
-                conn.execute("ALTER TABLE sessions ADD COLUMN csrf_token TEXT")
-            except Exception:
-                pass
-            try:
-                conn.execute("ALTER TABLE phrases ADD COLUMN topic TEXT")
-            except Exception:
-                pass
+            conn.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS csrf_token TEXT")
+            conn.execute("ALTER TABLE phrases ADD COLUMN IF NOT EXISTS topic TEXT")
         else:
             try:
                 conn.execute("ALTER TABLE phrases ADD COLUMN topic TEXT")
