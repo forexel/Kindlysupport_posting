@@ -63,20 +63,51 @@ export function PhrasesImportPage() {
       const images = await Promise.all(selected.map(async (f) => ({ name: f.name, image_data_url: await toDataUrl(f) })));
       const res = await api<{ items: any[]; recognized: number; total: number }>('/api/phrases/ocr-images-base64', 'POST', { images });
 
-      setFiles((prev) =>
-        prev.map((f) => {
-          const item = res.items.find((x) => x.name === f.fileName);
-          if (!item) return f;
-          if (!item.ok) return { ...f, status: 'error', error: item.error || 'OCR error' };
-          return {
-            ...f,
-            status: 'completed',
-            text: (item.phrase || '').trim(),
-            editable: false,
-            selected: Boolean((item.phrase || '').trim()),
-          };
-        })
-      );
+      setFiles((prev) => {
+        const initialIds = new Set(initial.map((x) => x.id));
+        const keep = prev.filter((x) => !initialIds.has(x.id));
+        const expanded: OCRResult[] = [];
+
+        for (const base of initial) {
+          const item = res.items.find((x) => x.name === base.fileName);
+          if (!item || !item.ok) {
+            expanded.push({
+              ...base,
+              status: 'error',
+              error: (item && item.error) || 'OCR error',
+              selected: false,
+            });
+            continue;
+          }
+
+          const phrases: string[] = Array.isArray(item.phrases)
+            ? item.phrases.map((p: any) => String(p || '').trim()).filter(Boolean)
+            : [String(item.phrase || '').trim()].filter(Boolean);
+
+          if (!phrases.length) {
+            expanded.push({
+              ...base,
+              status: 'error',
+              error: 'Фразы не найдены',
+              selected: false,
+            });
+            continue;
+          }
+
+          phrases.forEach((p, idx) => {
+            expanded.push({
+              id: `${base.id}-${idx + 1}`,
+              fileName: phrases.length > 1 ? `${base.fileName} • ${idx + 1}/${phrases.length}` : base.fileName,
+              status: 'completed',
+              text: p,
+              editable: false,
+              selected: true,
+            });
+          });
+        }
+
+        return [...keep, ...expanded];
+      });
       toast.success(`Распознано ${res.recognized} из ${res.total}`);
     } catch (e: any) {
       setFiles((prev) => prev.map((f) => (f.status === 'processing' ? { ...f, status: 'error', error: String(e?.message || e) } : f)));

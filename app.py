@@ -1030,12 +1030,14 @@ def openrouter_extract_text_from_image(image_url: str) -> str:
                     {
                         "type": "text",
                         "text": (
-                            "Извлеки ТОЛЬКО основную фразу с карточки на изображении.\n"
+                            "Извлеки все самостоятельные фразы/высказывания с изображения.\n"
                             "Правила:\n"
-                            "- Верни только текст самой фразы, без заголовков, пояснений и markdown.\n"
+                            "- Каждую фразу верни с новой строки.\n"
+                            "- Верни только текст фраз, без заголовков, пояснений и markdown.\n"
                             "- Игнорируй служебные элементы интерфейса (например: 'Поделиться', 'Вопрос сессии').\n"
-                            "- Если фраза состоит из нескольких строк, верни её одной строкой.\n"
-                            "- Если фразу прочитать нельзя, верни пустую строку."
+                            "- Если одна фраза разбита на несколько строк, склей её в одну строку.\n"
+                            "- Убирай нумерацию вида '1.'/'2.' в начале строк.\n"
+                            "- Если фразы прочитать нельзя, верни пустую строку."
                         ),
                     },
                     {"type": "image_url", "image_url": {"url": image_url}},
@@ -1163,9 +1165,18 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
     if not cleaned_lines:
         return []
 
-    # Prefer single consolidated phrase for card-style images.
-    consolidated = re.sub(r"\s+", " ", " ".join(cleaned_lines)).strip()
-    candidates = [consolidated] + cleaned_lines
+    # If model returns a single line with numbered list, split it.
+    if len(cleaned_lines) == 1:
+        one = cleaned_lines[0]
+        parts = re.split(r"(?:^|\s)(?:\d{1,2}[\.\)]\s+)", one)
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if len(parts) > 1:
+            cleaned_lines = parts
+
+    # For multi-phrase pages keep separate lines; for single-card keep one line.
+    candidates = cleaned_lines
+    if len(cleaned_lines) == 1:
+        candidates = [re.sub(r"\s+", " ", cleaned_lines[0]).strip()]
 
     phrases: list[str] = []
     seen: set[str] = set()
@@ -1180,6 +1191,8 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
         if "extracted text" in low or "visible text" in low:
             continue
         if low in {"поделиться", "вопрос сессии"}:
+            continue
+        if c.endswith(":"):
             continue
         seen.add(low)
         phrases.append(c)
