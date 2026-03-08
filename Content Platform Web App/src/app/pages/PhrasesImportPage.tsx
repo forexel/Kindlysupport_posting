@@ -217,16 +217,21 @@ export function PhrasesImportPage() {
 
                 <div className="space-y-2 max-h-96 overflow-y-auto">
                   {files.map((file) => (
-                    <div key={file.id} className="bg-zinc-800 border border-zinc-700 rounded-lg p-4 space-y-2">
+                    <div
+                      key={file.id}
+                      className={`rounded-lg p-4 space-y-2 border ${
+                        file.selected ? 'bg-green-950/20 border-green-800' : 'bg-zinc-800 border-zinc-700'
+                      }`}
+                    >
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
-                          {file.status === 'completed' && (
-                            <Checkbox
-                              checked={file.selected}
-                              onCheckedChange={(checked) => handleToggleSelected(file.id, Boolean(checked))}
-                              className="border-zinc-600"
-                            />
-                          )}
+                          <Checkbox
+                            checked={file.selected}
+                            disabled={!(file.status === 'completed' && file.text.trim())}
+                            onCheckedChange={(checked) => handleToggleSelected(file.id, Boolean(checked))}
+                            className="border-zinc-500"
+                          />
+                          <span className="text-xs text-zinc-400 min-w-[64px]">Сохранить</span>
                           {file.status === 'processing' && <Loader2 className="h-4 w-4 text-blue-400 animate-spin" />}
                           {file.status === 'completed' && <Check className="h-4 w-4 text-green-400" />}
                           {file.status === 'error' && <X className="h-4 w-4 text-red-400" />}
