@@ -1242,7 +1242,8 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
         if i + 1 < len(phrases):
             nxt = phrases[i + 1]
             if _is_probable_author_line(nxt) and len(current) >= 28:
-                merged.append(f"{current} ({nxt})")
+                quote = current.rstrip(" .")
+                merged.append(f"{quote}. {nxt}")
                 i += 2
                 continue
         merged.append(current)
