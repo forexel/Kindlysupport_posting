@@ -3,16 +3,19 @@ import os
 import secrets
 import sqlite3
 import time
+import base64
+import io
 import urllib.parse
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Cookie, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
-
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from PIL import Image
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -49,8 +52,12 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me").strip()
 SESSION_COOKIE = "session_id"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_TEXT_MODEL = os.getenv("OPENROUTER_TEXT_MODEL", "openai/gpt-4o-mini").strip()
-OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "meta-llama/llama-4-scout").strip()
-OPENROUTER_IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "openai/gpt-5-image-mini").strip()
+OPENROUTER_OCR_MODEL = os.getenv("OPENROUTER_OCR_MODEL", "openai/gpt-4.1-mini").strip()
+OPENROUTER_PROMPT_MODEL = os.getenv("OPENROUTER_PROMPT_MODEL", "openai/gpt-4o-mini").strip()
+OPENROUTER_IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "black-forest-labs/flux.2-pro").strip()
+IMAGE_WORK_SIZE = os.getenv("IMAGE_WORK_SIZE", "1536x1024").strip()
+IMAGE_FINAL_SIZE = int(os.getenv("IMAGE_FINAL_SIZE", "1024").strip() or "1024")
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "generated_media")).resolve()
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "http://localhost:8000").strip()
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "KindlySupport Posting").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -621,6 +628,34 @@ def default_image_prompt(title: str, scenario: str, extra_instruction: str = "")
     return prompt
 
 
+def llm_image_prompt(title: str, text_body: str, scenario: str, extra_instruction: str = "") -> str:
+    prompt = (
+        "You are preparing a production image-generation prompt for Flux.2 Pro. "
+        "Return only the final prompt text, no markdown, no explanations.\\n\\n"
+        f"Post title: {title}\\n"
+        f"Post body (context): {text_body[:2500]}\\n"
+        f"Visual scenario: {scenario}\\n"
+        f"Editor note: {extra_instruction or 'none'}\\n\\n"
+        "Requirements:\\n"
+        "- Cinematic photorealistic style, natural lighting, rich realistic textures.\\n"
+        "- Absolutely no text, letters, symbols, watermark, logo, UI, signature.\\n"
+        "- No people, no hands, no fingers, no faces.\\n"
+        "- Strong center-safe composition for future square crop 1024x1024.\\n"
+        "- Image should work as a calm inspirational background for Russian quote overlay.\\n"
+    )
+    raw = openrouter_chat(OPENROUTER_PROMPT_MODEL, [{"role": "user", "content": prompt}])
+    return ((raw.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
+
+
+def generate_post_text_from_phrase(phrase: str) -> str:
+    prompt = (
+        "Write a Russian inspirational post based on the phrase. "
+        "Output exactly 2 paragraphs, each 3-5 sentences. "
+        "No emojis, no hashtags, no markdown.\\n\\n"
+        f"Phrase: {phrase}"
+    )
+    raw = openrouter_chat(OPENROUTER_TEXT_MODEL, [{"role": "user", "content": prompt}])
+    return ((raw.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
 def estimate_cost_usd(model: str, usage: dict[str, Any]) -> Optional[float]:
     input_t = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
     output_t = usage.get("output_tokens") or usage.get("completion_tokens") or 0
@@ -680,7 +715,7 @@ def openrouter_generate_text(prompt: str) -> str:
 
 def openrouter_extract_text_from_image(image_url: str) -> str:
     res = openrouter_chat(
-        OPENROUTER_VISION_MODEL,
+        OPENROUTER_OCR_MODEL,
         [
             {
                 "role": "user",
@@ -703,29 +738,56 @@ def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024"
     usage = {}
     image_url = None
     try:
-        raw = openrouter_chat(
-            model,
-            [{"role": "user", "content": prompt}],
-            extra_body={
-                "modalities": ["image", "text"],
-                "image": {"size": size},
-            },
-        )
+        try:
+            raw = openrouter_chat(
+                model,
+                [{"role": "user", "content": prompt}],
+                extra_body={
+                    "modalities": ["image", "text"],
+                    "image": {"size": size},
+                },
+            )
+        except HTTPException as e:
+            detail = str(getattr(e, "detail", ""))
+            if "modalit" not in detail.lower() and "output" not in detail.lower():
+                raise
+            raw = openrouter_chat(
+                model,
+                [{"role": "user", "content": prompt}],
+                extra_body={
+                    "modalities": ["image"],
+                    "image": {"size": size},
+                },
+            )
+
         usage = raw.get("usage") or {}
         msg = (raw.get("choices") or [{}])[0].get("message", {})
         content = msg.get("content")
-        # Providers vary; try common shapes.
-        if isinstance(content, list):
+
+        images = msg.get("images")
+        if isinstance(images, list):
+            for img in images:
+                if isinstance(img, dict) and img.get("image_url", {}).get("url"):
+                    image_url = img["image_url"]["url"]
+                    break
+
+        if not image_url and isinstance(content, list):
             for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "image_url" and item.get("image_url", {}).get("url"):
-                        image_url = item["image_url"]["url"]
-                        break
-                    if item.get("type") == "output_image" and item.get("url"):
-                        image_url = item["url"]
-                        break
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image_url" and item.get("image_url", {}).get("url"):
+                    image_url = item["image_url"]["url"]
+                    break
+                if item.get("type") == "output_image" and item.get("url"):
+                    image_url = item["url"]
+                    break
+
+        if not image_url and isinstance(content, str) and content.startswith("data:image/"):
+            image_url = content
+
         if not image_url:
-            image_url = raw.get("image_url") or raw.get("output", {}).get("image_url")
+            image_url = raw.get("image_url") or (raw.get("output") or {}).get("image_url")
+
         if not image_url:
             raise RuntimeError("No image URL in response")
         return {"image_url": image_url, "raw": raw, "usage": usage, "latency_sec": round(time.time() - started, 2)}
@@ -761,6 +823,58 @@ def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024"
             )
 
 
+def _fetch_image_bytes(url_or_data: str) -> bytes:
+    if url_or_data.startswith("data:image/"):
+        try:
+            payload = url_or_data.split(",", 1)[1]
+            return base64.b64decode(payload)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to decode generated data image: {e}")
+
+    req = urllib.request.Request(url_or_data, headers={"User-Agent": "KindlySupport/1.0"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.read()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to download generated image: {e}")
+
+
+def _square_crop_png(image_bytes: bytes, final_size: int = IMAGE_FINAL_SIZE) -> bytes:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            rgb = img.convert("RGB")
+            w, h = rgb.size
+            side = min(w, h)
+            left = max(0, (w - side) // 2)
+            top = max(0, (h - side) // 2)
+            cropped = rgb.crop((left, top, left + side, top + side)).resize((final_size, final_size), Image.LANCZOS)
+            out = io.BytesIO()
+            cropped.save(out, format="PNG")
+            return out.getvalue()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to crop generated image: {e}")
+
+
+def _save_generated_media(post_id: int, image_bytes: bytes, suffix: str = "square") -> str:
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    filename = f"post_{post_id}_{suffix}_{ts}.png"
+    full = MEDIA_DIR / filename
+    full.write_bytes(image_bytes)
+    return f"{OPENROUTER_SITE_URL.rstrip('/')}/media/{filename}"
+
+
+def generate_square_image_for_post(post_id: int, image_prompt: str) -> dict[str, Any]:
+    raw_img = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size=IMAGE_WORK_SIZE)
+    source_image_url = raw_img["image_url"]
+    source_bytes = _fetch_image_bytes(source_image_url)
+    square_png = _square_crop_png(source_bytes, IMAGE_FINAL_SIZE)
+    final_image_url = _save_generated_media(post_id, square_png)
+    return {
+        "final_image_url": final_image_url,
+        "source_image_url": source_image_url,
+    }
+
 def extract_from_url(url: str) -> tuple[str, str]:
     lower = url.lower()
     if lower.endswith(".pdf"):
@@ -777,8 +891,17 @@ app = FastAPI(title="Kindlysupport Posting MVP")
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+
+@app.get("/media/{filename}")
+def media_file(filename: str) -> FileResponse:
+    safe_name = os.path.basename(filename)
+    path = MEDIA_DIR / safe_name
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="media file not found")
+    return FileResponse(path)
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return INDEX_HTML
@@ -818,9 +941,12 @@ def get_config(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
     ensure_auth(session_id)
     return {
         "models": {
-            "vision": OPENROUTER_VISION_MODEL,
+            "ocr": OPENROUTER_OCR_MODEL,
             "text": OPENROUTER_TEXT_MODEL,
+            "prompt": OPENROUTER_PROMPT_MODEL,
             "image": OPENROUTER_IMAGE_MODEL,
+            "work_size": IMAGE_WORK_SIZE,
+            "final_size": IMAGE_FINAL_SIZE,
         },
         "openrouter_key_configured": bool(OPENROUTER_API_KEY),
         "db_backend": DB_BACKEND,
@@ -833,7 +959,6 @@ def get_config(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
         "instagram_configured": bool(ENABLE_INSTAGRAM and INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_IG_USER_ID),
         "pinterest_configured": bool(ENABLE_PINTEREST and PINTEREST_ACCESS_TOKEN and PINTEREST_BOARD_ID),
     }
-
 
 @app.post("/api/posts")
 async def create_post(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
@@ -958,13 +1083,20 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
     caption = generate_caption(post["title"], post["text_body"])
     if post.get("source_kind") == "phrase":
         caption = generate_post_caption(post)
+
     image_prompt = default_image_prompt(post["title"], scenario, regen_instruction)
+    try:
+        image_prompt = llm_image_prompt(post["title"], post["text_body"], scenario, regen_instruction)
+    except Exception:
+        pass
 
     image_url = None
+    source_image_url = None
     image_error = None
     try:
-        result = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size="1024x1024")
-        image_url = result["image_url"]
+        result = generate_square_image_for_post(post_id=post_id, image_prompt=image_prompt)
+        image_url = result["final_image_url"]
+        source_image_url = result.get("source_image_url")
     except HTTPException as e:
         image_error = e.detail
     except Exception as e:
@@ -975,8 +1107,9 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
         "buttons": ["Опубликовать", "Перегенерировать", "Отмена"],
         "publish_options": ["Сейчас", "В указанное время и дату", "Заменить фразу"],
         "regenerate_options": ["Текст", "Картинку", "И то и то"],
-        "note": "При перегенерации админ присылает текст-инструкцию, он учитывается в prompt изображения.",
+        "note": "При перегенерации админ присылает текст-инструкцию, она учитывается в prompt изображения.",
         "image_error": image_error,
+        "source_image_url": source_image_url,
     }
     update_post(
         post_id,
@@ -1008,7 +1141,6 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
         post = fetch_post(post_id)
     return post
 
-
 @app.post("/api/posts/{post_id}/regenerate")
 async def regenerate_preview(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
@@ -1023,22 +1155,40 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
     scenario = post.get("selected_scenario") or "Стандартный реалистичный природный фон, квадратный"
 
     if target in ("text", "both") and instruction:
-        # MVP: keep structure strict, but allow short refinement by appending admin note to the body.
-        text_body = f"{post['text_body']}\n\nP.S. Уточнение редактора: {instruction}"
+        try:
+            rewrite_prompt = (
+                "Rewrite this Russian post body into exactly 2 paragraphs. "
+                "Keep the core meaning and style. No hashtags, no emojis.\n\n"
+                f"Current text:\n{post['text_body']}\n\n"
+                f"Editor instruction: {instruction}"
+            )
+            text_body = openrouter_generate_text(rewrite_prompt).strip() or post["text_body"]
+        except Exception:
+            text_body = post["text_body"]
         update_post(post_id, text_body=text_body)
+
     if target in ("image", "both"):
         image_prompt = default_image_prompt(title, scenario, instruction)
+        try:
+            image_prompt = llm_image_prompt(title, text_body, scenario, instruction)
+        except Exception:
+            pass
+
         image_url = None
+        source_image_url = None
         image_error = None
         try:
-            result = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size="1024x1024")
-            image_url = result["image_url"]
+            result = generate_square_image_for_post(post_id=post_id, image_prompt=image_prompt)
+            image_url = result["final_image_url"]
+            source_image_url = result.get("source_image_url")
         except HTTPException as e:
             image_error = e.detail
         except Exception as e:
             image_error = str(e)
+
         preview = post.get("preview_payload") or {}
         preview["image_error"] = image_error
+        preview["source_image_url"] = source_image_url
         update_post(
             post_id,
             image_prompt=image_prompt,
@@ -1050,7 +1200,6 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
     latest = fetch_post(post_id)
     update_post(post_id, telegram_caption=generate_post_caption(latest))
     return fetch_post(post_id)
-
 
 @app.post("/api/posts/{post_id}/publish")
 async def publish(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
@@ -1182,6 +1331,15 @@ def create_post_from_phrase(phrase_id: int, session_id: Optional[str] = Cookie(d
             raise HTTPException(status_code=400, detail="empty phrase")
         created_at = now_iso()
         title = text
+        post_text = text
+        if OPENROUTER_API_KEY:
+            try:
+                candidate = generate_post_text_from_phrase(text).strip()
+                if candidate:
+                    post_text = candidate
+            except Exception:
+                post_text = text
+
         if DB_BACKEND == "postgres":
             cur = conn.execute(
                 """
@@ -1189,7 +1347,7 @@ def create_post_from_phrase(phrase_id: int, session_id: Optional[str] = Cookie(d
                 VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
                 RETURNING id
                 """,
-                (title, text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
+                (title, post_text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
             )
             row = cur.fetchone()
             post_id = row["id"]
@@ -1199,11 +1357,10 @@ def create_post_from_phrase(phrase_id: int, session_id: Optional[str] = Cookie(d
                 INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
                 """,
-                (title, text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
+                (title, post_text, f"phrase:{phrase_id}", "phrase", text, created_at, created_at),
             )
             post_id = cur.lastrowid
     return fetch_post(int(post_id))
-
 
 @app.get("/api/phrases")
 def list_phrases(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> list[dict[str, Any]]:
