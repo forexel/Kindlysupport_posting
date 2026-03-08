@@ -38,6 +38,7 @@ export function GeneratePostPage() {
 
   const [mode, setMode] = useState<'random' | 'selected'>(preselectedPhraseId ? 'selected' : 'random');
   const [selectedPhrase, setSelectedPhrase] = useState(preselectedPhraseId);
+  const [phraseQuery, setPhraseQuery] = useState('');
   const [phrases, setPhrases] = useState<Phrase[]>([]);
   const [postId, setPostId] = useState<number | null>(null);
 
@@ -53,6 +54,10 @@ export function GeneratePostPage() {
   const [scheduleType, setScheduleType] = useState<'now' | 'scheduled'>('now');
   const [scheduleDate, setScheduleDate] = useState('');
   const [scheduleTime, setScheduleTime] = useState('');
+
+  const filteredPhrases = phrases.filter((phrase) =>
+    !phraseQuery.trim() || phrase.text_body.toLowerCase().includes(phraseQuery.trim().toLowerCase()),
+  );
 
   useEffect(() => {
     (async () => {
@@ -189,12 +194,29 @@ export function GeneratePostPage() {
               <div className="flex items-center space-x-2"><Checkbox id="mode-selected" checked={mode === 'selected'} onCheckedChange={(c) => c && setMode('selected')} className="border-zinc-700" /><Label htmlFor="mode-selected" className="text-zinc-300 cursor-pointer">Выбрать конкретную фразу</Label></div>
             </div>
             {mode === 'selected' && (
-              <Select value={selectedPhrase} onValueChange={setSelectedPhrase}>
-                <SelectTrigger className="bg-zinc-800 border-zinc-700 text-zinc-200"><SelectValue placeholder="Выберите фразу" /></SelectTrigger>
-                <SelectContent className="bg-zinc-900 border-zinc-800">
-                  {phrases.map((phrase) => <SelectItem key={phrase.id} value={String(phrase.id)} className="text-zinc-200">{phrase.text_body}</SelectItem>)}
-                </SelectContent>
-              </Select>
+              <div className="space-y-2">
+                <Input
+                  value={phraseQuery}
+                  onChange={(e) => setPhraseQuery(e.target.value)}
+                  placeholder="Поиск фразы..."
+                  className="bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500"
+                />
+                <Select value={selectedPhrase} onValueChange={setSelectedPhrase}>
+                  <SelectTrigger className="bg-zinc-800 border-zinc-700 text-zinc-200"><SelectValue placeholder="Выберите фразу" /></SelectTrigger>
+                  <SelectContent className="bg-zinc-900 border-zinc-800">
+                    {filteredPhrases.map((phrase) => (
+                      <SelectItem
+                        key={phrase.id}
+                        value={String(phrase.id)}
+                        className="text-zinc-200 items-start whitespace-normal break-words py-2 leading-5"
+                      >
+                        <span className="line-clamp-2">{phrase.text_body}</span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-zinc-500">Найдено: {filteredPhrases.length}</p>
+              </div>
             )}
           </Card>
 
