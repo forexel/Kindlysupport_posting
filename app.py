@@ -1026,7 +1026,17 @@ def openrouter_extract_text_from_image(image_url: str) -> str:
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Extract the visible text from this image in Russian if present. Return plain text only."},
+                    {
+                        "type": "text",
+                        "text": (
+                            "Извлеки ТОЛЬКО основную фразу с карточки на изображении.\n"
+                            "Правила:\n"
+                            "- Верни только текст самой фразы, без заголовков, пояснений и markdown.\n"
+                            "- Игнорируй служебные элементы интерфейса (например: 'Поделиться', 'Вопрос сессии').\n"
+                            "- Если фраза состоит из нескольких строк, верни её одной строкой.\n"
+                            "- Если фразу прочитать нельзя, верни пустую строку."
+                        ),
+                    },
                     {"type": "image_url", "image_url": {"url": image_url}},
                 ],
             }
@@ -1114,14 +1124,64 @@ def extract_from_url(url: str) -> tuple[str, str]:
 
 
 def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
-    phrases: list[str] = []
-    for line in (ocr_text or "").splitlines():
+    raw = (ocr_text or "").strip()
+    if not raw:
+        return []
+
+    # Strip common wrappers from vision-model responses.
+    raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    bad_patterns = [
+        r"^#+\s*extracted text\b[:：]?\s*$",
+        r"^the visible text .*?:\s*$",
+        r"^visible text .*?:\s*$",
+        r"^extracted text\b[:：]?\s*$",
+        r"^text\b[:：]?\s*$",
+        r"^answer\b[:：]?\s*$",
+        r"^поделиться$",
+        r"^вопрос сессии$",
+    ]
+
+    cleaned_lines: list[str] = []
+    for line in raw.splitlines():
         s = line.strip()
         if not s:
             continue
         s = s.lstrip("•-—* \t").strip()
-        if s:
-            phrases.append(s)
+        s = s.strip("\"'«»")
+        if not s:
+            continue
+        low = s.lower()
+        if any(re.match(p, low, flags=re.IGNORECASE) for p in bad_patterns):
+            continue
+        if len(s) <= 2:
+            continue
+        cleaned_lines.append(s)
+
+    if not cleaned_lines:
+        return []
+
+    # Prefer single consolidated phrase for card-style images.
+    consolidated = re.sub(r"\s+", " ", " ".join(cleaned_lines)).strip()
+    candidates = [consolidated] + cleaned_lines
+
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        c = re.sub(r"\s+", " ", c).strip(" .,:;-\t")
+        if not c:
+            continue
+        low = c.lower()
+        if low in seen:
+            continue
+        # Drop leftovers if response is still meta text.
+        if "extracted text" in low or "visible text" in low:
+            continue
+        if low in {"поделиться", "вопрос сессии"}:
+            continue
+        seen.add(low)
+        phrases.append(c)
     return phrases
 
 
