@@ -2142,7 +2142,7 @@ async def import_phrases_csv(request: Request, session_id: Optional[str] = Cooki
     return {"ok": True, "parsed": parsed, "inserted": inserted, "updated": updated, "skipped": skipped}
 
 
-@app.put("/api/phrases/{phrase_id}")
+@app.put("/api/phrases/{phrase_id:int}")
 async def update_phrase(phrase_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
     payload = await request.json()
@@ -2176,7 +2176,7 @@ async def update_phrase(phrase_id: int, request: Request, session_id: Optional[s
     return dict(row)
 
 
-@app.delete("/api/phrases/{phrase_id}")
+@app.delete("/api/phrases/{phrase_id:int}")
 def delete_phrase(phrase_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
     with db() as conn:
