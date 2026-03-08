@@ -1234,7 +1234,38 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
             continue
         seen.add(low)
         phrases.append(c)
-    return phrases
+    # Merge "quote + author" into one phrase, e.g. "Текст цитаты (Пема Чёдрон)".
+    merged: list[str] = []
+    i = 0
+    while i < len(phrases):
+        current = phrases[i]
+        if i + 1 < len(phrases):
+            nxt = phrases[i + 1]
+            if _is_probable_author_line(nxt) and len(current) >= 28:
+                merged.append(f"{current} ({nxt})")
+                i += 2
+                continue
+        merged.append(current)
+        i += 1
+    return merged
+
+
+def _is_probable_author_line(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    if len(s) > 42:
+        return False
+    if re.search(r"\d", s):
+        return False
+    if looks_like_noise_phrase(s):
+        return False
+    words = re.findall(r"[A-Za-zА-Яа-яЁё'\\-]+", s)
+    if not (1 <= len(words) <= 4):
+        return False
+    # Typical author line looks like a short proper name.
+    capitalized = sum(1 for w in words if w and w[0].isupper())
+    return capitalized >= max(1, len(words) - 1)
 
 
 def looks_like_noise_phrase(text: str) -> bool:
