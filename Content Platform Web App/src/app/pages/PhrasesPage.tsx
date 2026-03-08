@@ -42,7 +42,6 @@ import { api } from '../lib/api';
 interface Phrase {
   id: number;
   text_body: string;
-  topic?: string | null;
   is_published: number;
   created_at: string;
 }
@@ -53,7 +52,6 @@ export function PhrasesPage() {
   const [selectedPhrases, setSelectedPhrases] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | '0' | '1'>('all');
-  const [themeFilter, setThemeFilter] = useState<string>('all');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [loading, setLoading] = useState(false);
 
@@ -64,7 +62,6 @@ export function PhrasesPage() {
       params.set('limit', '2000');
       if (statusFilter !== 'all') params.set('status', statusFilter);
       if (searchQuery.trim()) params.set('search', searchQuery.trim());
-      if (themeFilter !== 'all') params.set('topic', themeFilter);
       const rows = await api<Phrase[]>(`/api/phrases?${params.toString()}`);
       setPhrases(rows);
     } catch (e: any) {
@@ -76,13 +73,11 @@ export function PhrasesPage() {
 
   useEffect(() => {
     loadPhrases();
-  }, [statusFilter, themeFilter]);
+  }, [statusFilter]);
 
   const filteredPhrases = phrases.filter((phrase) =>
     !searchQuery.trim() || phrase.text_body.toLowerCase().includes(searchQuery.toLowerCase())
   );
-
-  const themes = Array.from(new Set(phrases.map((p) => (p.topic || '').trim()).filter(Boolean)));
 
   const handleSelectAll = (checked: boolean) => {
     if (checked) setSelectedPhrases(filteredPhrases.map((p) => p.id));
@@ -152,13 +147,6 @@ export function PhrasesPage() {
             <SelectItem value="1" className="text-zinc-200">Опубликованные ({publishedPhrasesCount})</SelectItem>
           </SelectContent>
         </Select>
-        <Select value={themeFilter} onValueChange={setThemeFilter}>
-          <SelectTrigger className="w-full sm:w-[180px] bg-zinc-800 border-zinc-700 text-zinc-200"><SelectValue placeholder="Тема" /></SelectTrigger>
-          <SelectContent className="bg-zinc-900 border-zinc-800">
-            <SelectItem value="all" className="text-zinc-200">Все темы</SelectItem>
-            {themes.map((theme) => <SelectItem key={theme} value={theme} className="text-zinc-200">{theme}</SelectItem>)}
-          </SelectContent>
-        </Select>
       </div>
 
       {selectedPhrases.length > 0 && (
@@ -176,8 +164,7 @@ export function PhrasesPage() {
           <TableHeader>
             <TableRow className="hover:bg-zinc-800/50 border-zinc-800">
               <TableHead className="w-12"><Checkbox checked={selectedPhrases.length === filteredPhrases.length && filteredPhrases.length > 0} onCheckedChange={handleSelectAll} className="border-zinc-700" /></TableHead>
-              <TableHead className="text-zinc-300">Текст</TableHead>
-              <TableHead className="text-zinc-300">Тема</TableHead>
+              <TableHead className="text-zinc-300 min-w-[560px]">Текст</TableHead>
               <TableHead className="text-zinc-300">Статус</TableHead>
               <TableHead className="text-zinc-300">Дата добавления</TableHead>
               <TableHead className="w-12"></TableHead>
@@ -185,15 +172,14 @@ export function PhrasesPage() {
           </TableHeader>
           <TableBody>
             {loading ? (
-              <TableRow><TableCell colSpan={6} className="text-center py-12 text-zinc-500">Загрузка...</TableCell></TableRow>
+              <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-500">Загрузка...</TableCell></TableRow>
             ) : filteredPhrases.length === 0 ? (
-              <TableRow><TableCell colSpan={6} className="text-center py-12 text-zinc-500">Фразы не найдены</TableCell></TableRow>
+              <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-500">Фразы не найдены</TableCell></TableRow>
             ) : (
               filteredPhrases.map((phrase) => (
                 <TableRow key={phrase.id} className="hover:bg-zinc-800/50 border-zinc-800">
                   <TableCell><Checkbox checked={selectedPhrases.includes(phrase.id)} onCheckedChange={(checked) => handleSelectPhrase(phrase.id, checked as boolean)} className="border-zinc-700" /></TableCell>
-                  <TableCell className="text-zinc-200 max-w-md">{phrase.text_body}</TableCell>
-                  <TableCell className="text-zinc-400">{phrase.topic || '—'}</TableCell>
+                  <TableCell className="text-zinc-200 whitespace-normal break-words leading-6">{phrase.text_body}</TableCell>
                   <TableCell>
                     <Badge variant={phrase.is_published === 1 ? 'default' : 'secondary'} className={phrase.is_published === 1 ? 'bg-green-950/30 text-green-400 border-green-900/50' : 'bg-yellow-950/30 text-yellow-400 border-yellow-900/50'}>
                       {phrase.is_published === 1 ? 'Опубликована' : 'Новая'}
