@@ -3,13 +3,6 @@ import { Link, useNavigate } from 'react-router';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '../components/ui/select';
-import {
   Table,
   TableBody,
   TableCell,
@@ -133,20 +126,39 @@ export function PhrasesPage() {
         </div>
       </div>
 
+      <div className="flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          variant={statusFilter === 'all' ? 'default' : 'outline'}
+          onClick={() => setStatusFilter('all')}
+          className={statusFilter === 'all' ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-zinc-900 border-zinc-700 text-zinc-200'}
+        >
+          Все ({phrases.length})
+        </Button>
+        <Button
+          size="sm"
+          variant={statusFilter === '0' ? 'default' : 'outline'}
+          onClick={() => setStatusFilter('0')}
+          className={statusFilter === '0' ? 'bg-yellow-600 hover:bg-yellow-700 text-white' : 'bg-zinc-900 border-zinc-700 text-zinc-200'}
+        >
+          Новые ({newPhrasesCount})
+        </Button>
+        <Button
+          size="sm"
+          variant={statusFilter === '1' ? 'default' : 'outline'}
+          onClick={() => setStatusFilter('1')}
+          className={statusFilter === '1' ? 'bg-green-600 hover:bg-green-700 text-white' : 'bg-zinc-900 border-zinc-700 text-zinc-200'}
+        >
+          Опубликованные ({publishedPhrasesCount})
+        </Button>
+      </div>
+
       <div className="flex flex-col gap-4 sm:flex-row bg-zinc-900 p-4 rounded-lg border border-zinc-800">
         <div className="flex-1 relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-500" />
           <Input placeholder="Поиск по тексту..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="pl-9 bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500" />
         </div>
         <Button variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-200" onClick={loadPhrases}>Поиск</Button>
-        <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as any)}>
-          <SelectTrigger className="w-full sm:w-[180px] bg-zinc-800 border-zinc-700 text-zinc-200"><SelectValue placeholder="Статус" /></SelectTrigger>
-          <SelectContent className="bg-zinc-900 border-zinc-800">
-            <SelectItem value="all" className="text-zinc-200">Все</SelectItem>
-            <SelectItem value="0" className="text-zinc-200">Новые ({newPhrasesCount})</SelectItem>
-            <SelectItem value="1" className="text-zinc-200">Опубликованные ({publishedPhrasesCount})</SelectItem>
-          </SelectContent>
-        </Select>
       </div>
 
       {selectedPhrases.length > 0 && (
