@@ -44,7 +44,7 @@ export function PhrasesPage() {
   const [phrases, setPhrases] = useState<Phrase[]>([]);
   const [selectedPhrases, setSelectedPhrases] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | '0' | '1'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | '0' | '1'>('0');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [loading, setLoading] = useState(false);
 
