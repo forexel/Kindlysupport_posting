@@ -116,6 +116,7 @@ OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "meta-llama/llama
 OPENROUTER_IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "openai/gpt-5-image-mini").strip()
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "http://localhost:8000").strip()
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "KindlySupport Posting").strip()
+OCR_PRIMARY_ENGINE = os.getenv("OCR_PRIMARY_ENGINE", "local").strip().lower()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 TELEGRAM_PREVIEW_CHAT = os.getenv("TELEGRAM_PREVIEW_CHAT", "@Yudin_Finance").strip()
@@ -1335,24 +1336,32 @@ def looks_like_noise_phrase(text: str) -> bool:
 
 
 def extract_phrases_from_image(image_url: str) -> tuple[str, list[str]]:
-    primary_text = openrouter_extract_text_from_image(image_url)
-    primary_phrases = [p for p in extract_phrases_from_ocr_text(primary_text) if not looks_like_noise_phrase(p)]
-
-    # Fallback to central-quote extraction if primary result is empty/noisy.
-    if primary_phrases:
-        return primary_text, primary_phrases
-
-    fallback_text = openrouter_extract_main_quote_from_image(image_url)
-    fallback_phrases = [p for p in extract_phrases_from_ocr_text(fallback_text) if not looks_like_noise_phrase(p)]
-    if fallback_phrases:
-        return fallback_text, fallback_phrases
-
-    # Final fallback: local OCR (Tesseract).
     local_text = local_ocr_extract_text_from_image(image_url)
     local_phrases = [p for p in extract_phrases_from_ocr_text(local_text) if not looks_like_noise_phrase(p)]
+
+    llm_text = openrouter_extract_text_from_image(image_url)
+    llm_phrases = [p for p in extract_phrases_from_ocr_text(llm_text) if not looks_like_noise_phrase(p)]
+
+    llm_quote_text = openrouter_extract_main_quote_from_image(image_url)
+    llm_quote_phrases = [p for p in extract_phrases_from_ocr_text(llm_quote_text) if not looks_like_noise_phrase(p)]
+
+    if OCR_PRIMARY_ENGINE == "local":
+        if local_phrases:
+            return local_text, local_phrases
+        if llm_phrases:
+            return llm_text, llm_phrases
+        if llm_quote_phrases:
+            return llm_quote_text, llm_quote_phrases
+        return local_text or llm_text, []
+
+    # LLM-primary mode (can be enabled with OCR_PRIMARY_ENGINE=llm).
+    if llm_phrases:
+        return llm_text, llm_phrases
+    if llm_quote_phrases:
+        return llm_quote_text, llm_quote_phrases
     if local_phrases:
         return local_text, local_phrases
-    return primary_text, []
+    return llm_text or local_text, []
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
