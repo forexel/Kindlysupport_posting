@@ -1336,29 +1336,36 @@ def looks_like_noise_phrase(text: str) -> bool:
 
 
 def extract_phrases_from_image(image_url: str) -> tuple[str, list[str]]:
-    local_text = local_ocr_extract_text_from_image(image_url)
-    local_phrases = [p for p in extract_phrases_from_ocr_text(local_text) if not looks_like_noise_phrase(p)]
-
-    llm_text = openrouter_extract_text_from_image(image_url)
-    llm_phrases = [p for p in extract_phrases_from_ocr_text(llm_text) if not looks_like_noise_phrase(p)]
-
-    llm_quote_text = openrouter_extract_main_quote_from_image(image_url)
-    llm_quote_phrases = [p for p in extract_phrases_from_ocr_text(llm_quote_text) if not looks_like_noise_phrase(p)]
-
     if OCR_PRIMARY_ENGINE == "local":
+        local_text = local_ocr_extract_text_from_image(image_url)
+        local_phrases = [p for p in extract_phrases_from_ocr_text(local_text) if not looks_like_noise_phrase(p)]
         if local_phrases:
             return local_text, local_phrases
+
+        llm_text = openrouter_extract_text_from_image(image_url)
+        llm_phrases = [p for p in extract_phrases_from_ocr_text(llm_text) if not looks_like_noise_phrase(p)]
         if llm_phrases:
             return llm_text, llm_phrases
+
+        llm_quote_text = openrouter_extract_main_quote_from_image(image_url)
+        llm_quote_phrases = [p for p in extract_phrases_from_ocr_text(llm_quote_text) if not looks_like_noise_phrase(p)]
         if llm_quote_phrases:
             return llm_quote_text, llm_quote_phrases
         return local_text or llm_text, []
 
     # LLM-primary mode (can be enabled with OCR_PRIMARY_ENGINE=llm).
+    llm_text = openrouter_extract_text_from_image(image_url)
+    llm_phrases = [p for p in extract_phrases_from_ocr_text(llm_text) if not looks_like_noise_phrase(p)]
     if llm_phrases:
         return llm_text, llm_phrases
+
+    llm_quote_text = openrouter_extract_main_quote_from_image(image_url)
+    llm_quote_phrases = [p for p in extract_phrases_from_ocr_text(llm_quote_text) if not looks_like_noise_phrase(p)]
     if llm_quote_phrases:
         return llm_quote_text, llm_quote_phrases
+
+    local_text = local_ocr_extract_text_from_image(image_url)
+    local_phrases = [p for p in extract_phrases_from_ocr_text(local_text) if not looks_like_noise_phrase(p)]
     if local_phrases:
         return local_text, local_phrases
     return llm_text or local_text, []
