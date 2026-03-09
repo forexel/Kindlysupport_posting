@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import csv
 import io
+import binascii
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Thread
@@ -26,6 +27,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from PIL import Image
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
 
 try:
     import psycopg
@@ -778,23 +785,35 @@ def telegram_file_data_url(file_id: str) -> str:
 def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not runtime_telegram_token():
         return None
-    chat_id = runtime_telegram_preview_chat()
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
     keyboard = build_preview_keyboard(int(post["id"]))
-    if post.get("final_image_url"):
-        payload = {
-            "chat_id": chat_id,
-            "photo": post["final_image_url"],
-            "caption": caption[:1024],
-            "reply_markup": keyboard,
-        }
-        if len(caption) > 1024:
-            payload["caption"] = caption[:1000] + "..."
-        return telegram_api("sendPhoto", payload)
-    return telegram_api(
-        "sendMessage",
-        {"chat_id": chat_id, "text": caption, "reply_markup": keyboard, "disable_web_page_preview": True},
-    )
+    target_chat_id: str | int = runtime_telegram_preview_chat()
+
+    def _send(chat_id: str | int) -> dict[str, Any]:
+        if post.get("final_image_url"):
+            payload = {
+                "chat_id": chat_id,
+                "photo": post["final_image_url"],
+                "caption": caption[:1024],
+                "reply_markup": keyboard,
+            }
+            if len(caption) > 1024:
+                payload["caption"] = caption[:1000] + "..."
+            return telegram_api("sendPhoto", payload)
+        return telegram_api(
+            "sendMessage",
+            {"chat_id": chat_id, "text": caption, "reply_markup": keyboard, "disable_web_page_preview": True},
+        )
+
+    try:
+        return _send(target_chat_id)
+    except HTTPException as e:
+        detail = str(e.detail).lower()
+        admin_id = tg_admin_user_id()
+        if admin_id and "chat not found" in detail:
+            logger.warning("preview_chat_not_found_fallback_to_admin preview_chat=%s admin_id=%s", target_chat_id, admin_id)
+            return _send(admin_id)
+        raise
 
 
 def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1075,6 +1094,36 @@ def openrouter_extract_main_quote_from_image(image_url: str) -> str:
     return (res.get("choices") or [{}])[0].get("message", {}).get("content", "")
 
 
+def _load_image_for_local_ocr(image_url: str) -> Optional[Image.Image]:
+    try:
+        if image_url.startswith("data:image/"):
+            _, b64 = image_url.split(",", 1)
+            raw = base64.b64decode(b64, validate=False)
+            return Image.open(io.BytesIO(raw)).convert("RGB")
+        with urllib.request.urlopen(image_url, timeout=30) as resp:
+            raw = resp.read()
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except (ValueError, OSError, urllib.error.URLError, binascii.Error):
+        return None
+
+
+def local_ocr_extract_text_from_image(image_url: str) -> str:
+    if pytesseract is None:
+        return ""
+    img = _load_image_for_local_ocr(image_url)
+    if img is None:
+        return ""
+    try:
+        # Simple preprocessing improves contrast on mobile screenshots.
+        gray = img.convert("L")
+        bw = gray.point(lambda x: 255 if x > 165 else 0, mode="1")
+        text = pytesseract.image_to_string(bw, lang="rus+eng", config="--psm 6")
+        return (text or "").strip()
+    except Exception:
+        logger.exception("local_ocr_failed")
+        return ""
+
+
 def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024") -> dict[str, Any]:
     started = time.time()
     model = runtime_openrouter_image_model()
@@ -1297,6 +1346,12 @@ def extract_phrases_from_image(image_url: str) -> tuple[str, list[str]]:
     fallback_phrases = [p for p in extract_phrases_from_ocr_text(fallback_text) if not looks_like_noise_phrase(p)]
     if fallback_phrases:
         return fallback_text, fallback_phrases
+
+    # Final fallback: local OCR (Tesseract).
+    local_text = local_ocr_extract_text_from_image(image_url)
+    local_phrases = [p for p in extract_phrases_from_ocr_text(local_text) if not looks_like_noise_phrase(p)]
+    if local_phrases:
+        return local_text, local_phrases
     return primary_text, []
 
 
