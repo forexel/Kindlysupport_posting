@@ -1621,6 +1621,9 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
         if not c:
             continue
         c = _normalize_ocr_phrase_case(c)
+        c = _strip_ocr_date_prefix(c)
+        if not c:
+            continue
         low = c.lower()
         if low in seen:
             continue
@@ -1667,6 +1670,23 @@ def _normalize_ocr_phrase_case(text: str) -> str:
                 core = core.lower()
         out.append(f"{prefix}{core}{suffix}")
     return " ".join(out).strip()
+
+
+def _strip_ocr_date_prefix(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return s
+    # "нояб. 2024г Не торопитесь ..." -> "Не торопитесь ..."
+    # "30 дек. 2024г. Не торопитесь ..." -> "Не торопитесь ..."
+    s = re.sub(
+        r"^\s*(?:\d{1,2}\s+)?(?:янв|фев|мар|апр|май|июн|июл|авг|сен|сент|окт|ноя|нояб|дек)\.?\s+\d{4}\s*г?\.?\s+",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    # "30 Не торопитесь ..." -> "Не торопитесь ..."
+    s = re.sub(r"^\s*\d{1,2}\s+(?=[А-ЯЁA-Z])", "", s)
+    return s.strip()
 
 
 def _is_ocr_noise_line(text: str) -> bool:
