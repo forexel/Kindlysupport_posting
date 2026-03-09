@@ -837,6 +837,62 @@ def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     return http_json("POST", url, payload)
 
 
+def telegram_send_photo_bytes(
+    chat_id: str | int,
+    image_bytes: bytes,
+    filename: str = "image.jpg",
+    caption: str = "",
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    tg_token = runtime_telegram_token()
+    if not tg_token:
+        raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN not set")
+    boundary = f"----kindly{secrets.token_hex(12)}"
+
+    def _field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode("utf-8")
+
+    body = bytearray()
+    body.extend(_field("chat_id", str(chat_id)))
+    if caption:
+        body.extend(_field("caption", caption))
+    if parse_mode:
+        body.extend(_field("parse_mode", parse_mode))
+    if reply_markup:
+        body.extend(_field("reply_markup", json.dumps(reply_markup, ensure_ascii=False)))
+
+    body.extend(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+            "Content-Type: image/jpeg\r\n\r\n"
+        ).encode("utf-8")
+    )
+    body.extend(image_bytes)
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{tg_token}/sendPhoto",
+        data=bytes(body),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=502, detail=f"HTTP {e.code}: {detail[:1200]}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"HTTP request failed: {str(e)[:800]}")
+
+
 def answer_callback(callback_query_id: str, text: str = "") -> None:
     if not runtime_telegram_token():
         return
@@ -907,6 +963,20 @@ def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
 
     def _send(chat_id: str | int) -> dict[str, Any]:
         if post.get("final_image_url"):
+            media_key = media_key_from_url(str(post["final_image_url"]))
+            if media_key:
+                try:
+                    image_bytes, _ = storage_get_bytes(media_key)
+                    return telegram_send_photo_bytes(
+                        chat_id=chat_id,
+                        image_bytes=image_bytes,
+                        filename=Path(media_key).name or "preview.jpg",
+                        caption=(caption[:1000] + "...") if len(caption) > 1024 else caption,
+                        parse_mode="MarkdownV2" if use_md else None,
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    logger.exception("telegram_preview_send_file_failed media_key=%s", media_key)
             payload = {
                 "chat_id": chat_id,
                 "photo": post["final_image_url"],
@@ -946,6 +1016,19 @@ def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
     use_md = (post.get("source_kind") or "").strip() == "phrase"
     if post.get("final_image_url"):
+        media_key = media_key_from_url(str(post["final_image_url"]))
+        if media_key:
+            try:
+                image_bytes, _ = storage_get_bytes(media_key)
+                return telegram_send_photo_bytes(
+                    chat_id=chat_id,
+                    image_bytes=image_bytes,
+                    filename=Path(media_key).name or "publish.jpg",
+                    caption=(caption[:1000] + "...") if len(caption) > 1024 else caption,
+                    parse_mode="MarkdownV2" if use_md else None,
+                )
+            except Exception:
+                logger.exception("telegram_publish_send_file_failed media_key=%s", media_key)
         payload_photo: dict[str, Any] = {"chat_id": chat_id, "photo": post["final_image_url"], "caption": caption[:1024]}
         if use_md:
             payload_photo["parse_mode"] = "MarkdownV2"
