@@ -1620,6 +1620,7 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
         c = re.sub(r"\s+", " ", c).strip(" .,:;-\t")
         if not c:
             continue
+        c = _normalize_ocr_phrase_case(c)
         low = c.lower()
         if low in seen:
             continue
@@ -1628,10 +1629,13 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
             continue
         if low in {"поделиться", "подробнее", "узнать больше", "вопрос сессии", "ежедневное вдохновение"}:
             continue
+        if _is_ocr_noise_line(c):
+            continue
         if c.endswith(":"):
             continue
         seen.add(low)
         phrases.append(c)
+    phrases = _merge_broken_quote_lines(phrases)
     # Merge "quote + author" into one phrase, e.g. "Текст цитаты (Пема Чёдрон)".
     merged: list[str] = []
     i = 0
@@ -1645,6 +1649,79 @@ def extract_phrases_from_ocr_text(ocr_text: str) -> list[str]:
                 i += 2
                 continue
         merged.append(current)
+        i += 1
+    return merged
+
+
+def _normalize_ocr_phrase_case(text: str) -> str:
+    # Fix all-caps fragments in the middle of phrase (e.g. "ВНОВЬ").
+    out: list[str] = []
+    for token in text.split():
+        m = re.match(r"^([\"'«(]*)(.*?)([\"'».),!?;:]*)$", token)
+        if not m:
+            out.append(token)
+            continue
+        prefix, core, suffix = m.groups()
+        if core and any("А" <= ch <= "я" or ch in "Ёё" for ch in core):
+            if core.isupper() and len(core) >= 3:
+                core = core.lower()
+        out.append(f"{prefix}{core}{suffix}")
+    return " ".join(out).strip()
+
+
+def _is_ocr_noise_line(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    if "ежедневное вдохновение" in low:
+        return True
+    if "подробнее" in low:
+        return True
+    # Mostly numbers / UI counters / timestamps.
+    digits = sum(ch.isdigit() for ch in s)
+    letters = sum(ch.isalpha() for ch in s)
+    if digits >= 3 and letters <= 4:
+        return True
+    if re.fullmatch(r"[\d\s:./-]+", s):
+        return True
+    # Very short fragments (often OCR tail like "чина", "в (п").
+    words = re.findall(r"[A-Za-zА-Яа-яЁё]+", s)
+    if len(words) == 1 and len(words[0]) <= 5 and not s.endswith((".", "!", "?")):
+        return True
+    if len(words) <= 2 and len(s) <= 6:
+        return True
+    # UI-strip with many isolated tiny tokens: "29 30 1 2 3 4 5"
+    tokens = s.split()
+    if tokens and all(re.fullmatch(r"\d{1,2}", t or "") for t in tokens) and len(tokens) >= 3:
+        return True
+    return False
+
+
+def _merge_broken_quote_lines(lines: list[str]) -> list[str]:
+    if not lines:
+        return lines
+    merged: list[str] = []
+    i = 0
+    while i < len(lines):
+        cur = (lines[i] or "").strip()
+        if not cur:
+            i += 1
+            continue
+        # If current line is not terminal punctuation, try to join with next line.
+        while i + 1 < len(lines):
+            nxt = (lines[i + 1] or "").strip()
+            if not nxt or _is_probable_author_line(nxt) or _is_ocr_noise_line(nxt):
+                break
+            if cur.endswith((".", "!", "?")):
+                break
+            if len(cur) >= 180:
+                break
+            cur = f"{cur.rstrip(' ,;:')} {nxt.lstrip(' ,;:')}".strip()
+            i += 1
+            if cur.endswith((".", "!", "?")):
+                break
+        merged.append(cur)
         i += 1
     return merged
 
