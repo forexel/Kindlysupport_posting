@@ -222,6 +222,7 @@ OPENROUTER_IMAGE_MODEL = os.getenv("OPENROUTER_IMAGE_MODEL", "openai/gpt-5-image
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "http://localhost:8000").strip()
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "KindlySupport Posting").strip()
 OCR_PRIMARY_ENGINE = os.getenv("OCR_PRIMARY_ENGINE", "local").strip().lower()
+OCR_DISABLE_LLM_FALLBACK = os.getenv("OCR_DISABLE_LLM_FALLBACK", "0").strip() in {"1", "true", "yes"}
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 TELEGRAM_PREVIEW_CHAT = os.getenv("TELEGRAM_PREVIEW_CHAT", "@Yudin_Finance").strip()
@@ -1462,7 +1463,7 @@ def extract_from_url(url: str) -> tuple[str, str]:
     if lower.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF не поддерживается. Только ссылка на HTML или картинку.")
     if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        ocr_text, _ = extract_phrases_from_image(url)
+        ocr_text, _, _ = extract_phrases_from_image(url)
         return "url_image", ocr_text
     # MVP stub for HTML extraction. Replace with readability parser later.
     return "url_html", f"Текст, извлечённый из HTML-ссылки (заглушка)\nИсточник: {url}"
@@ -1599,40 +1600,44 @@ def looks_like_noise_phrase(text: str) -> bool:
     return any(re.match(p, s) for p in noise_patterns)
 
 
-def extract_phrases_from_image(image_url: str) -> tuple[str, list[str]]:
+def extract_phrases_from_image(image_url: str) -> tuple[str, list[str], str]:
     if OCR_PRIMARY_ENGINE == "local":
         local_text = local_ocr_extract_text_from_image(image_url)
         local_phrases = [p for p in extract_phrases_from_ocr_text(local_text) if not looks_like_noise_phrase(p)]
         if local_phrases:
-            return local_text, local_phrases
+            return local_text, local_phrases, "local"
+        if OCR_DISABLE_LLM_FALLBACK:
+            return local_text, [], "local"
 
         llm_text = openrouter_extract_text_from_image(image_url)
         llm_phrases = [p for p in extract_phrases_from_ocr_text(llm_text) if not looks_like_noise_phrase(p)]
         if llm_phrases:
-            return llm_text, llm_phrases
+            return llm_text, llm_phrases, "llm_fallback"
 
         llm_quote_text = openrouter_extract_main_quote_from_image(image_url)
         llm_quote_phrases = [p for p in extract_phrases_from_ocr_text(llm_quote_text) if not looks_like_noise_phrase(p)]
         if llm_quote_phrases:
-            return llm_quote_text, llm_quote_phrases
-        return local_text or llm_text, []
+            return llm_quote_text, llm_quote_phrases, "llm_quote_fallback"
+        return local_text or llm_text, [], "local"
 
     # LLM-primary mode (can be enabled with OCR_PRIMARY_ENGINE=llm).
     llm_text = openrouter_extract_text_from_image(image_url)
     llm_phrases = [p for p in extract_phrases_from_ocr_text(llm_text) if not looks_like_noise_phrase(p)]
     if llm_phrases:
-        return llm_text, llm_phrases
+        return llm_text, llm_phrases, "llm"
 
     llm_quote_text = openrouter_extract_main_quote_from_image(image_url)
     llm_quote_phrases = [p for p in extract_phrases_from_ocr_text(llm_quote_text) if not looks_like_noise_phrase(p)]
     if llm_quote_phrases:
-        return llm_quote_text, llm_quote_phrases
+        return llm_quote_text, llm_quote_phrases, "llm_quote"
+    if OCR_DISABLE_LLM_FALLBACK:
+        return llm_text or llm_quote_text, [], "llm"
 
     local_text = local_ocr_extract_text_from_image(image_url)
     local_phrases = [p for p in extract_phrases_from_ocr_text(local_text) if not looks_like_noise_phrase(p)]
     if local_phrases:
-        return local_text, local_phrases
-    return llm_text or local_text, []
+        return local_text, local_phrases, "local_fallback"
+    return llm_text or local_text, [], "llm"
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -2800,8 +2805,8 @@ async def import_phrases_image_url(request: Request, session_id: Optional[str] =
     ensure_auth(session_id)
     payload = await request.json()
     image_url = validate_public_http_url(payload.get("image_url") or "")
-    ocr_text, phrases = extract_phrases_from_image(image_url)
-    return {"ok": True, "image_url": image_url, "ocr_text": ocr_text, "phrases": phrases}
+    ocr_text, phrases, engine = extract_phrases_from_image(image_url)
+    return {"ok": True, "image_url": image_url, "ocr_text": ocr_text, "phrases": phrases, "ocr_engine": engine}
 
 
 @app.post("/api/phrases/ocr-image-base64")
@@ -2811,8 +2816,8 @@ async def ocr_phrase_image_base64(request: Request, session_id: Optional[str] = 
     image_data_url = (payload.get("image_data_url") or "").strip()
     if not image_data_url.startswith("data:image/"):
         raise HTTPException(status_code=400, detail="image_data_url must be a data:image/* base64 URL")
-    ocr_text, phrases = extract_phrases_from_image(image_data_url)
-    return {"ok": True, "ocr_text": ocr_text, "phrases": phrases}
+    ocr_text, phrases, engine = extract_phrases_from_image(image_data_url)
+    return {"ok": True, "ocr_text": ocr_text, "phrases": phrases, "ocr_engine": engine}
 
 
 @app.post("/api/phrases/ocr-images-base64")
@@ -2833,7 +2838,7 @@ async def ocr_phrase_images_base64(request: Request, session_id: Optional[str] =
             items.append({"name": name, "ok": False, "error": "invalid image_data_url"})
             continue
         try:
-            ocr_text, phrases = extract_phrases_from_image(data_url)
+            ocr_text, phrases, engine = extract_phrases_from_image(data_url)
             items.append(
                 {
                     "name": name,
@@ -2841,6 +2846,7 @@ async def ocr_phrase_images_base64(request: Request, session_id: Optional[str] =
                     "ocr_text": ocr_text,
                     "phrase": phrases[0] if phrases else "",
                     "phrases": phrases,
+                    "ocr_engine": engine,
                 }
             )
         except Exception as e:
@@ -2858,10 +2864,10 @@ async def import_phrase_image_base64(request: Request, session_id: Optional[str]
     if not image_data_url.startswith("data:image/"):
         raise HTTPException(status_code=400, detail="image_data_url must be a data:image/* base64 URL")
     is_published = int(payload.get("is_published", 0) or 0)
-    ocr_text, phrases = extract_phrases_from_image(image_data_url)
+    ocr_text, phrases, engine = extract_phrases_from_image(image_data_url)
     raw_text = "\n".join(phrases)
     res = await import_phrases_text(_mock_request({"raw_text": raw_text, "is_published": is_published}), session_id=session_id)  # type: ignore[arg-type]
-    return {"ok": True, "ocr_text": ocr_text, "phrases": phrases, **res}
+    return {"ok": True, "ocr_text": ocr_text, "phrases": phrases, "ocr_engine": engine, **res}
 
 
 @app.post("/api/phrases/daily-preview")
@@ -3152,7 +3158,7 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
                 return {"ok": True}
             try:
                 data_url = telegram_file_data_url(file_id)
-                ocr_text, phrases = extract_phrases_from_image(data_url)
+                ocr_text, phrases, engine = extract_phrases_from_image(data_url)
                 phrase_text = (phrases[0] if phrases else "").strip()
                 if not phrase_text:
                     send_telegram_text(chat.get("id"), "Не удалось распознать фразу. Отправь другую картинку.")
@@ -3160,7 +3166,7 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
                 tg_state_set(int(user_id), "await_add_phrase_confirm", {"phrase_text": phrase_text})
                 send_telegram_text(
                     chat.get("id"),
-                    f'Распознано: "{phrase_text}"\nСоздать новую фразу?',
+                    f'Распознано ({engine}): "{phrase_text}"\nСоздать новую фразу?',
                     reply_markup=tg_keyboard([[("Да", "ks:addphrase:0:yes"), ("Нет", "ks:addphrase:0:no")]]),
                 )
                 return {"ok": True}
