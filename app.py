@@ -40,6 +40,11 @@ except Exception:
     pytesseract = None
 
 try:
+    from minio import Minio
+except Exception:
+    Minio = None
+
+try:
     import psycopg
     from psycopg.rows import dict_row
 except Exception:  # optional in local dev until installed
@@ -99,6 +104,101 @@ def validate_public_http_url(value: str) -> str:
     return raw
 
 
+def media_public_url(object_key: str) -> str:
+    safe = urllib.parse.quote((object_key or "").strip("/"), safe="/._-")
+    return f"{APP_BASE_URL.rstrip('/')}/media/{safe}"
+
+
+def media_key_from_url(url: str) -> Optional[str]:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    path = parsed.path or ""
+    if "/media/" not in path:
+        return None
+    key = path.split("/media/", 1)[1].strip("/")
+    return urllib.parse.unquote(key) if key else None
+
+
+def minio_client() -> Any:
+    global _minio_client
+    if _minio_client is not None:
+        return _minio_client
+    if Minio is None:
+        raise RuntimeError("minio package not installed")
+    _minio_client = Minio(
+        MINIO_ENDPOINT,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=MINIO_SECURE,
+    )
+    return _minio_client
+
+
+def storage_put_bytes(object_key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
+    key = (object_key or "").strip("/")
+    if not key:
+        raise ValueError("object_key required")
+    if STORAGE_MODE == "minio":
+        client = minio_client()
+        client.put_object(
+            MINIO_BUCKET,
+            key,
+            io.BytesIO(data),
+            length=len(data),
+            content_type=content_type,
+        )
+        return media_public_url(key)
+    out = (MEDIA_DIR / key).resolve()
+    if not str(out).startswith(str(MEDIA_DIR)):
+        raise RuntimeError("invalid media path")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    return media_public_url(key)
+
+
+def storage_get_bytes(object_key: str) -> tuple[bytes, str]:
+    key = (object_key or "").strip("/")
+    if not key:
+        raise FileNotFoundError("empty media key")
+    if STORAGE_MODE == "minio":
+        client = minio_client()
+        obj = client.get_object(MINIO_BUCKET, key)
+        try:
+            data = obj.read()
+            ctype = obj.headers.get("Content-Type", "application/octet-stream")
+            return data, ctype
+        finally:
+            obj.close()
+            obj.release_conn()
+    path = (MEDIA_DIR / key).resolve()
+    if not str(path).startswith(str(MEDIA_DIR)) or not path.exists() or not path.is_file():
+        raise FileNotFoundError(key)
+    with open(path, "rb") as f:
+        data = f.read()
+    ext = path.suffix.lower()
+    ctype = "application/octet-stream"
+    if ext in {".jpg", ".jpeg"}:
+        ctype = "image/jpeg"
+    elif ext == ".png":
+        ctype = "image/png"
+    elif ext == ".webp":
+        ctype = "image/webp"
+    return data, ctype
+
+
+def download_remote_image(url: str) -> tuple[bytes, str]:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        data = resp.read()
+        ctype = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+    if not data:
+        raise RuntimeError("empty image data")
+    return data, ctype or "image/jpeg"
+
+
 def load_env_file(path: str = ".env") -> None:
     if not os.path.exists(path):
         return
@@ -150,8 +250,15 @@ DAILY_AUTOPREVIEW_MINUTE_MSK = int(os.getenv("DAILY_AUTOPREVIEW_MINUTE_MSK", "0"
 TELEGRAM_MODE = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()
 FRONTEND_DIST_DIR = Path(os.getenv("FRONTEND_DIST_DIR", "Content Platform Web App/dist")).resolve()
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "/tmp/generated_media")).resolve()
+STORAGE_MODE = os.getenv("STORAGE_MODE", "local").strip().lower()
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000").strip()
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin").strip()
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin").strip()
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "kindlysupport-media").strip()
+MINIO_SECURE = os.getenv("MINIO_SECURE", "0").strip() in {"1", "true", "yes"}
 
 rate_bucket: dict[str, list[float]] = {}
+_minio_client: Optional[Any] = None
 
 
 class DBCursorProxy:
@@ -1004,7 +1111,6 @@ def _load_background_image(url: str) -> Optional[Image.Image]:
 
 
 def render_phrase_card_image(phrase: str, image_url: Optional[str]) -> str:
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     size = 1080
     bg = _load_background_image(image_url or "")
     if bg is None:
@@ -1076,10 +1182,10 @@ def render_phrase_card_image(phrase: str, image_url: Optional[str]) -> str:
     wy = size - 84
     draw.text((wx, wy), wm, font=wm_font, fill=(230, 235, 242, 110))
 
-    file_name = f"post_card_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
-    out_path = MEDIA_DIR / file_name
-    card.convert("RGB").save(out_path, format="JPEG", quality=92, optimize=True)
-    return f"{APP_BASE_URL.rstrip('/')}/media/{file_name}"
+    file_name = f"final/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/post_card_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
+    out = io.BytesIO()
+    card.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
+    return storage_put_bytes(file_name, out.getvalue(), "image/jpeg")
 
 
 def generate_post_caption(post: dict[str, Any]) -> str:
@@ -1597,6 +1703,15 @@ def ensure_csrf(request: Request, session_id: Optional[str], allow_telegram_inte
         raise HTTPException(status_code=403, detail="csrf token mismatch")
 
 
+def ensure_storage_ready() -> None:
+    if STORAGE_MODE == "minio":
+        client = minio_client()
+        if not client.bucket_exists(MINIO_BUCKET):
+            client.make_bucket(MINIO_BUCKET)
+    else:
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+
 app = FastAPI(title="Kindlysupport Posting MVP")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS or ["localhost", "127.0.0.1"])
 app.add_middleware(GZipMiddleware, minimum_size=1200)
@@ -1611,15 +1726,27 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestContextMiddleware)
 if (FRONTEND_DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST_DIR / "assets")), name="frontend-assets")
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="generated-media")
 
 
 @app.on_event("startup")
 def startup() -> None:
-    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_storage_ready()
     init_db()
     start_background_scheduler()
+
+
+@app.get("/media/{object_path:path}")
+def serve_media(object_path: str) -> Response:
+    key = (object_path or "").strip("/")
+    if not key:
+        raise HTTPException(status_code=404, detail="media key not found")
+    try:
+        data, ctype = storage_get_bytes(key)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="media not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"media read failed: {str(e)[:300]}")
+    return Response(content=data, media_type=ctype, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 def run_scheduled_publications() -> int:
@@ -2034,10 +2161,23 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
     image_prompt = default_image_prompt(post["title"], scenario, regen_instruction)
 
     image_url = None
+    original_image_url = None
     image_error = None
     try:
         result = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size="1024x1024")
         image_url = result["image_url"]
+        try:
+            original_bytes, original_ctype = download_remote_image(image_url)
+            ext = "jpg"
+            if original_ctype == "image/png":
+                ext = "png"
+            elif original_ctype == "image/webp":
+                ext = "webp"
+            original_key = f"original/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/post_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}.{ext}"
+            original_image_url = storage_put_bytes(original_key, original_bytes, original_ctype)
+            image_url = original_image_url
+        except Exception as e:
+            image_error = f"{image_error or ''} | original_store_error: {str(e)}".strip(" |")
     except HTTPException as e:
         image_error = e.detail
     except Exception as e:
@@ -2057,6 +2197,7 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
         "regenerate_options": ["Текст", "Картинку", "И то и то"],
         "note": "При перегенерации админ присылает текст-инструкцию, он учитывается в prompt изображения.",
         "image_error": image_error,
+        "original_image_url": original_image_url,
     }
     update_post(
         post_id,
@@ -2109,10 +2250,23 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
     if target in ("image", "both"):
         image_prompt = default_image_prompt(title, scenario, instruction)
         image_url = None
+        original_image_url = None
         image_error = None
         try:
             result = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size="1024x1024")
             image_url = result["image_url"]
+            try:
+                original_bytes, original_ctype = download_remote_image(image_url)
+                ext = "jpg"
+                if original_ctype == "image/png":
+                    ext = "png"
+                elif original_ctype == "image/webp":
+                    ext = "webp"
+                original_key = f"original/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/post_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}.{ext}"
+                original_image_url = storage_put_bytes(original_key, original_bytes, original_ctype)
+                image_url = original_image_url
+            except Exception as e:
+                image_error = f"{image_error or ''} | original_store_error: {str(e)}".strip(" |")
         except HTTPException as e:
             image_error = e.detail
         except Exception as e:
@@ -2124,6 +2278,7 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
                 image_error = f"{image_error or ''} | local_render_error: {str(e)}".strip(" |")
         preview = post.get("preview_payload") or {}
         preview["image_error"] = image_error
+        preview["original_image_url"] = original_image_url
         update_post(
             post_id,
             image_prompt=image_prompt,
