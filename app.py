@@ -13,6 +13,7 @@ import urllib.request
 import csv
 import io
 import binascii
+import textwrap
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Thread
@@ -28,6 +29,10 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageEnhance
+from PIL import ImageFilter
+from PIL import ImageFont
 
 try:
     import pytesseract
@@ -144,6 +149,7 @@ DAILY_AUTOPREVIEW_HOUR_MSK = int(os.getenv("DAILY_AUTOPREVIEW_HOUR_MSK", "9"))
 DAILY_AUTOPREVIEW_MINUTE_MSK = int(os.getenv("DAILY_AUTOPREVIEW_MINUTE_MSK", "0"))
 TELEGRAM_MODE = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()
 FRONTEND_DIST_DIR = Path(os.getenv("FRONTEND_DIST_DIR", "Content Platform Web App/dist")).resolve()
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "generated_media")).resolve()
 
 rate_bucket: dict[str, list[float]] = {}
 
@@ -787,6 +793,7 @@ def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not runtime_telegram_token():
         return None
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
+    use_md = (post.get("source_kind") or "").strip() == "phrase"
     keyboard = build_preview_keyboard(int(post["id"]))
     target_chat_id: str | int = runtime_telegram_preview_chat()
 
@@ -798,13 +805,20 @@ def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
                 "caption": caption[:1024],
                 "reply_markup": keyboard,
             }
+            if use_md:
+                payload["parse_mode"] = "MarkdownV2"
             if len(caption) > 1024:
                 payload["caption"] = caption[:1000] + "..."
             return telegram_api("sendPhoto", payload)
-        return telegram_api(
-            "sendMessage",
-            {"chat_id": chat_id, "text": caption, "reply_markup": keyboard, "disable_web_page_preview": True},
-        )
+        payload_msg: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": caption,
+            "reply_markup": keyboard,
+            "disable_web_page_preview": True,
+        }
+        if use_md:
+            payload_msg["parse_mode"] = "MarkdownV2"
+        return telegram_api("sendMessage", payload_msg)
 
     try:
         return _send(target_chat_id)
@@ -822,12 +836,16 @@ def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
     chat_id = runtime_telegram_publish_chat()
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
+    use_md = (post.get("source_kind") or "").strip() == "phrase"
     if post.get("final_image_url"):
-        return telegram_api(
-            "sendPhoto",
-            {"chat_id": chat_id, "photo": post["final_image_url"], "caption": caption[:1024]},
-        )
-    return telegram_api("sendMessage", {"chat_id": chat_id, "text": caption, "disable_web_page_preview": True})
+        payload_photo: dict[str, Any] = {"chat_id": chat_id, "photo": post["final_image_url"], "caption": caption[:1024]}
+        if use_md:
+            payload_photo["parse_mode"] = "MarkdownV2"
+        return telegram_api("sendPhoto", payload_photo)
+    payload_text: dict[str, Any] = {"chat_id": chat_id, "text": caption, "disable_web_page_preview": True}
+    if use_md:
+        payload_text["parse_mode"] = "MarkdownV2"
+    return telegram_api("sendMessage", payload_text)
 
 
 def send_telegram_text(chat_id: str | int, text: str, reply_markup: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
@@ -926,15 +944,155 @@ def generate_caption(title: str, text_body: str) -> str:
     return f"Притча: {title}\n{text_body}\n\n@kindlysupport"
 
 
+def escape_markdown_v2(text: str) -> str:
+    # Telegram MarkdownV2 escaping.
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", text or "")
+
+
+def expand_phrase_text(phrase: str) -> str:
+    clean = (phrase or "").strip()
+    if not clean:
+        return ""
+    prompt = (
+        "Ниже фраза для поста. Напиши ровно 2 коротких предложения на русском, "
+        "которые раскрывают мысль фразы и мягко мотивируют. "
+        "Без списков, без эмодзи, без кавычек, без повторения фразы слово в слово.\n\n"
+        f"Фраза: {clean}"
+    )
+    try:
+        raw = openrouter_generate_text(prompt)
+        text = re.sub(r"\s+", " ", (raw or "").strip())
+        # Keep max first 2 sentences.
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+        if len(parts) >= 2:
+            return f"{parts[0]} {parts[1]}".strip()
+        if parts:
+            return parts[0]
+    except Exception:
+        pass
+    return "Сделай маленький шаг в эту сторону уже сегодня. Последовательные действия укрепляют внутреннюю опору."
+
+
+def _wrap_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    words = (text or "").split()
+    if not words:
+        return []
+    lines: list[str] = []
+    current = words[0]
+    for w in words[1:]:
+        candidate = f"{current} {w}"
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if (bbox[2] - bbox[0]) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = w
+    lines.append(current)
+    return lines
+
+
+def _load_background_image(url: str) -> Optional[Image.Image]:
+    safe = (url or "").strip()
+    if not safe:
+        return None
+    try:
+        with urllib.request.urlopen(safe, timeout=25) as resp:
+            raw = resp.read()
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        return None
+
+
+def render_phrase_card_image(phrase: str, image_url: Optional[str]) -> str:
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    size = 1080
+    bg = _load_background_image(image_url or "")
+    if bg is None:
+        # Local fallback background: soft gradient + subtle blur/noise feel.
+        bg = Image.new("RGB", (size, size), "#1b2437")
+        grad = Image.new("RGB", (size, size))
+        gdraw = ImageDraw.Draw(grad)
+        for y in range(size):
+            t = y / float(size)
+            r = int(28 + (52 - 28) * t)
+            g = int(38 + (80 - 38) * t)
+            b = int(58 + (124 - 58) * t)
+            gdraw.line([(0, y), (size, y)], fill=(r, g, b))
+        bg = Image.blend(bg, grad, 0.82)
+    bg = bg.resize((size, size), Image.Resampling.LANCZOS)
+    bg = ImageEnhance.Contrast(bg).enhance(1.08)
+    bg = ImageEnhance.Color(bg).enhance(0.95)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=0.8))
+
+    # Dark overlay.
+    overlay = Image.new("RGBA", (size, size), (10, 14, 22, 130))
+    card = bg.convert("RGBA")
+    card.alpha_composite(overlay)
+    draw = ImageDraw.Draw(card)
+
+    font_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ]
+    quote_font = None
+    for f in font_candidates:
+        try:
+            quote_font = ImageFont.truetype(f, size=74)
+            break
+        except Exception:
+            continue
+    if quote_font is None:
+        quote_font = ImageFont.load_default()
+
+    max_width = 900
+    text = (phrase or "").strip()
+    lines = _wrap_lines(draw, text, quote_font, max_width)
+    # Auto-fit font size
+    while lines and len(lines) > 7:
+        try:
+            quote_font = ImageFont.truetype(font_candidates[0], size=max(34, quote_font.size - 4))
+        except Exception:
+            break
+        lines = _wrap_lines(draw, text, quote_font, max_width)
+
+    line_height = int(quote_font.size * 1.24) if hasattr(quote_font, "size") else 42
+    block_h = max(line_height * max(1, len(lines)), line_height)
+    y = (size - block_h) // 2
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=quote_font)
+        w = bbox[2] - bbox[0]
+        x = (size - w) // 2
+        draw.text((x, y), line, font=quote_font, fill=(245, 247, 250, 255))
+        y += line_height
+
+    wm_font = quote_font
+    try:
+        wm_font = ImageFont.truetype(font_candidates[0], size=34)
+    except Exception:
+        pass
+    wm = "@kindlysupport"
+    wb = draw.textbbox((0, 0), wm, font=wm_font)
+    wx = (size - (wb[2] - wb[0])) // 2
+    wy = size - 84
+    draw.text((wx, wy), wm, font=wm_font, fill=(230, 235, 242, 110))
+
+    file_name = f"post_card_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
+    out_path = MEDIA_DIR / file_name
+    card.convert("RGB").save(out_path, format="JPEG", quality=92, optimize=True)
+    return f"{APP_BASE_URL.rstrip('/')}/media/{file_name}"
+
+
 def generate_post_caption(post: dict[str, Any]) -> str:
     source_kind = (post.get("source_kind") or "").strip()
     title = (post.get("title") or "").strip()
     text_body = (post.get("text_body") or "").strip()
     if source_kind == "phrase":
-        # For phrase-posting mode: start with the phrase as the title, then channel handle.
-        if text_body and text_body != title:
-            return f"{title}\n\n{text_body}\n\n@kindlysupport"
-        return f"{title}\n\n@kindlysupport"
+        body = text_body
+        if not body or body == title:
+            body = expand_phrase_text(title)
+        phrase_md = f"*{escape_markdown_v2(title)}*"
+        body_md = escape_markdown_v2(body)
+        return f"{phrase_md}\n\n{body_md}\n\n@kindlysupport"
     return generate_caption(title, text_body)
 
 
@@ -1453,10 +1611,13 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestContextMiddleware)
 if (FRONTEND_DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST_DIR / "assets")), name="frontend-assets")
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="generated-media")
 
 
 @app.on_event("startup")
 def startup() -> None:
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     init_db()
     start_background_scheduler()
 
@@ -1882,6 +2043,13 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
     except Exception as e:
         image_error = str(e)
 
+    # Phrase posts always get final local rendered card with dark overlay and title text.
+    if post.get("source_kind") == "phrase":
+        try:
+            image_url = render_phrase_card_image(post["title"], image_url)
+        except Exception as e:
+            image_error = f"{image_error or ''} | local_render_error: {str(e)}".strip(" |")
+
     preview = {
         "chat": runtime_telegram_preview_chat(),
         "buttons": ["Опубликовать", "Перегенерировать", "Отмена"],
@@ -1949,6 +2117,11 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
             image_error = e.detail
         except Exception as e:
             image_error = str(e)
+        if post.get("source_kind") == "phrase":
+            try:
+                image_url = render_phrase_card_image(title, image_url)
+            except Exception as e:
+                image_error = f"{image_error or ''} | local_render_error: {str(e)}".strip(" |")
         preview = post.get("preview_payload") or {}
         preview["image_error"] = image_error
         update_post(
