@@ -149,7 +149,7 @@ DAILY_AUTOPREVIEW_HOUR_MSK = int(os.getenv("DAILY_AUTOPREVIEW_HOUR_MSK", "9"))
 DAILY_AUTOPREVIEW_MINUTE_MSK = int(os.getenv("DAILY_AUTOPREVIEW_MINUTE_MSK", "0"))
 TELEGRAM_MODE = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()
 FRONTEND_DIST_DIR = Path(os.getenv("FRONTEND_DIST_DIR", "Content Platform Web App/dist")).resolve()
-MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "generated_media")).resolve()
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "/tmp/generated_media")).resolve()
 
 rate_bucket: dict[str, list[float]] = {}
 
