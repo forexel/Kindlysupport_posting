@@ -1463,11 +1463,50 @@ def local_ocr_extract_text_from_image(image_url: str) -> str:
     if img is None:
         return ""
     try:
-        # Simple preprocessing improves contrast on mobile screenshots.
+        # OCR by blocks/lines with confidence filtering to reduce UI garbage.
         gray = img.convert("L")
         bw = gray.point(lambda x: 255 if x > 165 else 0, mode="1")
-        text = pytesseract.image_to_string(bw, lang="rus+eng", config="--psm 6")
-        return (text or "").strip()
+        data = pytesseract.image_to_data(
+            bw,
+            lang="rus+eng",
+            config="--psm 6",
+            output_type=pytesseract.Output.DICT,
+        )
+        buckets: dict[tuple[int, int, int], dict[str, Any]] = {}
+        n = len(data.get("text", []))
+        for i in range(n):
+            raw = str(data["text"][i] or "").strip()
+            if not raw:
+                continue
+            conf_raw = str(data.get("conf", ["-1"])[i] or "-1").strip()
+            try:
+                conf = float(conf_raw)
+            except Exception:
+                conf = -1.0
+            if conf < 35:
+                continue
+            key = (int(data["block_num"][i]), int(data["par_num"][i]), int(data["line_num"][i]))
+            row = buckets.setdefault(key, {"words": [], "conf_sum": 0.0, "count": 0})
+            row["words"].append(raw)
+            row["conf_sum"] += conf
+            row["count"] += 1
+
+        lines: list[str] = []
+        for key in sorted(buckets.keys()):
+            row = buckets[key]
+            if row["count"] <= 0:
+                continue
+            avg_conf = row["conf_sum"] / row["count"]
+            if avg_conf < 48:
+                continue
+            line = re.sub(r"\s+", " ", " ".join(row["words"])).strip()
+            if len(re.findall(r"[A-Za-zА-Яа-яЁё]", line)) < 6:
+                continue
+            if _is_ocr_noise_line(line):
+                continue
+            lines.append(line)
+
+        return "\n".join(lines).strip()
     except Exception:
         logger.exception("local_ocr_failed")
         return ""
@@ -1684,6 +1723,15 @@ def _strip_ocr_date_prefix(text: str) -> str:
         s,
         flags=re.IGNORECASE,
     )
+    # "нояб, 2024г ...", "nov 2024 ..."
+    s = re.sub(
+        r"^\s*(?:\d{1,2}\s+)?[A-Za-zА-Яа-яЁё]{3,10}[.,]?\s+(?:19|20)\d{2}\s*[A-Za-zА-Яа-яЁё]*\.?\s+",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    # "2024г ...", "2024 ..."
+    s = re.sub(r"^\s*(?:19|20)\d{2}\s*[A-Za-zА-Яа-яЁё]*\.?\s+", "", s, flags=re.IGNORECASE)
     # "30 Не торопитесь ..." -> "Не торопитесь ..."
     s = re.sub(r"^\s*\d{1,2}\s+(?=[А-ЯЁA-Z])", "", s)
     return s.strip()
