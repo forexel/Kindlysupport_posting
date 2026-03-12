@@ -1749,9 +1749,10 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
 
 
 def instagram_caption_text(post: dict[str, Any]) -> str:
-    raw = (post.get("telegram_caption") or "").strip()
+    # Instagram caption should come from canonical post content, not Telegram-specific cached caption.
+    raw = generate_post_caption_plain(post).strip()
     if not raw:
-        raw = generate_post_caption_plain(post)
+        raw = (post.get("telegram_caption") or "").strip()
     # Telegram MarkdownV2 escapes are not valid/useful in Instagram captions.
     text = re.sub(r"\\([_*\[\]()~`>#+\-=|{}.!\\])", r"\1", raw)
     text = re.sub(r"\*([^*\n]+)\*", r"\1", text)
