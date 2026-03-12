@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "error": "HTTP 400: {\"error\":{\"message\":\"Only photo or video can be accepted as media type.\",\"type\":\"OAuthException\",\"code\":9004,\"error_subcode\":2207052,\"is_transient\":false,\"error_user_title\":\"Media download has failed. The media URI doesn't meet our requirements.\",\"error_user_msg\":\"The media could not be fetched from this URI: .Please check the limitations section in our development document for more information: https:\\/\\/developers.facebook.com\\/docs\\/instagram-platform\\/instagram-graph-api\\/reference\\/ig-user\\/media#creating\",\"fbtrace_id\":\"A0rxw8Sd9jzMh3ta6bkRlzT\"}}",
+  "payload": {
+    "caption": "Мир существует только в настоящем моменте\n\nНас часто захватывает поток мыслей о том, что было, что могло бы быть, или что должно случиться. Мы можем перебирать прошлые обиды, строить планы на далёкое будущее, или беспокоиться о грядущих событиях, забывая о том, где мы находимся прямо сейчас. Казалось бы, это естественное течение ума, ведь он помогает нам учиться и планировать. Но иногда это уводит нас так далеко от реальности, что мы перестаём замечать, как течёт наша собственная жизнь.\n\nА ведь вся полнота бытия, всё, что мы можем по-настоящему почувствовать и пережить, происходит только в эту самую секунду. Этот единственный момент - это то единственное место, где мы можем дышать, видеть, любить и быть собой. Он не требует от нас совершенства или каких-то особых достижений, только готовности быть здесь. Именно в этом простом присутствии открывается возможность ощутить реальность во всей её хрупкой, но подлинной красоте.\n\n@kindlysupport",
+    "image_url": "https://posting.testmakerapp.online/media/final/2026/03/11/post_card_1773210107898_0b228580.jpg",
+    "publish_at": ""
+  }
+}
