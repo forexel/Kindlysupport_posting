@@ -1661,7 +1661,7 @@ def instagram_publish_post(post: dict[str, Any]) -> dict[str, Any]:
         f"{base}/media",
         {
             "image_url": post["final_image_url"],
-            "caption": (post.get("telegram_caption") or "")[:2200],
+            "caption": instagram_caption_text(post),
             "access_token": instagram_token,
         },
         proxy_url=proxy_url,
@@ -1690,7 +1690,7 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
     image_url = (post.get("final_image_url") or "").strip()
     if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
-    caption = (post.get("telegram_caption") or "").strip()
+    caption = instagram_caption_text(post)
     now_tag = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     post_tag = f"post-{post.get('id') or 'x'}-{uuid4().hex[:8]}"
 
@@ -1728,7 +1728,7 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
         logger.exception("instagram_enqueue_rehost_failed post_id=%s", post.get("id"))
 
     payload: dict[str, Any] = {
-        "caption": caption[:2200],
+        "caption": caption,
         "image_url": rehosted_image_url or image_url,
         "publish_at": (post.get("scheduled_for") or ""),
     }
@@ -1746,6 +1746,16 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
         "rehosted_image_url": rehosted_image_url or None,
         "github_response": {"content": res.get("content"), "commit": res.get("commit")},
     }
+
+
+def instagram_caption_text(post: dict[str, Any]) -> str:
+    raw = (post.get("telegram_caption") or "").strip()
+    if not raw:
+        raw = generate_post_caption_plain(post)
+    # Telegram MarkdownV2 escapes are not valid/useful in Instagram captions.
+    text = re.sub(r"\\([_*\[\]()~`>#+\-=|{}.!\\])", r"\1", raw)
+    text = re.sub(r"\*([^*\n]+)\*", r"\1", text)
+    return text[:2200]
 
 
 def instagram_publish_or_enqueue(post: dict[str, Any]) -> dict[str, Any]:
