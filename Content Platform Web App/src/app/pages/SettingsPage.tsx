@@ -25,6 +25,7 @@ export function SettingsPage() {
   const [publishChatId, setPublishChatId] = useState('');
   const [webhookUrl, setWebhookUrl] = useState('');
   const [webhookSecret, setWebhookSecret] = useState('');
+  const [telegramMode, setTelegramMode] = useState<'webhook' | 'polling'>('webhook');
 
   const [vkEnabled, setVkEnabled] = useState(false);
   const [vkAccessToken, setVkAccessToken] = useState('');
@@ -46,6 +47,8 @@ export function SettingsPage() {
   const [pinEnabled, setPinEnabled] = useState(false);
   const [pinAccessToken, setPinAccessToken] = useState('');
   const [pinBoardId, setPinBoardId] = useState('');
+  const [readiness, setReadiness] = useState<any>(null);
+  const [checkingReadiness, setCheckingReadiness] = useState(false);
 
   const applyModelPreset = () => {
     setTextModel('google/gemini-2.5-flash-lite');
@@ -66,6 +69,7 @@ export function SettingsPage() {
       setPreviewChatId(s.telegram_preview_chat || '');
       setPublishChatId(s.telegram_publish_chat || '');
       setWebhookSecret(s.telegram_webhook_secret || '');
+      setTelegramMode(s.telegram_mode === 'polling' ? 'polling' : 'webhook');
       setVkEnabled(Boolean(s.enable_vk));
       setVkAccessToken(s.vk_access_token || '');
       setVkGroupId(s.vk_group_id || '');
@@ -101,6 +105,7 @@ export function SettingsPage() {
         telegram_admin_user_id: adminUserId,
         telegram_preview_chat: previewChatId,
         telegram_publish_chat: publishChatId,
+        telegram_mode: telegramMode,
         enable_vk: vkEnabled,
         vk_group_id: vkGroupId,
         enable_max: maxEnabled,
@@ -127,6 +132,7 @@ export function SettingsPage() {
       await api('/api/settings', 'PUT', payload);
       toast.success('Настройки сохранены');
       await load();
+      await loadReadiness(false);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     } finally {
@@ -134,9 +140,23 @@ export function SettingsPage() {
     }
   };
 
+  const loadReadiness = async (showToast = true) => {
+    setCheckingReadiness(true);
+    try {
+      const ready = await api<any>('/api/integrations/readiness');
+      setReadiness(ready);
+      if (showToast) toast.success('Проверка интеграций обновлена');
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setCheckingReadiness(false);
+    }
+  };
+
   const handleTestConnection = async (service: string) => {
     try {
       const ready = await api<any>('/api/integrations/readiness');
+      setReadiness(ready);
       toast.success(`${service}: проверка выполнена`);
       if (ready.missing_required?.length) toast.info(`Не хватает: ${ready.missing_required.join(', ')}`);
     } catch (e: any) {
@@ -153,6 +173,71 @@ export function SettingsPage() {
       toast.error(String(e?.message || e));
     }
   };
+
+  useEffect(() => {
+    loadReadiness(false);
+  }, []);
+
+  const missing: string[] = readiness?.missing_required || [];
+  const hasMissing = (name: string) => missing.includes(name);
+
+  const statusItems = [
+    {
+      name: 'OpenRouter',
+      ok: !hasMissing('OPENROUTER_API_KEY'),
+      detail: hasMissing('OPENROUTER_API_KEY') ? 'Проблема: не задан OPENROUTER_API_KEY' : 'ОК',
+    },
+    {
+      name: 'Telegram',
+      ok: !hasMissing('TELEGRAM_BOT_TOKEN') && !hasMissing('TELEGRAM_WEBHOOK_SECRET'),
+      detail: hasMissing('TELEGRAM_BOT_TOKEN')
+        ? 'Проблема: не задан TELEGRAM_BOT_TOKEN'
+        : hasMissing('TELEGRAM_WEBHOOK_SECRET')
+          ? 'Проблема: включен webhook, но не задан TELEGRAM_WEBHOOK_SECRET'
+          : `ОК (${telegramMode})`,
+    },
+    {
+      name: 'VK',
+      ok: !readiness?.vk?.enabled || Boolean(readiness?.vk?.configured),
+      detail: !readiness?.vk?.enabled
+        ? 'Выключено'
+        : readiness?.vk?.configured
+          ? 'ОК'
+          : `Проблема: ${missing.filter((x) => x.startsWith('VK_')).join(', ') || 'неполная конфигурация'}`,
+    },
+    {
+      name: 'MAX',
+      ok: !readiness?.max?.enabled || Boolean(readiness?.max?.configured),
+      detail: !readiness?.max?.enabled
+        ? 'Выключено'
+        : readiness?.max?.configured
+          ? 'ОК'
+          : `Проблема: ${missing.filter((x) => x.startsWith('MAX_')).join(', ') || 'неполная конфигурация'}`,
+    },
+    {
+      name: 'Instagram',
+      ok: !readiness?.instagram?.enabled || Boolean(readiness?.instagram?.configured),
+      detail: !readiness?.instagram?.enabled
+        ? 'Выключено'
+        : readiness?.instagram?.configured
+          ? `ОК (${readiness?.instagram?.delivery_mode || 'mode'})`
+          : `Проблема: ${Array.isArray(readiness?.instagram?.needs) ? readiness.instagram.needs.join(', ') : 'неполная конфигурация'}`,
+    },
+    {
+      name: 'Pinterest',
+      ok: !readiness?.pinterest?.enabled || Boolean(readiness?.pinterest?.configured),
+      detail: !readiness?.pinterest?.enabled
+        ? 'Выключено'
+        : readiness?.pinterest?.configured
+          ? 'ОК'
+          : `Проблема: ${Array.isArray(readiness?.pinterest?.needs) ? readiness.pinterest.needs.join(', ') : 'неполная конфигурация'}`,
+    },
+    {
+      name: 'Database',
+      ok: Boolean(readiness?.database?.backend),
+      detail: readiness?.database?.backend ? `ОК (${readiness.database.backend})` : 'Проблема: backend не определен',
+    },
+  ];
 
   return (
     <div className="space-y-6">
@@ -226,6 +311,16 @@ export function SettingsPage() {
         <TabsContent value="telegram" className="mt-6">
           <Card className="bg-zinc-900 border-zinc-800 p-6 space-y-4">
             <h2 className="text-xl font-semibold text-zinc-50">Telegram</h2>
+            <div className="space-y-2">
+              <Label className="text-zinc-200">Режим Telegram</Label>
+              <select value={telegramMode} onChange={(e) => setTelegramMode((e.target.value === 'polling' ? 'polling' : 'webhook'))} className="w-full h-10 rounded-md border border-zinc-700 bg-zinc-800 px-3 text-zinc-100">
+                <option value="polling">polling (без webhook)</option>
+                <option value="webhook">webhook</option>
+              </select>
+              <p className="text-xs text-zinc-400">
+                Если webhook не нужен, выбери polling. Тогда TELEGRAM_WEBHOOK_SECRET не требуется.
+              </p>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2"><Label className="text-zinc-200">Bot Token</Label><Input type="password" value={botToken} onChange={(e) => setBotToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
               <div className="space-y-2"><Label className="text-zinc-200">Admin User ID</Label><Input value={adminUserId} onChange={(e) => setAdminUserId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
@@ -318,8 +413,41 @@ export function SettingsPage() {
           <Card className="bg-zinc-900 border-zinc-800 p-6 space-y-4">
             <h2 className="text-xl font-semibold text-zinc-50">Проверки</h2>
             <div className="flex gap-2">
-              <Button onClick={() => handleTestConnection('Интеграции')} variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700"><CheckCircle2 className="mr-2 h-4 w-4" />Проверить все интеграции</Button>
+              <Button onClick={() => loadReadiness(true)} variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700">
+                <CheckCircle2 className={`mr-2 h-4 w-4 ${checkingReadiness ? 'animate-spin' : ''}`} />
+                Проверить все интеграции
+              </Button>
             </div>
+            <div className="rounded-lg border border-zinc-800 overflow-hidden">
+              <div className="grid grid-cols-1 md:grid-cols-[220px_130px_1fr] gap-0 bg-zinc-950/40 border-b border-zinc-800">
+                <div className="px-4 py-2 text-xs uppercase tracking-wide text-zinc-500">Интеграция</div>
+                <div className="px-4 py-2 text-xs uppercase tracking-wide text-zinc-500">Статус</div>
+                <div className="px-4 py-2 text-xs uppercase tracking-wide text-zinc-500">Детали</div>
+              </div>
+              {statusItems.map((item) => (
+                <div key={item.name} className="grid grid-cols-1 md:grid-cols-[220px_130px_1fr] gap-0 border-b border-zinc-800/70 last:border-b-0">
+                  <div className="px-4 py-3 text-zinc-100">{item.name}</div>
+                  <div className={`px-4 py-3 font-medium ${item.ok ? 'text-green-400' : 'text-amber-400'}`}>{item.ok ? '✓ ОК' : 'Проблема'}</div>
+                  <div className="px-4 py-3 text-zinc-300">{item.detail}</div>
+                </div>
+              ))}
+            </div>
+            {!!missing.length && (
+              <div className="text-sm text-amber-300 bg-amber-950/30 border border-amber-900/50 rounded-md px-3 py-2">
+                Не хватает обязательных параметров: {missing.join(', ')}
+              </div>
+            )}
+            {telegramMode === 'webhook' && hasMissing('TELEGRAM_WEBHOOK_SECRET') && (
+              <div className="text-sm text-zinc-300">
+                Сейчас у Telegram выбран режим <span className="text-zinc-100 font-medium">webhook</span>, поэтому требуется <code>TELEGRAM_WEBHOOK_SECRET</code>.
+                Если webhook не нужен, переключи режим на <span className="text-zinc-100 font-medium">polling</span> во вкладке Telegram и сохрани настройки.
+              </div>
+            )}
+            {telegramMode === 'polling' && (
+              <div className="text-sm text-zinc-300">
+                Telegram работает в режиме <span className="text-zinc-100 font-medium">polling</span>; webhook и его secret не требуются.
+              </div>
+            )}
           </Card>
         </TabsContent>
       </Tabs>
