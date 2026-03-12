@@ -2275,6 +2275,52 @@ def _force_two_clean_paragraphs(text: str) -> str:
     return _cleanup_generated_ru_text(f"{p1}\n\n{p2}".strip())
 
 
+def _phrase_post_needs_expansion(post: dict[str, Any]) -> bool:
+    if (post.get("source_kind") or "").strip() != "phrase":
+        return False
+    title = _phrase_title_for_publish((post.get("title") or "").strip())
+    body = (post.get("text_body") or "").strip()
+    if not title:
+        return False
+    if not body:
+        return True
+    if _texts_too_similar(body, title, threshold=0.78):
+        return True
+    if len(body) < 220:
+        return True
+    p1, p2 = _split_two_paragraphs(body)
+    if not p1 or not p2:
+        return True
+    if _sentence_count(p1) < 2 or _sentence_count(p2) < 2:
+        return True
+    if not _phrase_expansion_quality_ok(body, title):
+        return True
+    return False
+
+
+def ensure_phrase_post_ready_for_publish(post_id: int, post: dict[str, Any]) -> dict[str, Any]:
+    if (post.get("source_kind") or "").strip() != "phrase":
+        return post
+    if not _phrase_post_needs_expansion(post):
+        return post
+    phrase_title = _phrase_title_for_publish((post.get("title") or "").strip())
+    generated = expand_phrase_text(
+        phrase_title,
+        instruction=(
+            "Сделай цельный публикуемый текст по фразе. "
+            "Ровно 2 абзаца по 3-5 предложений, живой язык, без повтора самой фразы."
+        ),
+        previous_text=(post.get("text_body") or "").strip(),
+    )
+    generated = (generated or "").strip()
+    if not generated:
+        return post
+    update_post(post_id, text_body=generated)
+    refreshed = fetch_post(post_id)
+    update_post(post_id, telegram_caption=generate_post_caption_plain(refreshed))
+    return fetch_post(post_id)
+
+
 def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = "") -> str:
     clean = (phrase or "").strip()
     if not clean:
@@ -5664,6 +5710,7 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
                 post = fetch_post(post_id)
         except Exception:
             logger.exception("preview_text_idea_failed post_id=%s", post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     if not scenario:
         scenario = generate_image_scenario(post["title"], post["text_body"], scenario_idea)
     regen_instruction = (payload.get("regen_instruction") or "").strip()
@@ -5977,6 +6024,7 @@ def _mock_request(payload: dict[str, Any]) -> _MockRequest:
 
 def publish_now_internal(post_id: int) -> dict[str, Any]:
     post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     preview_before = post.get("preview_payload") or {}
     published_before = preview_before.get("published") if isinstance(preview_before, dict) else None
     if post.get("status") == "published" and isinstance(published_before, dict) and str(published_before.get("mode") or "") == "now":
@@ -5990,6 +6038,7 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
         if int(getattr(cur, "rowcount", 0) or 0) == 0:
             return fetch_post(post_id)
     post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     tg_res = None
     tg_err = None
     ig_res = None
@@ -6149,6 +6198,7 @@ def publish_instagram_endpoint(post_id: int, session_id: Optional[str] = Cookie(
     if not runtime_enable_instagram():
         raise HTTPException(status_code=503, detail="Instagram publishing temporarily disabled")
     post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     res = instagram_publish_or_enqueue(post)
     return {"ok": True, "post_id": post_id, "instagram": res}
 
@@ -6159,6 +6209,7 @@ def publish_pinterest_endpoint(post_id: int, session_id: Optional[str] = Cookie(
     if not runtime_enable_pinterest():
         raise HTTPException(status_code=503, detail="Pinterest publishing temporarily disabled")
     post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     res = pinterest_publish_post(post)
     return {"ok": True, "post_id": post_id, "pinterest": res}
 
@@ -6169,6 +6220,7 @@ def publish_vk_endpoint(post_id: int, session_id: Optional[str] = Cookie(default
     if not runtime_enable_vk():
         raise HTTPException(status_code=503, detail="VK publishing temporarily disabled")
     post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     res = vk_publish_post(post)
     return {"ok": True, "post_id": post_id, "vk": res}
 
@@ -6179,6 +6231,7 @@ def publish_max_endpoint(post_id: int, session_id: Optional[str] = Cookie(defaul
     if not runtime_enable_max():
         raise HTTPException(status_code=503, detail="MAX publishing temporarily disabled")
     post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     res = max_publish_post(post)
     return {"ok": True, "post_id": post_id, "max": res}
 
@@ -6191,6 +6244,7 @@ async def publish_multi(post_id: int, request: Request, session_id: Optional[str
     if not isinstance(targets, list) or not targets:
         raise HTTPException(status_code=400, detail="targets[] required")
     post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
     result: dict[str, Any] = {"post_id": post_id, "targets": {}, "ok": True}
     for target in targets:
         t = str(target).strip().lower()
