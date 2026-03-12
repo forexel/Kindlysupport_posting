@@ -1,31 +1,4 @@
 services:
-  warp_proxy:
-    build:
-      context: .
-      dockerfile: docker/warp-proxy/Dockerfile
-    container_name: kindlysupport_warp_proxy
-    restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    security_opt:
-      - no-new-privileges:true
-    environment:
-      WARP_PROXY_PORT: ${WARP_PROXY_PORT:-40000}
-      WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
-    expose:
-      - "${WARP_PROXY_PORT:-40000}"
-    volumes:
-      - warp_state:/var/lib/cloudflare-warp
-    networks:
-      - default
-    profiles:
-      - warp
-    healthcheck:
-      test: ["CMD-SHELL", "warp-cli --accept-tos status | grep -qi Connected"]
-      interval: 20s
-      timeout: 10s
-      retries: 10
-
   app:
     build:
       context: .
@@ -75,6 +48,3 @@ networks:
   apps_infra:
     external: true
     name: apps-net
-
-volumes:
-  warp_state:
