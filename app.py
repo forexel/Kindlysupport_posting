@@ -2451,17 +2451,12 @@ def generate_post_caption(post: dict[str, Any]) -> str:
     if source_kind == "phrase":
         quote, author = split_quote_and_author(title)
         phrase_title = quote or title
-        body = text_body
-        if not body or body == title:
-            body = expand_phrase_text(phrase_title)
-        body = _force_two_clean_paragraphs(_normalize_generated_ru_text(body))
-        title = _cleanup_generated_ru_text(title)
-        body = _cleanup_generated_ru_text(body)
+        body = (text_body or "").strip()
         phrase_md = f"*{escape_markdown_v2(phrase_title)}*"
         if author:
             phrase_md = f"{phrase_md} — {escape_markdown_v2(author)}"
         body_md = escape_markdown_v2(body)
-        return f"{phrase_md}\n\n{body_md}\n\n@kindlysupport"
+        return f"{phrase_md}\n\n{body_md}\n\n@kindlysupport" if body_md else f"{phrase_md}\n\n@kindlysupport"
     return generate_caption(title, text_body)
 
 
@@ -2473,13 +2468,10 @@ def generate_post_caption_plain(post: dict[str, Any]) -> str:
         quote, author = split_quote_and_author(title)
         phrase_title = (quote or title or "").strip()
         body = (text_body or "").strip()
-        if not body or body == title:
-            body = expand_phrase_text(phrase_title)
-        body = _force_two_clean_paragraphs(_normalize_generated_ru_text(body))
         title_line = phrase_title
         if author:
             title_line = f"{title_line} - {author}"
-        return f"{title_line}\n\n{body}\n\n@kindlysupport"
+        return f"{title_line}\n\n{body}\n\n@kindlysupport" if body else f"{title_line}\n\n@kindlysupport"
     return generate_caption(title, text_body)
 
 
@@ -2493,10 +2485,7 @@ def generate_post_caption_markdown_limited(post: dict[str, Any], max_len: int = 
 
     quote, author = split_quote_and_author(title)
     phrase_title = quote or title
-    body = text_body
-    if not body or body == title:
-        body = expand_phrase_text(phrase_title)
-    body = _force_two_clean_paragraphs(_normalize_generated_ru_text(body))
+    body = (text_body or "").strip()
 
     title_md = f"*{escape_markdown_v2(phrase_title)}*"
     if author:
