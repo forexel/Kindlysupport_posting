@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "result": {
+    "create": {
+      "id": "17876749128535986"
+    },
+    "publish": {
+      "id": "18101882563922625"
+    }
+  },
+  "payload": {
+    "caption": "Тестовая публикация из GitHub Actions (external publisher)",
+    "image_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Example.jpg/800px-Example.jpg",
+    "publish_at": "2026-03-12T10:00:00Z"
+  }
+}
