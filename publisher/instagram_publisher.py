@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,8 @@ DONE_DIR = Path(os.getenv("IG_DONE_DIR", "queue/instagram_done"))
 FAILED_DIR = Path(os.getenv("IG_FAILED_DIR", "queue/instagram_failed"))
 AUTO_COMMIT = os.getenv("IG_AUTO_COMMIT", "1").strip().lower() in {"1", "true", "yes", "on"}
 FAIL_ON_ITEM_ERROR = os.getenv("IG_FAIL_ON_ITEM_ERROR", "0").strip().lower() in {"1", "true", "yes", "on"}
+CONTAINER_WAIT_SECONDS = int(os.getenv("IG_CONTAINER_WAIT_SECONDS", "90"))
+CONTAINER_POLL_INTERVAL_SECONDS = int(os.getenv("IG_CONTAINER_POLL_INTERVAL_SECONDS", "5"))
 
 
 @dataclass
@@ -98,6 +101,8 @@ def publish_instagram(image_url: str, caption: str) -> dict[str, Any]:
     if not creation_id:
         raise RuntimeError(f"create_failed: {create_res}")
 
+    wait_for_container_ready(creation_id)
+
     publish_url = build_url(
         f"{IG_USER_ID}/media_publish",
         {
@@ -107,6 +112,29 @@ def publish_instagram(image_url: str, caption: str) -> dict[str, Any]:
     )
     publish_res = fetch_json(publish_url, "POST")
     return {"create": create_res, "publish": publish_res}
+
+
+def wait_for_container_ready(creation_id: str) -> None:
+    deadline = time.time() + max(0, CONTAINER_WAIT_SECONDS)
+    last_status = ""
+    while time.time() <= deadline:
+        status_url = build_url(
+            creation_id,
+            {
+                "fields": "status_code",
+                "access_token": IG_ACCESS_TOKEN,
+            },
+        )
+        status_res = fetch_json(status_url, "GET")
+        status = str(status_res.get("status_code") or "").strip().upper()
+        if status == "FINISHED":
+            return
+        if status in {"ERROR", "EXPIRED"}:
+            raise RuntimeError(f"container_status={status}: {status_res}")
+        if status:
+            last_status = status
+        time.sleep(max(1, CONTAINER_POLL_INTERVAL_SECONDS))
+    raise RuntimeError(f"container_not_ready_timeout last_status={last_status or 'UNKNOWN'}")
 
 
 def move_with_meta(src: Path, dst_dir: Path, meta: dict[str, Any]) -> Path:
