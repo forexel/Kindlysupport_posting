@@ -1239,6 +1239,15 @@ def answer_callback(callback_query_id: str, text: str = "") -> None:
         pass
 
 
+def _delete_callback_source_message(callback_query: dict[str, Any]) -> None:
+    msg = callback_query.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id")
+    if chat_id is None or message_id is None:
+        return
+    telegram_delete_message(chat_id, message_id)
+
+
 def telegram_delete_message(chat_id: str | int, message_id: str | int) -> bool:
     if not runtime_telegram_token():
         return False
@@ -1357,18 +1366,22 @@ def _clear_service_message_ids_for_chat(post_id: int, post: dict[str, Any], chat
         update_post(post_id, preview_payload_json=preview)
 
 
-def cleanup_post_thread_messages_for_chat(post_id: int, chat_id: str | int) -> None:
+def cleanup_post_service_messages_for_chat(post_id: int, chat_id: str | int) -> None:
     post = fetch_post(post_id)
-    # service messages tracked during regeneration/publish flow
     mids = _get_service_message_ids_for_chat(post, chat_id)
-    # preview message for this chat
-    preview_mid = get_preview_message_id_for_chat(post, chat_id)
-    if preview_mid and preview_mid not in mids:
-        mids.append(preview_mid)
     for mid in mids:
         telegram_delete_message(chat_id, mid)
-    _clear_preview_message_id_for_chat(post_id, post, chat_id)
     _clear_service_message_ids_for_chat(post_id, post, chat_id)
+
+
+def cleanup_post_thread_messages_for_chat(post_id: int, chat_id: str | int) -> None:
+    post = fetch_post(post_id)
+    cleanup_post_service_messages_for_chat(post_id, chat_id)
+    post = fetch_post(post_id)
+    preview_mid = get_preview_message_id_for_chat(post, chat_id)
+    if preview_mid:
+        telegram_delete_message(chat_id, preview_mid)
+        _clear_preview_message_id_for_chat(post_id, post, chat_id)
 
 
 def tg_keyboard(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
@@ -6654,6 +6667,7 @@ def _telegram_admin_check_or_learn(user_id: int) -> bool:
 
 async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
     msg = update.get("message") or {}
+    message_id = msg.get("message_id")
     user = msg.get("from") or {}
     user_id = user.get("id")
     chat = msg.get("chat") or {}
@@ -6774,6 +6788,9 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True}
         tg_state_clear(int(user_id))
         await publish(post_id, _mock_request({"mode": "schedule", "scheduled_for": text}), session_id="telegram-internal")  # type: ignore[arg-type]
+        cleanup_post_service_messages_for_chat(post_id, chat.get("id"))
+        if message_id is not None:
+            telegram_delete_message(chat.get("id"), message_id)
         send_telegram_text(chat.get("id"), f"Публикация запланирована: {text}", track_post_id=post_id)
         return {"ok": True}
     if st == "await_replace_phrase":
@@ -7108,6 +7125,7 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             send_telegram_text(chat_id, f"Добавлено фраз: {inserted}. Срезано как дубль: {duplicates}.")
         return {"ok": True}
     if action == "dailyswap":
+        _delete_callback_source_message(cq)
         current_phrase_id = int(post_id or 0)
         with db() as conn:
             phrase = conn.execute(
@@ -7140,6 +7158,7 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
                 telegram_delete_message(chat_id, old_mid)
         return {"ok": True}
     if action == "dailygen":
+        _delete_callback_source_message(cq)
         phrase_id = int(post_id or 0)
         if not phrase_id:
             if cb_id:
@@ -7176,6 +7195,7 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             send_telegram_text(chat_id, "Превью отменено.")
         return {"ok": True}
     if action == "regen":
+        _delete_callback_source_message(cq)
         if cb_id:
             answer_callback(cb_id, "Выбери, что перегенерировать")
         if chat_id:
@@ -7192,6 +7212,7 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             )
         return {"ok": True}
     if action == "regenpick":
+        _delete_callback_source_message(cq)
         target = extra or "both"
         tg_state_set(int(user_id), "await_regen_instruction", {"post_id": post_id, "target": target})
         if cb_id:
@@ -7245,6 +7266,7 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             )
         return {"ok": True}
     if action == "pubpick":
+        _delete_callback_source_message(cq)
         choice = extra or ""
         if choice == "now":
             await publish(post_id, _mock_request({"mode": "now"}), session_id="telegram-internal")  # type: ignore[arg-type]
