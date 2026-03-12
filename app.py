@@ -277,6 +277,9 @@ TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "@ForCreatingTestsBot
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "").strip()
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
+MAX_PUBLISH_URL = os.getenv("MAX_PUBLISH_URL", "").strip()
+MAX_ACCESS_TOKEN = os.getenv("MAX_ACCESS_TOKEN", "").strip()
+MAX_HTTP_HEADER = os.getenv("MAX_HTTP_HEADER", "Authorization").strip()
 INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v22.0").strip()
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
 INSTAGRAM_IG_USER_ID = os.getenv("INSTAGRAM_IG_USER_ID", "").strip()
@@ -291,6 +294,7 @@ PINTEREST_BOARD_ID = os.getenv("PINTEREST_BOARD_ID", "").strip()
 ENABLE_INSTAGRAM = os.getenv("ENABLE_INSTAGRAM", "0").strip() in {"1", "true", "yes"}
 ENABLE_PINTEREST = os.getenv("ENABLE_PINTEREST", "0").strip() in {"1", "true", "yes"}
 ENABLE_VK = os.getenv("ENABLE_VK", "0").strip() in {"1", "true", "yes"}
+ENABLE_MAX = os.getenv("ENABLE_MAX", "0").strip() in {"1", "true", "yes"}
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Moscow").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").strip()
@@ -835,6 +839,19 @@ def runtime_vk_version() -> str:
     return setting_get("vk_api_version", VK_API_VERSION)
 
 
+def runtime_max_publish_url() -> str:
+    return setting_get("max_publish_url", MAX_PUBLISH_URL).strip()
+
+
+def runtime_max_token() -> str:
+    return setting_get("max_access_token", MAX_ACCESS_TOKEN).strip()
+
+
+def runtime_max_http_header() -> str:
+    raw = setting_get("max_http_header", MAX_HTTP_HEADER).strip()
+    return raw or "Authorization"
+
+
 def runtime_enable_instagram() -> bool:
     return bool_from_str(setting_get("enable_instagram", "1" if ENABLE_INSTAGRAM else "0"))
 
@@ -845,6 +862,10 @@ def runtime_enable_pinterest() -> bool:
 
 def runtime_enable_vk() -> bool:
     return bool_from_str(setting_get("enable_vk", "1" if ENABLE_VK else "0"))
+
+
+def runtime_enable_max() -> bool:
+    return bool_from_str(setting_get("enable_max", "1" if ENABLE_MAX else "0"))
 
 
 def runtime_telegram_mode() -> str:
@@ -891,9 +912,13 @@ def bootstrap_runtime_settings() -> None:
         "vk_access_token": VK_ACCESS_TOKEN,
         "vk_group_id": VK_GROUP_ID,
         "vk_api_version": VK_API_VERSION,
+        "max_publish_url": MAX_PUBLISH_URL,
+        "max_access_token": MAX_ACCESS_TOKEN,
+        "max_http_header": MAX_HTTP_HEADER,
         "enable_instagram": "1" if ENABLE_INSTAGRAM else "0",
         "enable_pinterest": "1" if ENABLE_PINTEREST else "0",
         "enable_vk": "1" if ENABLE_VK else "0",
+        "enable_max": "1" if ENABLE_MAX else "0",
         "ocr_primary_engine": OCR_PRIMARY_ENGINE,
     }
     for key, default_value in defaults.items():
@@ -1812,6 +1837,85 @@ def pinterest_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     return res
 
 
+def vk_api_call(
+    method: str,
+    params: dict[str, Any],
+    *,
+    vk_token: str,
+    vk_version: str,
+    timeout: int = 45,
+) -> Any:
+    payload = dict(params or {})
+    payload["access_token"] = vk_token
+    payload["v"] = vk_version
+    body = urllib.parse.urlencode(payload, doseq=True).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.vk.com/method/{method}",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=502, detail=f"VK {method} HTTP {e.code}: {detail[:1200]}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"VK {method} request failed: {str(e)[:800]}")
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"VK {method} invalid JSON response")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail=f"VK {method} unexpected response format")
+    err = data.get("error")
+    if err:
+        msg = str(err.get("error_msg") or "unknown error")
+        code = str(err.get("error_code") or "")
+        raise HTTPException(status_code=502, detail=f"VK {method} error {code}: {msg}")
+    if "response" not in data:
+        raise HTTPException(status_code=502, detail=f"VK {method} empty response")
+    return data["response"]
+
+
+def vk_upload_photo(upload_url: str, image_bytes: bytes, filename: str = "publish.jpg") -> dict[str, Any]:
+    boundary = f"----kindlyvk{secrets.token_hex(12)}"
+    body = bytearray()
+    body.extend(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+            "Content-Type: image/jpeg\r\n\r\n"
+        ).encode("utf-8")
+    )
+    body.extend(image_bytes)
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        upload_url,
+        data=bytes(body),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw) if raw else {}
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=502, detail="VK upload invalid response format")
+            if data.get("error"):
+                raise HTTPException(status_code=502, detail=f"VK upload error: {str(data.get('error'))[:800]}")
+            return data
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=502, detail=f"VK upload HTTP {e.code}: {detail[:1200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"VK upload request failed: {str(e)[:800]}")
+
+
 def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     if not runtime_enable_vk():
         raise HTTPException(status_code=503, detail="VK publishing temporarily disabled")
@@ -1822,20 +1926,81 @@ def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="VK credentials not configured")
     if not post.get("final_image_url"):
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
-    caption = (post.get("telegram_caption") or generate_post_caption(post))[:3500]
-    wall_post = http_json(
-        "POST",
-        "https://api.vk.com/method/wall.post",
+    caption = generate_post_caption_plain(post)[:3500]
+    media_key = media_key_from_url(str(post["final_image_url"]))
+    if media_key:
+        try:
+            image_bytes, _ = storage_get_bytes(media_key)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"VK image read failed: {str(e)[:800]}")
+    else:
+        try:
+            image_bytes, _ = download_remote_image(str(post["final_image_url"]))
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"VK image download failed: {str(e)[:800]}")
+    upload = vk_api_call(
+        "photos.getWallUploadServer",
+        {"group_id": vk_group_id},
+        vk_token=vk_token,
+        vk_version=vk_version,
+    )
+    upload_url = str((upload or {}).get("upload_url") or "").strip()
+    if not upload_url:
+        raise HTTPException(status_code=502, detail="VK upload server URL is empty")
+    upload_res = vk_upload_photo(upload_url, image_bytes, filename=f"post_{post.get('id') or 'x'}.jpg")
+    saved = vk_api_call(
+        "photos.saveWallPhoto",
+        {
+            "group_id": vk_group_id,
+            "photo": upload_res.get("photo"),
+            "server": upload_res.get("server"),
+            "hash": upload_res.get("hash"),
+        },
+        vk_token=vk_token,
+        vk_version=vk_version,
+    )
+    if not isinstance(saved, list) or not saved:
+        raise HTTPException(status_code=502, detail="VK saveWallPhoto returned empty list")
+    photo = saved[0] if isinstance(saved[0], dict) else {}
+    owner_id = photo.get("owner_id")
+    photo_id = photo.get("id")
+    if owner_id is None or photo_id is None:
+        raise HTTPException(status_code=502, detail="VK saveWallPhoto missing owner_id/id")
+    attachment = f"photo{owner_id}_{photo_id}"
+    wall_post = vk_api_call(
+        "wall.post",
         {
             "owner_id": f"-{vk_group_id}",
             "from_group": 1,
             "message": caption,
-            "attachments": post["final_image_url"],
-            "v": vk_version,
-            "access_token": vk_token,
+            "attachments": attachment,
         },
+        vk_token=vk_token,
+        vk_version=vk_version,
     )
-    return wall_post
+    return {"wall_post": wall_post, "attachment": attachment, "photo": photo}
+
+
+def max_publish_post(post: dict[str, Any]) -> dict[str, Any]:
+    if not runtime_enable_max():
+        raise HTTPException(status_code=503, detail="MAX publishing temporarily disabled")
+    publish_url = runtime_max_publish_url()
+    if not publish_url:
+        raise HTTPException(status_code=400, detail="MAX publish URL not configured")
+    if not post.get("final_image_url"):
+        raise HTTPException(status_code=400, detail="Post has no final_image_url")
+    payload = {
+        "title": (post.get("title") or "")[:300],
+        "text": (post.get("telegram_caption") or generate_post_caption_plain(post))[:5000],
+        "image_url": post["final_image_url"],
+        "post_id": post.get("id"),
+        "source": "kindlysupport_posting",
+    }
+    token = runtime_max_token()
+    headers: dict[str, str] = {}
+    if token:
+        headers[runtime_max_http_header()] = token
+    return http_json("POST", publish_url, payload, headers=headers or None)
 
 
 def generate_caption(title: str, text_body: str) -> str:
@@ -5143,6 +5308,7 @@ def get_config(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
         "instagram_configured": runtime_instagram_configured(),
         "pinterest_configured": bool(runtime_enable_pinterest() and runtime_pinterest_token() and runtime_pinterest_board_id()),
         "vk_configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
+        "max_configured": bool(runtime_enable_max() and runtime_max_publish_url()),
     }
 
 
@@ -5168,6 +5334,10 @@ def get_settings(session_id: Optional[str] = Cookie(default=None, alias=SESSION_
         "vk_access_token": "***" if runtime_vk_token() else "",
         "vk_group_id": runtime_vk_group_id(),
         "vk_api_version": runtime_vk_version(),
+        "enable_max": runtime_enable_max(),
+        "max_publish_url": runtime_max_publish_url(),
+        "max_access_token": "***" if runtime_max_token() else "",
+        "max_http_header": runtime_max_http_header(),
         "enable_instagram": runtime_enable_instagram(),
         "instagram_delivery_mode": runtime_instagram_delivery_mode(),
         "instagram_access_token": "***" if runtime_instagram_token() else "",
@@ -5206,6 +5376,10 @@ async def update_settings(request: Request, session_id: Optional[str] = Cookie(d
         "vk_access_token",
         "vk_group_id",
         "vk_api_version",
+        "enable_max",
+        "max_publish_url",
+        "max_access_token",
+        "max_http_header",
         "enable_instagram",
         "instagram_delivery_mode",
         "instagram_access_token",
@@ -5800,6 +5974,8 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
     tg_err = None
     ig_res = None
     ig_err = None
+    max_res = None
+    max_err = None
     try:
         tg_res = telegram_send_publish(post)
     except HTTPException as e:
@@ -5813,15 +5989,33 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
             ig_err = e.detail
         except Exception as e:
             ig_err = str(e)
+    if runtime_enable_max():
+        try:
+            max_res = max_publish_post(post)
+        except HTTPException as e:
+            max_err = e.detail
+        except Exception as e:
+            max_err = str(e)
     preview = post.get("preview_payload") or {}
+    published_channels: list[str] = []
+    if tg_res:
+        published_channels.append("telegram")
+    if ig_res:
+        published_channels.append("instagram")
+    if max_res:
+        published_channels.append("max")
     preview["published"] = {
         "mode": "now",
         "at": now_iso(),
+        "channels": published_channels,
         "telegram": bool(tg_res),
         "telegram_error": tg_err,
         "instagram": bool(ig_res),
         "instagram_error": ig_err,
         "instagram_result": ig_res,
+        "max": bool(max_res),
+        "max_error": max_err,
+        "max_result": max_res,
     }
     pub_message_id = None
     if tg_res and (tg_res.get("result") or {}).get("message_id") is not None:
@@ -5864,6 +6058,8 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
         missing.extend([x for x in ["PINTEREST_ACCESS_TOKEN", "PINTEREST_BOARD_ID"] if x not in missing])
     if runtime_enable_vk() and (not runtime_vk_token() or not runtime_vk_group_id()):
         missing.extend([x for x in ["VK_ACCESS_TOKEN", "VK_GROUP_ID"] if x not in missing])
+    if runtime_enable_max() and not runtime_max_publish_url():
+        missing.append("MAX_PUBLISH_URL")
     return {
         "telegram": {
             "bot_token": bool(runtime_telegram_token()),
@@ -5890,6 +6086,13 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
             "enabled": runtime_enable_vk(),
             "configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
             "needs": ["VK_ACCESS_TOKEN", "VK_GROUP_ID"],
+        },
+        "max": {
+            "enabled": runtime_enable_max(),
+            "configured": bool(runtime_enable_max() and runtime_max_publish_url()),
+            "needs": ["MAX_PUBLISH_URL"],
+            "publish_url": runtime_max_publish_url(),
+            "http_header": runtime_max_http_header(),
         },
         "database": {"backend": DB_BACKEND, "database_url_set": bool(DATABASE_URL)},
         "missing_required": missing,
@@ -5926,6 +6129,16 @@ def publish_vk_endpoint(post_id: int, session_id: Optional[str] = Cookie(default
     return {"ok": True, "post_id": post_id, "vk": res}
 
 
+@app.post("/api/posts/{post_id}/publish/max")
+def publish_max_endpoint(post_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    if not runtime_enable_max():
+        raise HTTPException(status_code=503, detail="MAX publishing temporarily disabled")
+    post = fetch_post(post_id)
+    res = max_publish_post(post)
+    return {"ok": True, "post_id": post_id, "max": res}
+
+
 @app.post("/api/posts/{post_id}/publish/multi")
 async def publish_multi(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
@@ -5951,15 +6164,30 @@ async def publish_multi(post_id: int, request: Request, session_id: Optional[str
                 if not runtime_enable_pinterest():
                     raise HTTPException(status_code=503, detail="Pinterest disabled")
                 result["targets"]["pinterest"] = {"ok": True, "result": pinterest_publish_post(post)}
+            elif t == "max":
+                if not runtime_enable_max():
+                    raise HTTPException(status_code=503, detail="MAX disabled")
+                result["targets"]["max"] = {"ok": True, "result": max_publish_post(post)}
             else:
                 result["targets"][t] = {"ok": False, "error": "unsupported target"}
                 result["ok"] = False
         except Exception as e:
             result["targets"][t] = {"ok": False, "error": str(e)}
             result["ok"] = False
-    if result["targets"].get("telegram", {}).get("ok"):
-        update_post(post_id, status="published")
-        mark_phrase_published_if_linked(fetch_post(post_id))
+    any_success = any(bool(v.get("ok")) for v in result["targets"].values() if isinstance(v, dict))
+    if any_success:
+        successful_targets = [name for name, state in result["targets"].items() if bool((state or {}).get("ok"))]
+        latest = fetch_post(post_id)
+        preview = latest.get("preview_payload") or {}
+        preview["published"] = {
+            "mode": "multi",
+            "at": now_iso(),
+            "channels": successful_targets,
+            "targets": result["targets"],
+        }
+        update_post(post_id, status="published", preview_payload_json=preview)
+        if "telegram" in successful_targets:
+            mark_phrase_published_if_linked(fetch_post(post_id))
     return result
 
 

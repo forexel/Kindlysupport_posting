@@ -29,6 +29,10 @@ export function SettingsPage() {
   const [vkEnabled, setVkEnabled] = useState(false);
   const [vkAccessToken, setVkAccessToken] = useState('');
   const [vkGroupId, setVkGroupId] = useState('');
+  const [maxEnabled, setMaxEnabled] = useState(false);
+  const [maxPublishUrl, setMaxPublishUrl] = useState('');
+  const [maxAccessToken, setMaxAccessToken] = useState('');
+  const [maxHttpHeader, setMaxHttpHeader] = useState('Authorization');
 
   const [igEnabled, setIgEnabled] = useState(false);
   const [igDeliveryMode, setIgDeliveryMode] = useState('external_queue');
@@ -65,6 +69,10 @@ export function SettingsPage() {
       setVkEnabled(Boolean(s.enable_vk));
       setVkAccessToken(s.vk_access_token || '');
       setVkGroupId(s.vk_group_id || '');
+      setMaxEnabled(Boolean(s.enable_max));
+      setMaxPublishUrl(s.max_publish_url || '');
+      setMaxAccessToken(s.max_access_token || '');
+      setMaxHttpHeader(s.max_http_header || 'Authorization');
       setIgEnabled(Boolean(s.enable_instagram));
       setIgDeliveryMode(s.instagram_delivery_mode || 'external_queue');
       setIgAccessToken(s.instagram_access_token || '');
@@ -95,6 +103,9 @@ export function SettingsPage() {
         telegram_publish_chat: publishChatId,
         enable_vk: vkEnabled,
         vk_group_id: vkGroupId,
+        enable_max: maxEnabled,
+        max_publish_url: maxPublishUrl,
+        max_http_header: maxHttpHeader,
         enable_instagram: igEnabled,
         instagram_delivery_mode: igDeliveryMode,
         instagram_ig_user_id: igUserId,
@@ -108,6 +119,7 @@ export function SettingsPage() {
       if (botToken && botToken !== '***') payload.telegram_bot_token = botToken;
       if (webhookSecret && webhookSecret !== '***') payload.telegram_webhook_secret = webhookSecret;
       if (vkAccessToken && vkAccessToken !== '***') payload.vk_access_token = vkAccessToken;
+      if (maxAccessToken && maxAccessToken !== '***') payload.max_access_token = maxAccessToken;
       if (igAccessToken && igAccessToken !== '***') payload.instagram_access_token = igAccessToken;
       if (igQueueGithubToken && igQueueGithubToken !== '***') payload.instagram_queue_github_token = igQueueGithubToken;
       if (pinAccessToken && pinAccessToken !== '***') payload.pinterest_access_token = pinAccessToken;
@@ -152,11 +164,12 @@ export function SettingsPage() {
       </div>
 
       <Tabs defaultValue="profile" className="w-full">
-        <TabsList className="bg-zinc-900 border border-zinc-800 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7">
+        <TabsList className="bg-zinc-900 border border-zinc-800 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8">
           <TabsTrigger value="profile" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100"><User className="h-4 w-4 sm:mr-2" /><span className="hidden sm:inline">Профиль</span></TabsTrigger>
           <TabsTrigger value="llm" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100"><Cpu className="h-4 w-4 sm:mr-2" /><span className="hidden sm:inline">LLM</span></TabsTrigger>
           <TabsTrigger value="telegram" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100"><SendIcon className="h-4 w-4 sm:mr-2" /><span className="hidden sm:inline">Telegram</span></TabsTrigger>
           <TabsTrigger value="vk" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">VK</TabsTrigger>
+          <TabsTrigger value="max" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">MAX</TabsTrigger>
           <TabsTrigger value="instagram" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">Instagram</TabsTrigger>
           <TabsTrigger value="pinterest" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">Pinterest</TabsTrigger>
           <TabsTrigger value="actions" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">Действия</TabsTrigger>
@@ -241,6 +254,18 @@ export function SettingsPage() {
               <div className="space-y-2"><Label className="text-zinc-200">Access Token</Label><Input type="password" value={vkAccessToken} onChange={(e) => setVkAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
               <div className="space-y-2"><Label className="text-zinc-200">Group ID</Label><Input value={vkGroupId} onChange={(e) => setVkGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
             </div>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="max" className="mt-6">
+          <Card className="bg-zinc-900 border-zinc-800 p-6 space-y-4">
+            <h2 className="text-xl font-semibold text-zinc-50">MAX</h2>
+            <div className="flex items-center gap-2"><input type="checkbox" checked={maxEnabled} onChange={(e) => setMaxEnabled(e.target.checked)} /><span className="text-zinc-300">Включить MAX</span></div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2"><Label className="text-zinc-200">Publish URL</Label><Input value={maxPublishUrl} onChange={(e) => setMaxPublishUrl(e.target.value)} placeholder="https://.../publish" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">HTTP Header</Label><Input value={maxHttpHeader} onChange={(e) => setMaxHttpHeader(e.target.value)} placeholder="Authorization" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+            </div>
+            <div className="space-y-2"><Label className="text-zinc-200">Access Token (optional)</Label><Input type="password" value={maxAccessToken} onChange={(e) => setMaxAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
           </Card>
         </TabsContent>
 

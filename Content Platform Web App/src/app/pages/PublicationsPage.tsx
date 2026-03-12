@@ -99,6 +99,7 @@ export function PublicationsPage() {
             <SelectItem value="all" className="text-zinc-200">Все каналы</SelectItem>
             <SelectItem value="telegram" className="text-zinc-200">Telegram</SelectItem>
             <SelectItem value="vk" className="text-zinc-200">VK</SelectItem>
+            <SelectItem value="max" className="text-zinc-200">MAX</SelectItem>
             <SelectItem value="pinterest" className="text-zinc-200">Pinterest</SelectItem>
             <SelectItem value="instagram" className="text-zinc-200">Instagram</SelectItem>
           </SelectContent>
@@ -131,7 +132,11 @@ export function PublicationsPage() {
             {filtered.length === 0 ? <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-500">Публикации не найдены</TableCell></TableRow> : filtered.map((pub) => (
               <TableRow key={pub.id} className="hover:bg-zinc-800/50 border-zinc-800">
                 <TableCell className="text-zinc-200 max-w-md truncate">{pub.title || pub.text_body}</TableCell>
-                <TableCell><Badge variant="outline" className="bg-blue-950/30 text-blue-400 border-blue-900/50">telegram</Badge></TableCell>
+                <TableCell>
+                  <Badge variant="outline" className="bg-blue-950/30 text-blue-400 border-blue-900/50">
+                    {String(pub.preview_payload?.published?.channels?.[0] || 'telegram')}
+                  </Badge>
+                </TableCell>
                 <TableCell><div className="flex items-center gap-2">{getStatusIcon(pub.status)}{getStatusBadge(pub.status)}</div></TableCell>
                 <TableCell className="text-zinc-400">{(pub.scheduled_for || pub.updated_at || '').replace('T', ' ').slice(0, 16)}</TableCell>
                 <TableCell>
