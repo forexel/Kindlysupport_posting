@@ -1727,9 +1727,14 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
         return github_put_bytes(rel_path, text_payload.encode("utf-8"), commit_message)
 
     # Rehost image in GitHub to avoid Meta fetch issues with app-hosted media URLs.
+    # Prefer object storage read by media key (no network/self-call dependency).
     rehosted_image_url = ""
     try:
-        image_bytes, _ = download_remote_image(image_url)
+        media_key = media_key_from_url(image_url)
+        if media_key:
+            image_bytes, _ = storage_get_bytes(media_key)
+        else:
+            image_bytes, _ = download_remote_image(image_url)
         media_rel_path = f"{queue_path}/media/{now_tag}-{post_tag}.jpg".strip("/")
         github_put_bytes(
             media_rel_path,
