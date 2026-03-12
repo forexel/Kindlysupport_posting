@@ -363,6 +363,7 @@ class DBCursorProxy:
     def __init__(self, inner: Any):
         self.inner = inner
         self.lastrowid = getattr(inner, "lastrowid", None)
+        self.rowcount = getattr(inner, "rowcount", 0)
 
     def fetchone(self) -> Any:
         row = self.inner.fetchone()
