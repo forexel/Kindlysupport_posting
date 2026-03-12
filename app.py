@@ -5783,6 +5783,19 @@ def _mock_request(payload: dict[str, Any]) -> _MockRequest:
 
 def publish_now_internal(post_id: int) -> dict[str, Any]:
     post = fetch_post(post_id)
+    preview_before = post.get("preview_payload") or {}
+    published_before = preview_before.get("published") if isinstance(preview_before, dict) else None
+    if post.get("status") == "published" and isinstance(published_before, dict) and str(published_before.get("mode") or "") == "now":
+        return post
+    # Best-effort guard against duplicate publish callbacks/races.
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE posts SET status = ?, updated_at = ? WHERE id = ? AND coalesce(status, '') NOT IN ('publishing', 'published')",
+            ("publishing", now_iso(), post_id),
+        )
+        if int(getattr(cur, "rowcount", 0) or 0) == 0:
+            return fetch_post(post_id)
+    post = fetch_post(post_id)
     tg_res = None
     tg_err = None
     ig_res = None
@@ -7274,13 +7287,21 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
         _delete_callback_source_message(cq)
         choice = extra or ""
         if choice == "now":
-            await publish(post_id, _mock_request({"mode": "now"}), session_id="telegram-internal")  # type: ignore[arg-type]
             if cb_id:
-                answer_callback(cb_id, "Опубликовано")
+                answer_callback(cb_id, "Публикую...")
+            await publish(post_id, _mock_request({"mode": "now"}), session_id="telegram-internal")  # type: ignore[arg-type]
             if chat_id:
                 # Cleanup previous service/preview messages for this generation thread.
                 cleanup_post_thread_messages_for_chat(post_id, chat_id)
-                send_telegram_text(chat_id, "Пост опубликован сейчас.")
+                post_after = fetch_post(post_id)
+                preview_after = post_after.get("preview_payload") or {}
+                published_meta = preview_after.get("published") if isinstance(preview_after, dict) else None
+                if post_after.get("status") == "publishing":
+                    send_telegram_text(chat_id, "Публикация уже выполняется, подожди пару секунд.")
+                elif post_after.get("status") == "published" and isinstance(published_meta, dict) and str(published_meta.get("mode") or "") == "now":
+                    send_telegram_text(chat_id, "Пост опубликован сейчас.")
+                else:
+                    send_telegram_text(chat_id, "Запрос на публикацию принят.")
             return {"ok": True}
         if choice == "schedule":
             tg_state_set(int(user_id), "await_schedule_datetime", {"post_id": post_id})
