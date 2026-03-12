@@ -28,6 +28,7 @@
 
 - `IG_USER_ID` (Secret)
 - `IG_ACCESS_TOKEN` (Secret)
+- `IG_GRAPH_HOST` (Variable, опционально: `graph.facebook.com` или `graph.instagram.com`)
 - `IG_GRAPH_VERSION` (Variable, опционально, по умолчанию `v22.0`)
 
 ## Важно

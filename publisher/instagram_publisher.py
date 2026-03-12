@@ -13,6 +13,7 @@ from typing import Any, Optional
 from urllib import parse, request, error
 
 GRAPH_VERSION = os.getenv("IG_GRAPH_VERSION", "v22.0").strip() or "v22.0"
+GRAPH_HOST = os.getenv("IG_GRAPH_HOST", "graph.facebook.com").strip() or "graph.facebook.com"
 IG_USER_ID = os.getenv("IG_USER_ID", "").strip()
 IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN", "").strip()
 QUEUE_DIR = Path(os.getenv("IG_QUEUE_DIR", "queue/instagram"))
@@ -64,7 +65,7 @@ def load_queue_items() -> list[QueueItem]:
 
 
 def build_url(path: str, params: dict[str, str]) -> str:
-    return f"https://graph.facebook.com/{GRAPH_VERSION}/{path}?{parse.urlencode(params)}"
+    return f"https://{GRAPH_HOST}/{GRAPH_VERSION}/{path}?{parse.urlencode(params)}"
 
 
 def fetch_json(url: str, method: str = "POST", timeout: int = 30) -> dict[str, Any]:
