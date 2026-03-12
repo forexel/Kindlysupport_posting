@@ -1,9 +1,0 @@
-{
-  "ok": false,
-  "error": "HTTP 400: {\"error\":{\"message\":\"Invalid OAuth access token - Cannot parse access token\",\"type\":\"OAuthException\",\"code\":190,\"fbtrace_id\":\"Ag55RL4M37zF_V0XNoi6ULQ\"}}",
-  "payload": {
-    "caption": "Тестовая публикация из GitHub Actions (external publisher)",
-    "image_url": "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
-    "publish_at": "2026-03-12T10:00:00Z"
-  }
-}
