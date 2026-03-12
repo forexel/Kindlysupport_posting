@@ -5266,7 +5266,7 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
     regen_instruction = (payload.get("regen_instruction") or "").strip()
     caption = generate_caption(post["title"], post["text_body"])
     if post.get("source_kind") == "phrase":
-        caption = generate_post_caption(post)
+        caption = generate_post_caption_plain(post)
     image_prompt = generate_detailed_image_prompt(post["title"], post["text_body"], scenario, regen_instruction)
 
     image_url = None
@@ -5528,7 +5528,7 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
         )
 
     latest = fetch_post(post_id)
-    update_post(post_id, telegram_caption=generate_post_caption(latest))
+    update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
     return fetch_post(post_id)
 
 
