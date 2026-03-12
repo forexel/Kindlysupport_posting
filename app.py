@@ -4893,6 +4893,181 @@ def health() -> dict[str, Any]:
     }
 
 
+def _legal_page_html(title: str, content: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --text: #111827;
+      --muted: #4b5563;
+      --border: #e5e7eb;
+      --accent: #2563eb;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: var(--text);
+      background: linear-gradient(180deg, #eef2ff 0%, var(--bg) 24%);
+    }}
+    .wrap {{
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 28px 16px 48px;
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+      box-shadow: 0 8px 28px rgba(17, 24, 39, 0.05);
+    }}
+    h1 {{
+      margin: 0 0 8px 0;
+      font-size: 28px;
+      line-height: 1.2;
+    }}
+    h2 {{
+      margin: 22px 0 10px 0;
+      font-size: 18px;
+      line-height: 1.3;
+    }}
+    p, li {{
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.6;
+    }}
+    ul {{ margin: 8px 0 0 20px; padding: 0; }}
+    .meta {{
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }}
+    a {{
+      color: var(--accent);
+      text-decoration: none;
+    }}
+    a:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <article class="card">
+      {content}
+    </article>
+  </main>
+</body>
+</html>
+"""
+
+
+@app.get("/legal/about", response_class=HTMLResponse)
+def legal_about() -> HTMLResponse:
+    html = _legal_page_html(
+        "Kindlysupport App Overview",
+        """
+        <h1>Kindlysupport Application Overview</h1>
+        <div class="meta">Last updated: 2026-03-12</div>
+        <p>
+          Kindlysupport is a content publishing tool used to prepare and publish social media posts,
+          including standard Pins to Pinterest boards selected by the account owner.
+        </p>
+        <h2>Application purpose</h2>
+        <p>
+          The application helps a creator or team automate repetitive publishing tasks:
+          composing text, attaching an image, and sending the post to configured destinations.
+        </p>
+        <h2>Pinterest integration usage</h2>
+        <ul>
+          <li>Read boards to select destination board IDs.</li>
+          <li>Create standard Pins with title, description, link, and image URL.</li>
+          <li>No actions are performed without explicit user setup and publish request.</li>
+        </ul>
+        <h2>Support</h2>
+        <p>
+          For support requests, contact: <a href="mailto:forexel357@gmail.com">forexel357@gmail.com</a>
+        </p>
+        """,
+    )
+    return HTMLResponse(content=html)
+
+
+@app.get("/about", response_class=HTMLResponse)
+def legal_about_alias() -> HTMLResponse:
+    return legal_about()
+
+
+@app.get("/legal/privacy", response_class=HTMLResponse)
+def legal_privacy() -> HTMLResponse:
+    html = _legal_page_html(
+        "Kindlysupport Privacy Policy",
+        """
+        <h1>Privacy Policy</h1>
+        <div class="meta">Last updated: 2026-03-12</div>
+        <p>
+          This Privacy Policy describes how Kindlysupport ("we", "our", "us") handles data when you use
+          the application and related integrations, including Pinterest API features.
+        </p>
+        <h2>What data we process</h2>
+        <ul>
+          <li>Account/session technical data needed to keep you signed in.</li>
+          <li>Content data you provide for post creation (text, links, image URLs).</li>
+          <li>Integration settings you enter (for example, access tokens and destination board IDs).</li>
+          <li>Operational logs for reliability and troubleshooting.</li>
+        </ul>
+        <h2>How we use data</h2>
+        <ul>
+          <li>To create, schedule, and publish content requested by you.</li>
+          <li>To connect to third-party APIs that you explicitly configure.</li>
+          <li>To maintain security, prevent abuse, and diagnose failures.</li>
+        </ul>
+        <h2>Pinterest-specific processing</h2>
+        <ul>
+          <li>We use Pinterest access tokens only to perform actions you authorize.</li>
+          <li>We may read boards and create Pins on boards you selected.</li>
+          <li>We do not sell Pinterest account data or share tokens with advertisers.</li>
+        </ul>
+        <h2>Data sharing</h2>
+        <p>
+          We share data only with service providers and APIs required to deliver the requested functionality
+          (for example, Pinterest and hosting infrastructure), or when required by law.
+        </p>
+        <h2>Data retention</h2>
+        <p>
+          We retain operational data only as long as needed for service operation, legal obligations,
+          and security review. You can request deletion by contacting us.
+        </p>
+        <h2>Security</h2>
+        <p>
+          We apply reasonable technical and organizational safeguards, but no system can guarantee
+          absolute security.
+        </p>
+        <h2>Your choices</h2>
+        <ul>
+          <li>You can revoke Pinterest access at any time from your Pinterest connected apps settings.</li>
+          <li>You can request account or data removal by email.</li>
+        </ul>
+        <h2>Contact</h2>
+        <p>
+          Privacy requests: <a href="mailto:forexel357@gmail.com">forexel357@gmail.com</a>
+        </p>
+        """,
+    )
+    return HTMLResponse(content=html)
+
+
+@app.get("/privacy-policy", response_class=HTMLResponse)
+def legal_privacy_alias() -> HTMLResponse:
+    return legal_privacy()
+
+
 @app.post("/api/login")
 async def login(request: Request, response: Response) -> dict[str, Any]:
     check_rate_limit(request, "login", per_minute=20)
