@@ -1938,47 +1938,66 @@ def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
             image_bytes, _ = download_remote_image(str(post["final_image_url"]))
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"VK image download failed: {str(e)[:800]}")
-    upload = vk_api_call(
-        "photos.getWallUploadServer",
-        {"group_id": vk_group_id},
-        vk_token=vk_token,
-        vk_version=vk_version,
-    )
-    upload_url = str((upload or {}).get("upload_url") or "").strip()
-    if not upload_url:
-        raise HTTPException(status_code=502, detail="VK upload server URL is empty")
-    upload_res = vk_upload_photo(upload_url, image_bytes, filename=f"post_{post.get('id') or 'x'}.jpg")
-    saved = vk_api_call(
-        "photos.saveWallPhoto",
-        {
-            "group_id": vk_group_id,
-            "photo": upload_res.get("photo"),
-            "server": upload_res.get("server"),
-            "hash": upload_res.get("hash"),
-        },
-        vk_token=vk_token,
-        vk_version=vk_version,
-    )
-    if not isinstance(saved, list) or not saved:
-        raise HTTPException(status_code=502, detail="VK saveWallPhoto returned empty list")
-    photo = saved[0] if isinstance(saved[0], dict) else {}
-    owner_id = photo.get("owner_id")
-    photo_id = photo.get("id")
-    if owner_id is None or photo_id is None:
-        raise HTTPException(status_code=502, detail="VK saveWallPhoto missing owner_id/id")
-    attachment = f"photo{owner_id}_{photo_id}"
-    wall_post = vk_api_call(
-        "wall.post",
-        {
-            "owner_id": f"-{vk_group_id}",
-            "from_group": 1,
-            "message": caption,
-            "attachments": attachment,
-        },
-        vk_token=vk_token,
-        vk_version=vk_version,
-    )
-    return {"wall_post": wall_post, "attachment": attachment, "photo": photo}
+    try:
+        upload = vk_api_call(
+            "photos.getWallUploadServer",
+            {"group_id": vk_group_id},
+            vk_token=vk_token,
+            vk_version=vk_version,
+        )
+        upload_url = str((upload or {}).get("upload_url") or "").strip()
+        if not upload_url:
+            raise HTTPException(status_code=502, detail="VK upload server URL is empty")
+        upload_res = vk_upload_photo(upload_url, image_bytes, filename=f"post_{post.get('id') or 'x'}.jpg")
+        saved = vk_api_call(
+            "photos.saveWallPhoto",
+            {
+                "group_id": vk_group_id,
+                "photo": upload_res.get("photo"),
+                "server": upload_res.get("server"),
+                "hash": upload_res.get("hash"),
+            },
+            vk_token=vk_token,
+            vk_version=vk_version,
+        )
+        if not isinstance(saved, list) or not saved:
+            raise HTTPException(status_code=502, detail="VK saveWallPhoto returned empty list")
+        photo = saved[0] if isinstance(saved[0], dict) else {}
+        owner_id = photo.get("owner_id")
+        photo_id = photo.get("id")
+        if owner_id is None or photo_id is None:
+            raise HTTPException(status_code=502, detail="VK saveWallPhoto missing owner_id/id")
+        attachment = f"photo{owner_id}_{photo_id}"
+        wall_post = vk_api_call(
+            "wall.post",
+            {
+                "owner_id": f"-{vk_group_id}",
+                "from_group": 1,
+                "message": caption,
+                "attachments": attachment,
+            },
+            vk_token=vk_token,
+            vk_version=vk_version,
+        )
+        return {"wall_post": wall_post, "attachment": attachment, "photo": photo, "mode": "photo_upload"}
+    except HTTPException as e:
+        detail = str(e.detail or "")
+        # Some VK tokens (group/service tokens) cannot call photo upload methods.
+        # Fallback: publish text and include image URL in message.
+        if "photos.getWallUploadServer" in detail and "Group authorization failed" in detail:
+            msg = f"{caption}\n\n{post['final_image_url']}".strip()[:4000]
+            wall_post = vk_api_call(
+                "wall.post",
+                {
+                    "owner_id": f"-{vk_group_id}",
+                    "from_group": 1,
+                    "message": msg,
+                },
+                vk_token=vk_token,
+                vk_version=vk_version,
+            )
+            return {"wall_post": wall_post, "attachment": None, "photo": None, "mode": "text_with_image_link"}
+        raise
 
 
 def max_publish_post(post: dict[str, Any]) -> dict[str, Any]:
@@ -5974,6 +5993,10 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
     tg_err = None
     ig_res = None
     ig_err = None
+    vk_res = None
+    vk_err = None
+    pin_res = None
+    pin_err = None
     max_res = None
     max_err = None
     try:
@@ -5989,6 +6012,20 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
             ig_err = e.detail
         except Exception as e:
             ig_err = str(e)
+    if runtime_enable_vk():
+        try:
+            vk_res = vk_publish_post(post)
+        except HTTPException as e:
+            vk_err = e.detail
+        except Exception as e:
+            vk_err = str(e)
+    if runtime_enable_pinterest():
+        try:
+            pin_res = pinterest_publish_post(post)
+        except HTTPException as e:
+            pin_err = e.detail
+        except Exception as e:
+            pin_err = str(e)
     if runtime_enable_max():
         try:
             max_res = max_publish_post(post)
@@ -6013,6 +6050,12 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
         "instagram": bool(ig_res),
         "instagram_error": ig_err,
         "instagram_result": ig_res,
+        "vk": bool(vk_res),
+        "vk_error": vk_err,
+        "vk_result": vk_res,
+        "pinterest": bool(pin_res),
+        "pinterest_error": pin_err,
+        "pinterest_result": pin_res,
         "max": bool(max_res),
         "max_error": max_err,
         "max_result": max_res,
