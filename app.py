@@ -2013,6 +2013,14 @@ def _rich_text_quality_ok(text: str) -> bool:
     return c1 >= 3 and c2 >= 3 and len(p1) >= 180 and len(p2) >= 180
 
 
+def _phrase_title_for_publish(text: str) -> str:
+    # Phrase cards/captions should end cleanly without a trailing period.
+    out = re.sub(r"\s+", " ", (text or "").strip())
+    out = re.sub(r"[.]+$", "", out).strip()
+    out = re.sub(r"[…]+$", "", out).strip()
+    return out
+
+
 def _texts_too_similar(a: str, b: str, threshold: float = 0.90) -> bool:
     aa = re.sub(r"\s+", " ", (a or "").strip().lower())
     bb = re.sub(r"\s+", " ", (b or "").strip().lower())
@@ -2024,6 +2032,25 @@ def _texts_too_similar(a: str, b: str, threshold: float = 0.90) -> bool:
     # Catch near-copy with a large common block even if ratio is slightly lower.
     m = difflib.SequenceMatcher(None, aa, bb).find_longest_match(0, len(aa), 0, len(bb))
     return m.size >= 180
+
+
+def _phrase_expansion_quality_ok(text: str, phrase: str) -> bool:
+    normalized = _force_two_clean_paragraphs(text)
+    p1, p2 = _split_two_paragraphs(normalized)
+    if not p1 or not p2:
+        return False
+    if len(p1) < 100 or len(p2) < 100:
+        return False
+    if _texts_too_similar(p1, p2, threshold=0.80):
+        return False
+    phrase_clean = _phrase_title_for_publish(phrase)
+    if phrase_clean and (
+        _texts_too_similar(normalized, phrase_clean, threshold=0.80)
+        or _texts_too_similar(p1, phrase_clean, threshold=0.82)
+        or _texts_too_similar(p2, phrase_clean, threshold=0.82)
+    ):
+        return False
+    return True
 
 
 def _force_two_clean_paragraphs(text: str) -> str:
@@ -2111,12 +2138,12 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
             text2 = _normalize_generated_ru_text(raw2 or "")
             if _rich_text_quality_ok(text2):
                 return _force_two_clean_paragraphs(text2)
-            if text2.strip():
+            if text2.strip() and _phrase_expansion_quality_ok(text2, clean):
                 # Keep non-empty regenerated text instead of dropping to deterministic template.
                 return _force_two_clean_paragraphs(text2)
-        if _rich_text_quality_ok(text):
+        if _rich_text_quality_ok(text) and _phrase_expansion_quality_ok(text, clean):
             return _force_two_clean_paragraphs(text)
-        if text.strip():
+        if text.strip() and _phrase_expansion_quality_ok(text, clean):
             return _force_two_clean_paragraphs(text)
         # Last attempt: hard reset from previous text to avoid template lock-in.
         prompt3 = build_user_prompt_for_task(
@@ -2137,7 +2164,7 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
             trace_label="TEXT:expand:hard_reset",
         )
         text3 = _normalize_generated_ru_text(raw3 or "")
-        if text3.strip():
+        if text3.strip() and _phrase_expansion_quality_ok(text3, clean):
             return _force_two_clean_paragraphs(text3)
         p1_dbg, p2_dbg = _split_two_paragraphs(text)
         logger.warning(
@@ -2387,7 +2414,7 @@ def render_phrase_card_image(
 
     max_width = quote_box_w
     quote_text, _author = split_quote_and_author(phrase)
-    text = (quote_text or phrase or "").strip()
+    text = _phrase_title_for_publish((quote_text or phrase or "").strip())
     lines = _wrap_lines(draw, text, quote_font, max_width)
     # Auto-fit font size into fixed quote box.
     while True:
@@ -2450,7 +2477,7 @@ def generate_post_caption(post: dict[str, Any]) -> str:
     text_body = (post.get("text_body") or "").strip()
     if source_kind == "phrase":
         quote, author = split_quote_and_author(title)
-        phrase_title = quote or title
+        phrase_title = _phrase_title_for_publish(quote or title)
         body = (text_body or "").strip()
         phrase_md = f"*{escape_markdown_v2(phrase_title)}*"
         if author:
@@ -2466,7 +2493,7 @@ def generate_post_caption_plain(post: dict[str, Any]) -> str:
     text_body = (post.get("text_body") or "").strip()
     if source_kind == "phrase":
         quote, author = split_quote_and_author(title)
-        phrase_title = (quote or title or "").strip()
+        phrase_title = _phrase_title_for_publish(quote or title)
         body = (text_body or "").strip()
         title_line = phrase_title
         if author:
@@ -2484,7 +2511,7 @@ def generate_post_caption_markdown_limited(post: dict[str, Any], max_len: int = 
         return raw if len(raw) <= max_len else raw[: max_len - 1]
 
     quote, author = split_quote_and_author(title)
-    phrase_title = quote or title
+    phrase_title = _phrase_title_for_publish(quote or title)
     body = (text_body or "").strip()
 
     title_md = f"*{escape_markdown_v2(phrase_title)}*"
