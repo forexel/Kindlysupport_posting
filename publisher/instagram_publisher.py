@@ -19,6 +19,7 @@ QUEUE_DIR = Path(os.getenv("IG_QUEUE_DIR", "queue/instagram"))
 DONE_DIR = Path(os.getenv("IG_DONE_DIR", "queue/instagram_done"))
 FAILED_DIR = Path(os.getenv("IG_FAILED_DIR", "queue/instagram_failed"))
 AUTO_COMMIT = os.getenv("IG_AUTO_COMMIT", "1").strip().lower() in {"1", "true", "yes", "on"}
+FAIL_ON_ITEM_ERROR = os.getenv("IG_FAIL_ON_ITEM_ERROR", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -172,7 +173,12 @@ def main() -> int:
             print(f"warning: git push failed: {exc}")
             return 1
 
-    return 0 if failed == 0 else 1
+    if failed > 0:
+        print(
+            "completed with failed items; check queue/instagram_failed/*.meta.json "
+            "for exact API errors"
+        )
+    return 1 if (failed > 0 and FAIL_ON_ITEM_ERROR) else 0
 
 
 if __name__ == "__main__":
