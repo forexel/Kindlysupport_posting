@@ -2390,8 +2390,8 @@ def render_phrase_card_image(
     # Dark overlay.
     if progress_cb:
         progress_cb("Этап наложения затемнения...")
-    # Slightly stronger darkening for stable readability.
-    overlay = Image.new("RGBA", (size, size), (0, 0, 0, 166))
+    # 40% dark overlay to keep text readable while preserving the image.
+    overlay = Image.new("RGBA", (size, size), (0, 0, 0, 102))
     card = bg.convert("RGBA")
     card.alpha_composite(overlay)
     draw = ImageDraw.Draw(card)
