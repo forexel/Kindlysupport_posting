@@ -37,13 +37,44 @@ export async function api<T = any>(path: string, method: ApiMethod = 'GET', body
   return data as T;
 }
 
-export function toDataUrl(file: File): Promise<string> {
+async function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result || ''));
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+export async function toDataUrl(file: File, opts?: { maxSide?: number; quality?: number }): Promise<string> {
+  const maxSide = Math.max(640, Math.min(2400, Number(opts?.maxSide || 1600)));
+  const quality = Math.max(0.5, Math.min(0.95, Number(opts?.quality || 0.82)));
+  if (!file.type.startsWith('image/')) return readFileAsDataUrl(file);
+  try {
+    const dataUrl = await readFileAsDataUrl(file);
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = dataUrl;
+    });
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    if (!w || !h) return dataUrl;
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    const tw = Math.max(1, Math.round(w * scale));
+    const th = Math.max(1, Math.round(h * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = tw;
+    canvas.height = th;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return dataUrl;
+    ctx.drawImage(img, 0, 0, tw, th);
+    const out = canvas.toDataURL('image/jpeg', quality);
+    return out || dataUrl;
+  } catch {
+    return readFileAsDataUrl(file);
+  }
 }
 
 export function mskIso(date: string, time: string): string {

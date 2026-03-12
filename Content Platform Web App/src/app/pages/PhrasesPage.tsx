@@ -12,6 +12,7 @@ import {
 } from '../components/ui/table';
 import { Badge } from '../components/ui/badge';
 import { Checkbox } from '../components/ui/checkbox';
+import { Textarea } from '../components/ui/textarea';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -23,11 +24,13 @@ import {
   AlertDialogTitle,
 } from '../components/ui/alert-dialog';
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '../components/ui/dropdown-menu';
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog';
 import { Upload, Search, MoreVertical, Trash2, Check, Sparkles, WandSparkles } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../lib/api';
@@ -35,6 +38,7 @@ import { api } from '../lib/api';
 interface Phrase {
   id: number;
   text_body: string;
+  author?: string | null;
   is_published: number;
   created_at: string;
 }
@@ -45,7 +49,16 @@ export function PhrasesPage() {
   const [selectedPhrases, setSelectedPhrases] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | '0' | '1'>('0');
+  const [sortBy, setSortBy] = useState<'text' | 'created_at'>('created_at');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [editingPhraseId, setEditingPhraseId] = useState<number | null>(null);
+  const [editingText, setEditingText] = useState('');
+  const [editingAuthor, setEditingAuthor] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [actionsDialogOpen, setActionsDialogOpen] = useState(false);
+  const [actionsPhrase, setActionsPhrase] = useState<Phrase | null>(null);
   const [loading, setLoading] = useState(false);
 
   const loadPhrases = async () => {
@@ -53,8 +66,6 @@ export function PhrasesPage() {
     try {
       const params = new URLSearchParams();
       params.set('limit', '2000');
-      if (statusFilter !== 'all') params.set('status', statusFilter);
-      if (searchQuery.trim()) params.set('search', searchQuery.trim());
       const rows = await api<Phrase[]>(`/api/phrases?${params.toString()}`);
       setPhrases(rows);
     } catch (e: any) {
@@ -66,11 +77,39 @@ export function PhrasesPage() {
 
   useEffect(() => {
     loadPhrases();
-  }, [statusFilter]);
+  }, []);
 
-  const filteredPhrases = phrases.filter((phrase) =>
-    !searchQuery.trim() || phrase.text_body.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const newPhrasesCount = phrases.filter((p) => p.is_published === 0).length;
+  const publishedPhrasesCount = phrases.filter((p) => p.is_published === 1).length;
+
+  const filteredPhrases = phrases
+    .filter((phrase) => {
+      if (statusFilter === 'all') return true;
+      return String(phrase.is_published) === statusFilter;
+    })
+    .filter((phrase) =>
+      !searchQuery.trim() || phrase.text_body.toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    .sort((a, b) => {
+      if (sortBy === 'text') {
+        const left = a.text_body.toLowerCase();
+        const right = b.text_body.toLowerCase();
+        const cmp = left.localeCompare(right, 'ru');
+        return sortDirection === 'asc' ? cmp : -cmp;
+      }
+      const left = new Date(a.created_at || 0).getTime();
+      const right = new Date(b.created_at || 0).getTime();
+      return sortDirection === 'asc' ? left - right : right - left;
+    });
+
+  const toggleSort = (field: 'text' | 'created_at') => {
+    if (sortBy === field) {
+      setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+      return;
+    }
+    setSortBy(field);
+    setSortDirection(field === 'text' ? 'asc' : 'desc');
+  };
 
   const handleSelectAll = (checked: boolean) => {
     if (checked) setSelectedPhrases(filteredPhrases.map((p) => p.id));
@@ -108,8 +147,63 @@ export function PhrasesPage() {
 
   const handleGenerateForPhrase = (id: number) => navigate(`/phrases/generate?phraseId=${id}`);
 
-  const newPhrasesCount = phrases.filter((p) => p.is_published === 0).length;
-  const publishedPhrasesCount = phrases.filter((p) => p.is_published === 1).length;
+  const handleSingleDelete = async (id: number) => {
+    try {
+      await api(`/api/phrases/${id}`, 'DELETE', {});
+      toast.success('Фраза удалена');
+      if (selectedPhrases.includes(id)) {
+        setSelectedPhrases((prev) => prev.filter((item) => item !== id));
+      }
+      await loadPhrases();
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    }
+  };
+
+  const openActionsDialog = (phrase: Phrase) => {
+    setActionsPhrase(phrase);
+    setActionsDialogOpen(true);
+  };
+
+  const handleSingleStatus = async (id: number, isPublished: number) => {
+    try {
+      await api('/api/phrases/bulk-status', 'PUT', { ids: [id], is_published: isPublished });
+      toast.success(isPublished === 1 ? 'Фраза отмечена опубликованной' : 'Фраза возвращена в новые');
+      await loadPhrases();
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    }
+  };
+
+  const openEditDialog = (phrase: Phrase) => {
+    setEditingPhraseId(phrase.id);
+    setEditingText(phrase.text_body || '');
+    setEditingAuthor(phrase.author || '');
+    setEditDialogOpen(true);
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingPhraseId) return;
+    const text = editingText.trim();
+    if (!text) {
+      toast.error('Текст фразы не может быть пустым');
+      return;
+    }
+    setSavingEdit(true);
+    try {
+      await api(`/api/phrases/${editingPhraseId}`, 'PUT', { text_body: text, author: editingAuthor.trim() });
+      toast.success('Фраза обновлена');
+      setEditDialogOpen(false);
+      setEditingPhraseId(null);
+      setEditingText('');
+      setEditingAuthor('');
+      await loadPhrases();
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setSavingEdit(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -176,9 +270,19 @@ export function PhrasesPage() {
           <TableHeader>
             <TableRow className="hover:bg-zinc-800/50 border-zinc-800">
               <TableHead className="w-12"><Checkbox checked={selectedPhrases.length === filteredPhrases.length && filteredPhrases.length > 0} onCheckedChange={handleSelectAll} className="border-zinc-700" /></TableHead>
-              <TableHead className="text-zinc-300 min-w-[560px]">Текст</TableHead>
+              <TableHead className="text-zinc-300 min-w-[560px]">
+                <button type="button" className="inline-flex items-center gap-2 hover:text-zinc-100" onClick={() => toggleSort('text')}>
+                  Текст
+                  {sortBy === 'text' ? (sortDirection === 'asc' ? '↑' : '↓') : ''}
+                </button>
+              </TableHead>
               <TableHead className="text-zinc-300">Статус</TableHead>
-              <TableHead className="text-zinc-300">Дата добавления</TableHead>
+              <TableHead className="text-zinc-300">
+                <button type="button" className="inline-flex items-center gap-2 hover:text-zinc-100" onClick={() => toggleSort('created_at')}>
+                  Дата добавления
+                  {sortBy === 'created_at' ? (sortDirection === 'asc' ? '↑' : '↓') : ''}
+                </button>
+              </TableHead>
               <TableHead className="w-12"></TableHead>
             </TableRow>
           </TableHeader>
@@ -191,7 +295,10 @@ export function PhrasesPage() {
               filteredPhrases.map((phrase) => (
                 <TableRow key={phrase.id} className="hover:bg-zinc-800/50 border-zinc-800">
                   <TableCell><Checkbox checked={selectedPhrases.includes(phrase.id)} onCheckedChange={(checked) => handleSelectPhrase(phrase.id, checked as boolean)} className="border-zinc-700" /></TableCell>
-                  <TableCell className="text-zinc-200 whitespace-normal break-words leading-6">{phrase.text_body}</TableCell>
+                  <TableCell className="text-zinc-200 whitespace-normal break-words leading-6">
+                    <div>{phrase.text_body}</div>
+                    {phrase.author ? <div className="mt-1 text-zinc-400 text-sm">— {phrase.author}</div> : null}
+                  </TableCell>
                   <TableCell>
                     <Badge variant={phrase.is_published === 1 ? 'default' : 'secondary'} className={phrase.is_published === 1 ? 'bg-green-950/30 text-green-400 border-green-900/50' : 'bg-yellow-950/30 text-yellow-400 border-yellow-900/50'}>
                       {phrase.is_published === 1 ? 'Опубликована' : 'Новая'}
@@ -209,14 +316,14 @@ export function PhrasesPage() {
                       >
                         <WandSparkles className="h-4 w-4" />
                       </Button>
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button variant="ghost" size="sm" className="text-zinc-400 hover:text-zinc-200"><MoreVertical className="h-4 w-4" /></Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end" className="bg-zinc-900 border-zinc-800">
-                          <DropdownMenuItem className="text-red-400 focus:bg-zinc-800" onClick={async () => { await api(`/api/phrases/${phrase.id}`, 'DELETE', {}); await loadPhrases(); }}>Удалить</DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-zinc-400 hover:text-zinc-200"
+                        onClick={() => openActionsDialog(phrase)}
+                      >
+                        <MoreVertical className="h-4 w-4" />
+                      </Button>
                     </div>
                   </TableCell>
                 </TableRow>
@@ -238,6 +345,112 @@ export function PhrasesPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog open={editDialogOpen} onOpenChange={setEditDialogOpen}>
+        <DialogContent className="bg-zinc-900 border-zinc-800 text-zinc-100">
+          <DialogHeader>
+            <DialogTitle>Редактировать фразу</DialogTitle>
+            <DialogDescription className="text-zinc-400">
+              Измените текст фразы и сохраните.
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            value={editingText}
+            onChange={(e) => setEditingText(e.target.value)}
+            rows={6}
+            className="bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500"
+          />
+          <Input
+            value={editingAuthor}
+            onChange={(e) => setEditingAuthor(e.target.value)}
+            placeholder="Автор (опционально)"
+            className="bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500"
+          />
+          <DialogFooter>
+            <Button variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-200" onClick={() => setEditDialogOpen(false)}>
+              Отмена
+            </Button>
+            <Button className="bg-blue-600 hover:bg-blue-700 text-white" onClick={handleSaveEdit} disabled={savingEdit}>
+              {savingEdit ? 'Сохранение...' : 'Сохранить'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={actionsDialogOpen}
+        onOpenChange={(open) => {
+          setActionsDialogOpen(open);
+          if (!open) setActionsPhrase(null);
+        }}
+      >
+        <DialogContent className="bg-zinc-900 border-zinc-800 text-zinc-100">
+          <DialogHeader>
+            <DialogTitle>Действия с фразой</DialogTitle>
+            <DialogDescription className="text-zinc-400">
+              Выберите действие для выбранной фразы.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid grid-cols-1 gap-2">
+            <Button
+              variant="outline"
+              className="bg-zinc-800 border-zinc-700 text-zinc-200 justify-start"
+              onClick={() => {
+                if (!actionsPhrase) return;
+                setActionsDialogOpen(false);
+                handleGenerateForPhrase(actionsPhrase.id);
+              }}
+            >
+              Генерировать пост
+            </Button>
+            <Button
+              variant="outline"
+              className="bg-zinc-800 border-zinc-700 text-zinc-200 justify-start"
+              onClick={() => {
+                if (!actionsPhrase) return;
+                setActionsDialogOpen(false);
+                openEditDialog(actionsPhrase);
+              }}
+            >
+              Редактировать
+            </Button>
+            <Button
+              variant="outline"
+              className="bg-zinc-800 border-zinc-700 text-zinc-200 justify-start"
+              onClick={() => {
+                if (!actionsPhrase) return;
+                const nextStatus = actionsPhrase.is_published === 1 ? 0 : 1;
+                setActionsDialogOpen(false);
+                handleSingleStatus(actionsPhrase.id, nextStatus);
+              }}
+            >
+              {actionsPhrase?.is_published === 1
+                ? 'Сменить статус на "Новая"'
+                : 'Сменить статус на "Опубликованная"'}
+            </Button>
+            <Button
+              variant="outline"
+              className="bg-red-950/30 border-red-900/50 text-red-400 hover:bg-red-900/40 justify-start"
+              onClick={() => {
+                if (!actionsPhrase) return;
+                setActionsDialogOpen(false);
+                handleSingleDelete(actionsPhrase.id);
+              }}
+            >
+              Удалить
+            </Button>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              className="bg-zinc-800 border-zinc-700 text-zinc-200"
+              onClick={() => setActionsDialogOpen(false)}
+            >
+              Закрыть
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
