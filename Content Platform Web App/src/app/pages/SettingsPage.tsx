@@ -34,6 +34,10 @@ export function SettingsPage() {
   const [maxPublishUrl, setMaxPublishUrl] = useState('');
   const [maxAccessToken, setMaxAccessToken] = useState('');
   const [maxHttpHeader, setMaxHttpHeader] = useState('Authorization');
+  const [okEnabled, setOkEnabled] = useState(false);
+  const [okPublishUrl, setOkPublishUrl] = useState('');
+  const [okAccessToken, setOkAccessToken] = useState('');
+  const [okHttpHeader, setOkHttpHeader] = useState('Authorization');
 
   const [igEnabled, setIgEnabled] = useState(false);
   const [igDeliveryMode, setIgDeliveryMode] = useState('external_queue');
@@ -77,6 +81,10 @@ export function SettingsPage() {
       setMaxPublishUrl(s.max_publish_url || '');
       setMaxAccessToken(s.max_access_token || '');
       setMaxHttpHeader(s.max_http_header || 'Authorization');
+      setOkEnabled(Boolean(s.enable_ok));
+      setOkPublishUrl(s.ok_publish_url || '');
+      setOkAccessToken(s.ok_access_token || '');
+      setOkHttpHeader(s.ok_http_header || 'Authorization');
       setIgEnabled(Boolean(s.enable_instagram));
       setIgDeliveryMode(s.instagram_delivery_mode || 'external_queue');
       setIgAccessToken(s.instagram_access_token || '');
@@ -111,6 +119,9 @@ export function SettingsPage() {
         enable_max: maxEnabled,
         max_publish_url: maxPublishUrl,
         max_http_header: maxHttpHeader,
+        enable_ok: okEnabled,
+        ok_publish_url: okPublishUrl,
+        ok_http_header: okHttpHeader,
         enable_instagram: igEnabled,
         instagram_delivery_mode: igDeliveryMode,
         instagram_ig_user_id: igUserId,
@@ -125,6 +136,7 @@ export function SettingsPage() {
       if (webhookSecret && webhookSecret !== '***') payload.telegram_webhook_secret = webhookSecret;
       if (vkAccessToken && vkAccessToken !== '***') payload.vk_access_token = vkAccessToken;
       if (maxAccessToken && maxAccessToken !== '***') payload.max_access_token = maxAccessToken;
+      if (okAccessToken && okAccessToken !== '***') payload.ok_access_token = okAccessToken;
       if (igAccessToken && igAccessToken !== '***') payload.instagram_access_token = igAccessToken;
       if (igQueueGithubToken && igQueueGithubToken !== '***') payload.instagram_queue_github_token = igQueueGithubToken;
       if (pinAccessToken && pinAccessToken !== '***') payload.pinterest_access_token = pinAccessToken;
@@ -215,6 +227,15 @@ export function SettingsPage() {
           : `Проблема: ${missing.filter((x) => x.startsWith('MAX_')).join(', ') || 'неполная конфигурация'}`,
     },
     {
+      name: 'OK',
+      ok: !readiness?.ok?.enabled || Boolean(readiness?.ok?.configured),
+      detail: !readiness?.ok?.enabled
+        ? 'Выключено'
+        : readiness?.ok?.configured
+          ? 'ОК'
+          : `Проблема: ${missing.filter((x) => x.startsWith('OK_')).join(', ') || 'неполная конфигурация'}`,
+    },
+    {
       name: 'Instagram',
       ok: !readiness?.instagram?.enabled || Boolean(readiness?.instagram?.configured),
       detail: !readiness?.instagram?.enabled
@@ -249,12 +270,13 @@ export function SettingsPage() {
       </div>
 
       <Tabs defaultValue="profile" className="w-full">
-        <TabsList className="bg-zinc-900 border border-zinc-800 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8">
+      <TabsList className="bg-zinc-900 border border-zinc-800 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-9">
           <TabsTrigger value="profile" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100"><User className="h-4 w-4 sm:mr-2" /><span className="hidden sm:inline">Профиль</span></TabsTrigger>
           <TabsTrigger value="llm" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100"><Cpu className="h-4 w-4 sm:mr-2" /><span className="hidden sm:inline">LLM</span></TabsTrigger>
           <TabsTrigger value="telegram" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100"><SendIcon className="h-4 w-4 sm:mr-2" /><span className="hidden sm:inline">Telegram</span></TabsTrigger>
           <TabsTrigger value="vk" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">VK</TabsTrigger>
           <TabsTrigger value="max" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">MAX</TabsTrigger>
+          <TabsTrigger value="ok" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">OK</TabsTrigger>
           <TabsTrigger value="instagram" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">Instagram</TabsTrigger>
           <TabsTrigger value="pinterest" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">Pinterest</TabsTrigger>
           <TabsTrigger value="actions" className="data-[state=active]:bg-zinc-800 data-[state=active]:text-zinc-100">Действия</TabsTrigger>
@@ -361,6 +383,18 @@ export function SettingsPage() {
               <div className="space-y-2"><Label className="text-zinc-200">HTTP Header</Label><Input value={maxHttpHeader} onChange={(e) => setMaxHttpHeader(e.target.value)} placeholder="Authorization" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
             </div>
             <div className="space-y-2"><Label className="text-zinc-200">Access Token (optional)</Label><Input type="password" value={maxAccessToken} onChange={(e) => setMaxAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="ok" className="mt-6">
+          <Card className="bg-zinc-900 border-zinc-800 p-6 space-y-4">
+            <h2 className="text-xl font-semibold text-zinc-50">Одноклассники (OK)</h2>
+            <div className="flex items-center gap-2"><input type="checkbox" checked={okEnabled} onChange={(e) => setOkEnabled(e.target.checked)} /><span className="text-zinc-300">Включить OK</span></div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2"><Label className="text-zinc-200">Publish URL</Label><Input value={okPublishUrl} onChange={(e) => setOkPublishUrl(e.target.value)} placeholder="https://.../publish" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">HTTP Header</Label><Input value={okHttpHeader} onChange={(e) => setOkHttpHeader(e.target.value)} placeholder="Authorization" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+            </div>
+            <div className="space-y-2"><Label className="text-zinc-200">Access Token (optional)</Label><Input type="password" value={okAccessToken} onChange={(e) => setOkAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
           </Card>
         </TabsContent>
 

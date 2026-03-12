@@ -280,6 +280,9 @@ VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
 MAX_PUBLISH_URL = os.getenv("MAX_PUBLISH_URL", "").strip()
 MAX_ACCESS_TOKEN = os.getenv("MAX_ACCESS_TOKEN", "").strip()
 MAX_HTTP_HEADER = os.getenv("MAX_HTTP_HEADER", "Authorization").strip()
+OK_PUBLISH_URL = os.getenv("OK_PUBLISH_URL", "").strip()
+OK_ACCESS_TOKEN = os.getenv("OK_ACCESS_TOKEN", "").strip()
+OK_HTTP_HEADER = os.getenv("OK_HTTP_HEADER", "Authorization").strip()
 INSTAGRAM_GRAPH_VERSION = os.getenv("INSTAGRAM_GRAPH_VERSION", "v22.0").strip()
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
 INSTAGRAM_IG_USER_ID = os.getenv("INSTAGRAM_IG_USER_ID", "").strip()
@@ -295,6 +298,7 @@ ENABLE_INSTAGRAM = os.getenv("ENABLE_INSTAGRAM", "0").strip() in {"1", "true", "
 ENABLE_PINTEREST = os.getenv("ENABLE_PINTEREST", "0").strip() in {"1", "true", "yes"}
 ENABLE_VK = os.getenv("ENABLE_VK", "0").strip() in {"1", "true", "yes"}
 ENABLE_MAX = os.getenv("ENABLE_MAX", "0").strip() in {"1", "true", "yes"}
+ENABLE_OK = os.getenv("ENABLE_OK", "0").strip() in {"1", "true", "yes"}
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Moscow").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").strip()
@@ -853,6 +857,19 @@ def runtime_max_http_header() -> str:
     return raw or "Authorization"
 
 
+def runtime_ok_publish_url() -> str:
+    return setting_get("ok_publish_url", OK_PUBLISH_URL).strip()
+
+
+def runtime_ok_token() -> str:
+    return setting_get("ok_access_token", OK_ACCESS_TOKEN).strip()
+
+
+def runtime_ok_http_header() -> str:
+    raw = setting_get("ok_http_header", OK_HTTP_HEADER).strip()
+    return raw or "Authorization"
+
+
 def runtime_enable_instagram() -> bool:
     return bool_from_str(setting_get("enable_instagram", "1" if ENABLE_INSTAGRAM else "0"))
 
@@ -867,6 +884,10 @@ def runtime_enable_vk() -> bool:
 
 def runtime_enable_max() -> bool:
     return bool_from_str(setting_get("enable_max", "1" if ENABLE_MAX else "0"))
+
+
+def runtime_enable_ok() -> bool:
+    return bool_from_str(setting_get("enable_ok", "1" if ENABLE_OK else "0"))
 
 
 def runtime_telegram_mode() -> str:
@@ -916,10 +937,14 @@ def bootstrap_runtime_settings() -> None:
         "max_publish_url": MAX_PUBLISH_URL,
         "max_access_token": MAX_ACCESS_TOKEN,
         "max_http_header": MAX_HTTP_HEADER,
+        "ok_publish_url": OK_PUBLISH_URL,
+        "ok_access_token": OK_ACCESS_TOKEN,
+        "ok_http_header": OK_HTTP_HEADER,
         "enable_instagram": "1" if ENABLE_INSTAGRAM else "0",
         "enable_pinterest": "1" if ENABLE_PINTEREST else "0",
         "enable_vk": "1" if ENABLE_VK else "0",
         "enable_max": "1" if ENABLE_MAX else "0",
+        "enable_ok": "1" if ENABLE_OK else "0",
         "ocr_primary_engine": OCR_PRIMARY_ENGINE,
     }
     for key, default_value in defaults.items():
@@ -2013,6 +2038,28 @@ def max_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     headers: dict[str, str] = {}
     if token:
         headers[runtime_max_http_header()] = token
+    return http_json("POST", publish_url, payload, headers=headers or None)
+
+
+def ok_publish_post(post: dict[str, Any]) -> dict[str, Any]:
+    if not runtime_enable_ok():
+        raise HTTPException(status_code=503, detail="OK publishing temporarily disabled")
+    publish_url = runtime_ok_publish_url()
+    if not publish_url:
+        raise HTTPException(status_code=400, detail="OK publish URL not configured")
+    if not post.get("final_image_url"):
+        raise HTTPException(status_code=400, detail="Post has no final_image_url")
+    payload = {
+        "title": (post.get("title") or "")[:300],
+        "text": (post.get("telegram_caption") or generate_post_caption_plain(post))[:5000],
+        "image_url": post["final_image_url"],
+        "post_id": post.get("id"),
+        "source": "kindlysupport_posting",
+    }
+    token = runtime_ok_token()
+    headers: dict[str, str] = {}
+    if token:
+        headers[runtime_ok_http_header()] = token
     return http_json("POST", publish_url, payload, headers=headers or None)
 
 
@@ -5368,6 +5415,7 @@ def get_config(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
         "pinterest_configured": bool(runtime_enable_pinterest() and runtime_pinterest_token() and runtime_pinterest_board_id()),
         "vk_configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
         "max_configured": bool(runtime_enable_max() and runtime_max_publish_url()),
+        "ok_configured": bool(runtime_enable_ok() and runtime_ok_publish_url()),
     }
 
 
@@ -5397,6 +5445,10 @@ def get_settings(session_id: Optional[str] = Cookie(default=None, alias=SESSION_
         "max_publish_url": runtime_max_publish_url(),
         "max_access_token": "***" if runtime_max_token() else "",
         "max_http_header": runtime_max_http_header(),
+        "enable_ok": runtime_enable_ok(),
+        "ok_publish_url": runtime_ok_publish_url(),
+        "ok_access_token": "***" if runtime_ok_token() else "",
+        "ok_http_header": runtime_ok_http_header(),
         "enable_instagram": runtime_enable_instagram(),
         "instagram_delivery_mode": runtime_instagram_delivery_mode(),
         "instagram_access_token": "***" if runtime_instagram_token() else "",
@@ -5439,6 +5491,10 @@ async def update_settings(request: Request, session_id: Optional[str] = Cookie(d
         "max_publish_url",
         "max_access_token",
         "max_http_header",
+        "enable_ok",
+        "ok_publish_url",
+        "ok_access_token",
+        "ok_http_header",
         "enable_instagram",
         "instagram_delivery_mode",
         "instagram_access_token",
@@ -6042,6 +6098,8 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
     pin_err = None
     max_res = None
     max_err = None
+    ok_res = None
+    ok_err = None
     try:
         tg_res = telegram_send_publish(post)
     except HTTPException as e:
@@ -6076,14 +6134,27 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
             max_err = e.detail
         except Exception as e:
             max_err = str(e)
+    if runtime_enable_ok():
+        try:
+            ok_res = ok_publish_post(post)
+        except HTTPException as e:
+            ok_err = e.detail
+        except Exception as e:
+            ok_err = str(e)
     preview = post.get("preview_payload") or {}
     published_channels: list[str] = []
     if tg_res:
         published_channels.append("telegram")
     if ig_res:
         published_channels.append("instagram")
+    if vk_res:
+        published_channels.append("vk")
+    if pin_res:
+        published_channels.append("pinterest")
     if max_res:
         published_channels.append("max")
+    if ok_res:
+        published_channels.append("ok")
     preview["published"] = {
         "mode": "now",
         "at": now_iso(),
@@ -6102,6 +6173,9 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
         "max": bool(max_res),
         "max_error": max_err,
         "max_result": max_res,
+        "ok": bool(ok_res),
+        "ok_error": ok_err,
+        "ok_result": ok_res,
     }
     pub_message_id = None
     if tg_res and (tg_res.get("result") or {}).get("message_id") is not None:
@@ -6146,6 +6220,8 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
         missing.extend([x for x in ["VK_ACCESS_TOKEN", "VK_GROUP_ID"] if x not in missing])
     if runtime_enable_max() and not runtime_max_publish_url():
         missing.append("MAX_PUBLISH_URL")
+    if runtime_enable_ok() and not runtime_ok_publish_url():
+        missing.append("OK_PUBLISH_URL")
     return {
         "telegram": {
             "bot_token": bool(runtime_telegram_token()),
@@ -6179,6 +6255,13 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
             "needs": ["MAX_PUBLISH_URL"],
             "publish_url": runtime_max_publish_url(),
             "http_header": runtime_max_http_header(),
+        },
+        "ok": {
+            "enabled": runtime_enable_ok(),
+            "configured": bool(runtime_enable_ok() and runtime_ok_publish_url()),
+            "needs": ["OK_PUBLISH_URL"],
+            "publish_url": runtime_ok_publish_url(),
+            "http_header": runtime_ok_http_header(),
         },
         "database": {"backend": DB_BACKEND, "database_url_set": bool(DATABASE_URL)},
         "missing_required": missing,
@@ -6229,6 +6312,17 @@ def publish_max_endpoint(post_id: int, session_id: Optional[str] = Cookie(defaul
     return {"ok": True, "post_id": post_id, "max": res}
 
 
+@app.post("/api/posts/{post_id}/publish/ok")
+def publish_ok_endpoint(post_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    if not runtime_enable_ok():
+        raise HTTPException(status_code=503, detail="OK publishing temporarily disabled")
+    post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
+    res = ok_publish_post(post)
+    return {"ok": True, "post_id": post_id, "ok": res}
+
+
 @app.post("/api/posts/{post_id}/publish/multi")
 async def publish_multi(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
@@ -6259,6 +6353,10 @@ async def publish_multi(post_id: int, request: Request, session_id: Optional[str
                 if not runtime_enable_max():
                     raise HTTPException(status_code=503, detail="MAX disabled")
                 result["targets"]["max"] = {"ok": True, "result": max_publish_post(post)}
+            elif t == "ok":
+                if not runtime_enable_ok():
+                    raise HTTPException(status_code=503, detail="OK disabled")
+                result["targets"]["ok"] = {"ok": True, "result": ok_publish_post(post)}
             else:
                 result["targets"][t] = {"ok": False, "error": "unsupported target"}
                 result["ok"] = False
