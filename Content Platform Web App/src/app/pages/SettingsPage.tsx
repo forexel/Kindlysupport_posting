@@ -14,9 +14,10 @@ export function SettingsPage() {
   const [email, setEmail] = useState(localStorage.getItem('userEmail') || '');
 
   const [apiKey, setApiKey] = useState('');
-  const [textModel, setTextModel] = useState('openai/gpt-4o-mini');
+  const [textModel, setTextModel] = useState('google/gemini-2.5-flash-lite');
   const [visionModel, setVisionModel] = useState('meta-llama/llama-4-scout');
-  const [imageModel, setImageModel] = useState('openai/gpt-5-image-mini');
+  const [imageModel, setImageModel] = useState('black-forest-labs/flux.2-pro');
+  const [modelsLocked, setModelsLocked] = useState(true);
 
   const [botToken, setBotToken] = useState('');
   const [adminUserId, setAdminUserId] = useState('');
@@ -30,16 +31,28 @@ export function SettingsPage() {
   const [vkGroupId, setVkGroupId] = useState('');
 
   const [igEnabled, setIgEnabled] = useState(false);
+  const [igDeliveryMode, setIgDeliveryMode] = useState('external_queue');
   const [igAccessToken, setIgAccessToken] = useState('');
   const [igUserId, setIgUserId] = useState('');
+  const [igQueueGithubToken, setIgQueueGithubToken] = useState('');
+  const [igQueueRepo, setIgQueueRepo] = useState('');
+  const [igQueueBranch, setIgQueueBranch] = useState('main');
+  const [igQueuePath, setIgQueuePath] = useState('queue/instagram');
 
   const [pinEnabled, setPinEnabled] = useState(false);
   const [pinAccessToken, setPinAccessToken] = useState('');
   const [pinBoardId, setPinBoardId] = useState('');
 
+  const applyModelPreset = () => {
+    setTextModel('google/gemini-2.5-flash-lite');
+    setVisionModel('meta-llama/llama-4-scout');
+    setImageModel('black-forest-labs/flux.2-pro');
+  };
+
   const load = async () => {
     try {
       const s = await api<any>('/api/settings');
+      setModelsLocked(Boolean(s.models_locked));
       setApiKey(s.openrouter_api_key || '');
       setTextModel(s.openrouter_text_model || textModel);
       setVisionModel(s.openrouter_vision_model || visionModel);
@@ -53,8 +66,13 @@ export function SettingsPage() {
       setVkAccessToken(s.vk_access_token || '');
       setVkGroupId(s.vk_group_id || '');
       setIgEnabled(Boolean(s.enable_instagram));
+      setIgDeliveryMode(s.instagram_delivery_mode || 'external_queue');
       setIgAccessToken(s.instagram_access_token || '');
       setIgUserId(s.instagram_ig_user_id || '');
+      setIgQueueGithubToken(s.instagram_queue_github_token || '');
+      setIgQueueRepo(s.instagram_queue_repo || '');
+      setIgQueueBranch(s.instagram_queue_branch || 'main');
+      setIgQueuePath(s.instagram_queue_path || 'queue/instagram');
       setPinEnabled(Boolean(s.enable_pinterest));
       setPinAccessToken(s.pinterest_access_token || '');
       setPinBoardId(s.pinterest_board_id || '');
@@ -78,7 +96,11 @@ export function SettingsPage() {
         enable_vk: vkEnabled,
         vk_group_id: vkGroupId,
         enable_instagram: igEnabled,
+        instagram_delivery_mode: igDeliveryMode,
         instagram_ig_user_id: igUserId,
+        instagram_queue_repo: igQueueRepo,
+        instagram_queue_branch: igQueueBranch,
+        instagram_queue_path: igQueuePath,
         enable_pinterest: pinEnabled,
         pinterest_board_id: pinBoardId,
       };
@@ -87,6 +109,7 @@ export function SettingsPage() {
       if (webhookSecret && webhookSecret !== '***') payload.telegram_webhook_secret = webhookSecret;
       if (vkAccessToken && vkAccessToken !== '***') payload.vk_access_token = vkAccessToken;
       if (igAccessToken && igAccessToken !== '***') payload.instagram_access_token = igAccessToken;
+      if (igQueueGithubToken && igQueueGithubToken !== '***') payload.instagram_queue_github_token = igQueueGithubToken;
       if (pinAccessToken && pinAccessToken !== '***') payload.pinterest_access_token = pinAccessToken;
 
       await api('/api/settings', 'PUT', payload);
@@ -149,12 +172,40 @@ export function SettingsPage() {
         <TabsContent value="llm" className="mt-6">
           <Card className="bg-zinc-900 border-zinc-800 p-6 space-y-4">
             <h2 className="text-xl font-semibold text-zinc-50">LLM / OpenRouter</h2>
+            <div className="space-y-2">
+              <Label className="text-zinc-200">Быстрые наборы моделей</Label>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700"
+                  onClick={applyModelPreset}
+                >
+                  Gemini 2.5 Flash Lite + Llama Scout + Flux.2-pro
+                </Button>
+              </div>
+            </div>
+            {modelsLocked && (
+              <p className="text-xs text-amber-400">
+                Модели зафиксированы на сервере: Text=Gemini 2.5 Flash Lite, Vision=Llama 4 Scout, Image=Flux.2-pro.
+              </p>
+            )}
             <div className="space-y-2"><Label className="text-zinc-200">API Key</Label><Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-or-..." className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="space-y-2"><Label className="text-zinc-200">Text Model</Label><Input value={textModel} onChange={(e) => setTextModel(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
-              <div className="space-y-2"><Label className="text-zinc-200">Vision Model</Label><Input value={visionModel} onChange={(e) => setVisionModel(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
-              <div className="space-y-2"><Label className="text-zinc-200">Image Model</Label><Input value={imageModel} onChange={(e) => setImageModel(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">Text Model</Label><Input list="text-models" value={textModel} onChange={(e) => setTextModel(e.target.value)} disabled={modelsLocked} className="bg-zinc-800 border-zinc-700 text-zinc-100 disabled:opacity-60" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">Vision Model</Label><Input list="vision-models" value={visionModel} onChange={(e) => setVisionModel(e.target.value)} disabled={modelsLocked} className="bg-zinc-800 border-zinc-700 text-zinc-100 disabled:opacity-60" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">Image Model</Label><Input list="image-models" value={imageModel} onChange={(e) => setImageModel(e.target.value)} disabled={modelsLocked} className="bg-zinc-800 border-zinc-700 text-zinc-100 disabled:opacity-60" /></div>
             </div>
+            <datalist id="text-models">
+              <option value="google/gemini-2.5-flash-lite" />
+              <option value="google/gemini-2.5-pro" />
+            </datalist>
+            <datalist id="vision-models">
+              <option value="meta-llama/llama-4-scout" />
+            </datalist>
+            <datalist id="image-models">
+              <option value="black-forest-labs/flux.2-pro" />
+            </datalist>
             <Button onClick={() => handleTestConnection('OpenRouter')} variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700"><CheckCircle2 className="mr-2 h-4 w-4" />Проверить подключение</Button>
           </Card>
         </TabsContent>
@@ -197,9 +248,32 @@ export function SettingsPage() {
           <Card className="bg-zinc-900 border-zinc-800 p-6 space-y-4">
             <h2 className="text-xl font-semibold text-zinc-50">Instagram</h2>
             <div className="flex items-center gap-2"><input type="checkbox" checked={igEnabled} onChange={(e) => setIgEnabled(e.target.checked)} /><span className="text-zinc-300">Включить Instagram</span></div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="space-y-2"><Label className="text-zinc-200">Access Token</Label><Input type="password" value={igAccessToken} onChange={(e) => setIgAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
-              <div className="space-y-2"><Label className="text-zinc-200">IG User ID</Label><Input value={igUserId} onChange={(e) => setIgUserId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+            <div className="space-y-2">
+              <Label className="text-zinc-200">Режим доставки</Label>
+              <select value={igDeliveryMode} onChange={(e) => setIgDeliveryMode(e.target.value)} className="w-full h-10 rounded-md border border-zinc-700 bg-zinc-800 px-3 text-zinc-100">
+                <option value="external_queue">Через внешнюю очередь GitHub</option>
+                <option value="direct">Прямой запрос в Graph API</option>
+              </select>
+            </div>
+            {igDeliveryMode === 'direct' ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-2"><Label className="text-zinc-200">Access Token</Label><Input type="password" value={igAccessToken} onChange={(e) => setIgAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+                <div className="space-y-2"><Label className="text-zinc-200">IG User ID</Label><Input value={igUserId} onChange={(e) => setIgUserId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-2"><Label className="text-zinc-200">GitHub Repo (owner/repo)</Label><Input value={igQueueRepo} onChange={(e) => setIgQueueRepo(e.target.value)} placeholder="forexel/Kindlysupport_posting" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+                  <div className="space-y-2"><Label className="text-zinc-200">GitHub Token</Label><Input type="password" value={igQueueGithubToken} onChange={(e) => setIgQueueGithubToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-2"><Label className="text-zinc-200">Branch</Label><Input value={igQueueBranch} onChange={(e) => setIgQueueBranch(e.target.value)} placeholder="main" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+                  <div className="space-y-2"><Label className="text-zinc-200">Queue Path</Label><Input value={igQueuePath} onChange={(e) => setIgQueuePath(e.target.value)} placeholder="queue/instagram" className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+                </div>
+              </div>
+            )}
+            <div className="text-xs text-zinc-400">
+              В режиме очереди приложение только кладёт JSON-задачу в GitHub, публикацию делает workflow Instagram Publisher.
             </div>
           </Card>
         </TabsContent>

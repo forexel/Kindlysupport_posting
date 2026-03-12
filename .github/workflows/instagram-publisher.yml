@@ -2,6 +2,9 @@ name: Instagram Publisher
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "queue/instagram/*.json"
   schedule:
     - cron: "*/15 * * * *"
 
@@ -18,7 +21,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
