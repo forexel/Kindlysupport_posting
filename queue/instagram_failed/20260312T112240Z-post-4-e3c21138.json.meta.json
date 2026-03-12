@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "error": "HTTP 400: {\"error\":{\"message\":\"Only photo or video can be accepted as media type.\",\"type\":\"OAuthException\",\"code\":9004,\"error_subcode\":2207052,\"is_transient\":false,\"error_user_title\":\"Media download has failed. The media URI doesn't meet our requirements.\",\"error_user_msg\":\"The media could not be fetched from this URI: .Please check the limitations section in our development document for more information: https:\\/\\/developers.facebook.com\\/docs\\/instagram-platform\\/instagram-graph-api\\/reference\\/ig-user\\/media#creating\",\"fbtrace_id\":\"Ac2Lag6hHGLJg5OrT1TmUjg\"}}",
+  "payload": {
+    "caption": "*Мир существует только в настоящем моменте*\n\nИногда человек идёт по выбранному когда \\- то маршруту просто потому, что так привычно и безопасно\\. Снаружи такой путь может выглядеть правильным, но внутри он постепенно отнимает живой интерес\\. Когда в делах остаётся только обязанность, появляется усталость и ощущение пустоты\\. И в этот момент важно честно признать: мир существует только в настоящем моменте\n\nПуть с сердцем не всегда самый быстрый, зато в нём есть внутренний отклик и энергия\\. Он возвращает внимание к тому, что действительно важно именно тебе,, без ожиданиям других людей\\. Даже небольшой шаг в сторону такого пути делает жизнь тише, глубже и устойчивее\\. Иногда этого достаточно, чтобы снова почувствовать опору и смысл\\.\n\n@kindlysupport",
+    "image_url": "https://posting.testmakerapp.online/media/final/2026/03/11/post_card_1773210107898_0b228580.jpg",
+    "publish_at": ""
+  }
+}
