@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "error": "HTTP 400: {\"error\":{\"message\":\"Only photo or video can be accepted as media type.\",\"type\":\"OAuthException\",\"code\":9004,\"error_subcode\":2207052,\"is_transient\":false,\"error_user_title\":\"Media download has failed. The media URI doesn't meet our requirements.\",\"error_user_msg\":\"The media could not be fetched from this URI: .Please check the limitations section in our development document for more information: https:\\/\\/developers.facebook.com\\/docs\\/instagram-platform\\/instagram-graph-api\\/reference\\/ig-user\\/media#creating\",\"fbtrace_id\":\"ArMyvgQNiVPa3bQxa2YyMWx\"}}",
+  "payload": {
+    "caption": "Тестовая публикация из GitHub Actions (external publisher)",
+    "image_url": "https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg",
+    "publish_at": "2026-03-12T10:00:00Z"
+  }
+}
