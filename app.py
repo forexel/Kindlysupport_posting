@@ -1691,36 +1691,59 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
     if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     caption = (post.get("telegram_caption") or "").strip()
+    now_tag = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    post_tag = f"post-{post.get('id') or 'x'}-{uuid4().hex[:8]}"
+
+    def github_put_bytes(rel_path: str, content_bytes: bytes, commit_message: str) -> dict[str, Any]:
+        api_url = f"https://api.github.com/repos/{queue_repo}/contents/{urllib.parse.quote(rel_path)}"
+        content_b64 = base64.b64encode(content_bytes).decode("ascii")
+        return http_json(
+            "PUT",
+            api_url,
+            {"message": commit_message, "content": content_b64, "branch": queue_branch},
+            headers={
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=40,
+            retries=1,
+        )
+
+    def github_put_text(rel_path: str, text_payload: str, commit_message: str) -> dict[str, Any]:
+        return github_put_bytes(rel_path, text_payload.encode("utf-8"), commit_message)
+
+    # Rehost image in GitHub to avoid Meta fetch issues with app-hosted media URLs.
+    rehosted_image_url = ""
+    try:
+        image_bytes, _ = download_remote_image(image_url)
+        media_rel_path = f"{queue_path}/media/{now_tag}-{post_tag}.jpg".strip("/")
+        github_put_bytes(
+            media_rel_path,
+            image_bytes,
+            f"chore: enqueue instagram media #{post.get('id') or 'unknown'}",
+        )
+        rehosted_image_url = f"https://raw.githubusercontent.com/{queue_repo}/{queue_branch}/{media_rel_path}"
+    except Exception:
+        logger.exception("instagram_enqueue_rehost_failed post_id=%s", post.get("id"))
+
     payload: dict[str, Any] = {
         "caption": caption[:2200],
-        "image_url": image_url,
+        "image_url": rehosted_image_url or image_url,
         "publish_at": (post.get("scheduled_for") or ""),
     }
-    now_tag = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
-    file_name = f"{now_tag}-post-{post.get('id') or 'x'}-{uuid4().hex[:8]}.json"
+    file_name = f"{now_tag}-{post_tag}.json"
     rel_path = f"{queue_path}/{file_name}".strip("/")
-    api_url = f"https://api.github.com/repos/{queue_repo}/contents/{urllib.parse.quote(rel_path)}"
-    content_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii")
-    res = http_json(
-        "PUT",
-        api_url,
-        {
-            "message": f"chore: enqueue instagram post #{post.get('id') or 'unknown'}",
-            "content": content_b64,
-            "branch": queue_branch,
-        },
-        headers={
-            "Authorization": f"Bearer {github_token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        timeout=40,
-        retries=1,
+    res = github_put_text(
+        rel_path,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        f"chore: enqueue instagram post #{post.get('id') or 'unknown'}",
     )
     return {
         "queue_repo": queue_repo,
         "queue_branch": queue_branch,
         "queue_path": rel_path,
+        "rehosted_image_url": rehosted_image_url or None,
         "github_response": {"content": res.get("content"), "commit": res.get("commit")},
     }
 
@@ -4710,8 +4733,8 @@ def startup() -> None:
     start_background_scheduler()
 
 
-@app.get("/media/{object_path:path}")
-def serve_media(object_path: str) -> Response:
+@app.api_route("/media/{object_path:path}", methods=["GET", "HEAD"])
+def serve_media(object_path: str, request: Request) -> Response:
     key = (object_path or "").strip("/")
     if not key:
         raise HTTPException(status_code=404, detail="media key not found")
@@ -4721,7 +4744,12 @@ def serve_media(object_path: str) -> Response:
         raise HTTPException(status_code=404, detail="media not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"media read failed: {str(e)[:300]}")
-    return Response(content=data, media_type=ctype, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+    if request.method == "HEAD":
+        head_headers = dict(headers)
+        head_headers["Content-Length"] = str(len(data))
+        return Response(content=b"", media_type=ctype, headers=head_headers)
+    return Response(content=data, media_type=ctype, headers=headers)
 
 
 def run_scheduled_publications() -> int:
