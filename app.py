@@ -1983,21 +1983,14 @@ def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
         return {"wall_post": wall_post, "attachment": attachment, "photo": photo, "mode": "photo_upload"}
     except HTTPException as e:
         detail = str(e.detail or "")
-        # Some VK tokens (group/service tokens) cannot call photo upload methods.
-        # Fallback: publish text and include image URL in message.
         if "photos.getWallUploadServer" in detail and "Group authorization failed" in detail:
-            msg = f"{caption}\n\n{post['final_image_url']}".strip()[:4000]
-            wall_post = vk_api_call(
-                "wall.post",
-                {
-                    "owner_id": f"-{vk_group_id}",
-                    "from_group": 1,
-                    "message": msg,
-                },
-                vk_token=vk_token,
-                vk_version=vk_version,
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "VK token cannot upload photos for wall posts. "
+                    "Use a user token with wall/photos permissions and access to the target community."
+                ),
             )
-            return {"wall_post": wall_post, "attachment": None, "photo": None, "mode": "text_with_image_link"}
         raise
 
 
