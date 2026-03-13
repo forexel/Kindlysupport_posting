@@ -5955,6 +5955,21 @@ async def update_post_text(post_id: int, request: Request, session_id: Optional[
         _remember_previous_text(post_id, post, post.get("text_body") or "")
     update_post(post_id, **updates)
     latest = fetch_post(post_id)
+    if (
+        "title" in updates
+        and updates["title"] != (post.get("title") or "")
+        and (latest.get("source_kind") or "").strip() == "phrase"
+    ):
+        preview = _preview_payload_dict(latest)
+        base_image_url = (
+            (preview.get("original_image_url") or "").strip()
+            or (preview.get("base_image_url") or "").strip()
+            or (latest.get("final_image_url") or "").strip()
+        )
+        if base_image_url:
+            rebuilt = render_phrase_card_image(str(latest.get("title") or ""), base_image_url)
+            update_post(post_id, final_image_url=rebuilt)
+            latest = fetch_post(post_id)
     update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
     return fetch_post(post_id)
 

@@ -29,6 +29,7 @@ export function PostDetailsPage() {
   const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [post, setPost] = useState<Post | null>(null);
+  const [title, setTitle] = useState('');
   const [textBody, setTextBody] = useState('');
   const [regenInstruction, setRegenInstruction] = useState('');
   const [loading, setLoading] = useState(true);
@@ -45,6 +46,7 @@ export function PostDetailsPage() {
     try {
       const row = await api<Post>(`/api/posts/${numericPostId}`);
       setPost(row);
+      setTitle(row.title || '');
       setTextBody(row.text_body || '');
     } catch (e: any) {
       toast.error(String(e?.message || e));
@@ -61,10 +63,14 @@ export function PostDetailsPage() {
     if (!post) return;
     setSavingText(true);
     try {
-      const updated = await api<Post>(`/api/posts/${post.id}`, 'PUT', { text_body: textBody });
+      const updated = await api<Post>(`/api/posts/${post.id}`, 'PUT', {
+        title,
+        text_body: textBody,
+      });
       setPost(updated);
+      setTitle(updated.title || '');
       setTextBody(updated.text_body || '');
-      toast.success('Текст сохранён');
+      toast.success('Пост сохранён');
     } catch (e: any) {
       toast.error(String(e?.message || e));
     } finally {
@@ -246,6 +252,15 @@ export function PostDetailsPage() {
             </CardHeader>
             <CardContent className="space-y-4 pt-6">
               <div className="space-y-2">
+                <Label htmlFor="post-title" className="text-zinc-300">Фраза на картинке</Label>
+                <Input
+                  id="post-title"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="bg-zinc-950 border-zinc-700 text-zinc-100"
+                />
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="post-text" className="text-zinc-300">Текст</Label>
                 <Textarea
                   id="post-text"
@@ -256,7 +271,7 @@ export function PostDetailsPage() {
               </div>
               <Button className="bg-emerald-600 hover:bg-emerald-700 text-white" onClick={saveText} disabled={savingText || !post}>
                 {savingText ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                Сохранить текст
+                Сохранить пост
               </Button>
             </CardContent>
           </Card>
