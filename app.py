@@ -2149,6 +2149,7 @@ Paragraph 2 - deeper meaning or invitation.
 Output must be plain text only.
 Do not add headings, markdown, bullets, labels, or intro lines.
 Never start with a title like "**...**".
+Respect any explicit character limit from the user prompt exactly.
 
 SCENARIO:
 Write in English.
@@ -2168,6 +2169,10 @@ Square image, no text, realistic cinematic style, clean composition, emotional d
 """.strip()
 
 
+TELEGRAM_PHRASE_POST_CHAR_LIMIT = 800
+CHANNEL_FOOTER = "@kindlysupport"
+
+
 def build_user_prompt_for_task(
     task: str,
     phrase: str = "",
@@ -2182,6 +2187,14 @@ def build_user_prompt_for_task(
             "TASK: TEXT",
             f"PHRASE: {(phrase or '').strip()}",
         ]
+        char_budget = phrase_body_char_budget(phrase)
+        if char_budget > 0:
+            parts.append(
+                "CHAR_LIMIT_RULE: "
+                f"the final Telegram post must be <= {TELEGRAM_PHRASE_POST_CHAR_LIMIT} characters total, "
+                f"including title, blank lines, and {CHANNEL_FOOTER}. "
+                f"So write the body in <= {char_budget} characters."
+            )
         if instruction.strip():
             parts.append(f"EDITOR_INSTRUCTION: {instruction.strip()}")
         if previous_text.strip():
@@ -2209,6 +2222,68 @@ def build_user_prompt_for_task(
 
 def _sentence_count(text: str) -> int:
     return len([x for x in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if x.strip()])
+
+
+def phrase_heading_line(title: str) -> str:
+    base_title = (title or "").strip()
+    quote, author = split_quote_and_author(base_title)
+    phrase_title = _phrase_title_for_publish(quote or base_title)
+    if author:
+        return f"{phrase_title} - {author}"
+    return phrase_title
+
+
+def phrase_body_char_budget(title: str) -> int:
+    heading = phrase_heading_line(title)
+    reserved = len(heading) + len("\n\n") + len("\n\n") + len(CHANNEL_FOOTER)
+    return max(0, TELEGRAM_PHRASE_POST_CHAR_LIMIT - reserved)
+
+
+def trim_phrase_body_to_budget(text: str, budget: int) -> str:
+    body = (text or "").strip()
+    if not body or budget <= 0:
+        return ""
+    if len(body) <= budget:
+        return body
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    if not paragraphs:
+        paragraphs = [body]
+
+    trimmed_parts: list[str] = []
+    remaining = budget
+    for index, paragraph in enumerate(paragraphs):
+        join_cost = 2 if index > 0 and trimmed_parts else 0
+        if remaining <= join_cost:
+            break
+        allowed = remaining - join_cost
+        candidate = paragraph
+        if len(candidate) > allowed:
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", candidate) if s.strip()]
+            kept: list[str] = []
+            used = 0
+            for sentence in sentences:
+                extra = len(sentence) + (1 if kept else 0)
+                if used + extra > allowed:
+                    break
+                kept.append(sentence)
+                used += extra
+            if kept:
+                candidate = " ".join(kept).strip()
+            else:
+                candidate = candidate[:allowed].rstrip(" ,;:-")
+                candidate = re.sub(r"\s+\S*$", "", candidate).strip()
+        candidate = candidate.strip()
+        if not candidate:
+            break
+        trimmed_parts.append(candidate)
+        remaining = budget - len("\n\n".join(trimmed_parts))
+
+    result = "\n\n".join(trimmed_parts).strip()
+    if len(result) > budget:
+        result = result[:budget].rstrip(" ,;:-")
+        result = re.sub(r"\s+\S*$", "", result).strip()
+    return result
 
 
 def _normalize_generated_ru_text(text: str) -> str:
@@ -2412,6 +2487,12 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
     clean = (phrase or "").strip()
     if not clean:
         return ""
+    body_budget = phrase_body_char_budget(clean)
+
+    def _fit_phrase_body(raw_text: str) -> str:
+        normalized = _force_two_clean_paragraphs(raw_text or "")
+        return trim_phrase_body_to_budget(normalized, body_budget)
+
     prompt = build_user_prompt_for_task(
         "TEXT",
         phrase=clean,
@@ -2426,7 +2507,7 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
             system_prompt=UNIVERSAL_CONTENT_SYSTEM_PROMPT,
             trace_label="TEXT:expand:v1",
         )
-        text = _normalize_generated_ru_text(raw or "")
+        text = _fit_phrase_body(_normalize_generated_ru_text(raw or ""))
         if previous_text.strip():
             for _ in range(3):
                 if not _texts_too_similar(text, previous_text, threshold=0.82):
@@ -2449,14 +2530,15 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
                     system_prompt=UNIVERSAL_CONTENT_SYSTEM_PROMPT,
                     trace_label="TEXT:expand:retry_diff",
                 )
-                text_diff = _normalize_generated_ru_text(raw_diff or "")
+                text_diff = _fit_phrase_body(_normalize_generated_ru_text(raw_diff or ""))
                 if text_diff:
                     text = text_diff
         if not _rich_text_quality_ok(text):
             strict_instruction = (
                 "Сделай текст длиннее и живее. Ровно 2 абзаца. В каждом абзаце 4 предложения. "
                 "Без списков, без метакомментариев. Никаких шаблонов '..., а не ...'. "
-                "Без заголовков и markdown. Верни только 2 абзаца чистого текста."
+                "Без заголовков и markdown. Верни только 2 абзаца чистого текста. "
+                f"Тело текста должно поместиться в {body_budget} символов."
             )
             prompt2 = build_user_prompt_for_task(
                 "TEXT",
@@ -2471,16 +2553,16 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
                 system_prompt=UNIVERSAL_CONTENT_SYSTEM_PROMPT,
                 trace_label="TEXT:expand:retry_quality",
             )
-            text2 = _normalize_generated_ru_text(raw2 or "")
+            text2 = _fit_phrase_body(_normalize_generated_ru_text(raw2 or ""))
             if _rich_text_quality_ok(text2):
-                return _force_two_clean_paragraphs(text2)
+                return text2
             if text2.strip() and _phrase_expansion_quality_ok(text2, clean):
                 # Keep non-empty regenerated text instead of dropping to deterministic template.
-                return _force_two_clean_paragraphs(text2)
+                return text2
         if _rich_text_quality_ok(text) and _phrase_expansion_quality_ok(text, clean):
-            return _force_two_clean_paragraphs(text)
+            return text
         if text.strip() and _phrase_expansion_quality_ok(text, clean):
-            return _force_two_clean_paragraphs(text)
+            return text
         # Last attempt: hard reset from previous text to avoid template lock-in.
         prompt3 = build_user_prompt_for_task(
             "TEXT",
@@ -2488,7 +2570,7 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
             instruction=(
                 f"{(instruction or '').strip()} "
                 "Полный перезапуск текста с нуля. Ровно 2 абзаца по 4-5 предложений, "
-                "без повторов прошлых формулировок."
+                f"без повторов прошлых формулировок. Тело текста должно поместиться в {body_budget} символов."
             ).strip(),
             previous_text="",
         )
@@ -2499,9 +2581,9 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
             system_prompt=UNIVERSAL_CONTENT_SYSTEM_PROMPT,
             trace_label="TEXT:expand:hard_reset",
         )
-        text3 = _normalize_generated_ru_text(raw3 or "")
+        text3 = _fit_phrase_body(_normalize_generated_ru_text(raw3 or ""))
         if text3.strip() and _phrase_expansion_quality_ok(text3, clean):
-            return _force_two_clean_paragraphs(text3)
+            return text3
         p1_dbg, p2_dbg = _split_two_paragraphs(text)
         logger.warning(
             "expand_phrase_text_low_quality phrase=%s p1_sent=%s p2_sent=%s p1_len=%s p2_len=%s",
@@ -2514,7 +2596,7 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
     except Exception:
         logger.exception("expand_phrase_text_failed phrase=%s", clean[:80])
     # Deterministic fallback, neutral and phrase-centered.
-    return (
+    fallback = (
         f"Иногда одна короткая фраза помогает увидеть то, что мы долго не замечали. "
         f"«{clean}» звучит просто, но в ней есть точка опоры для повседневных решений и внутренних сомнений. "
         f"Когда мыслей слишком много, полезно вернуться к этой простой формулировке и проверить, где именно сейчас находится внимание. "
@@ -2524,6 +2606,7 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
         f"Постепенно такие шаги собираются в устойчивое состояние и возвращают внутреннюю собранность. "
         f"Именно из этого рождается ощущение, что жизнь снова становится живой и цельной."
     )
+    return trim_phrase_body_to_budget(_force_two_clean_paragraphs(fallback), body_budget)
 
 
 def generate_image_scenario(title: str, text_body: str, extra_instruction: str = "") -> str:
@@ -2814,12 +2897,12 @@ def generate_post_caption(post: dict[str, Any]) -> str:
     if source_kind == "phrase":
         quote, author = split_quote_and_author(title)
         phrase_title = _phrase_title_for_publish(quote or title)
-        body = (text_body or "").strip()
+        body = trim_phrase_body_to_budget((text_body or "").strip(), phrase_body_char_budget(title))
         phrase_md = f"*{escape_markdown_v2(phrase_title)}*"
         if author:
             phrase_md = f"{phrase_md} — {escape_markdown_v2(author)}"
         body_md = escape_markdown_v2(body)
-        return f"{phrase_md}\n\n{body_md}\n\n@kindlysupport" if body_md else f"{phrase_md}\n\n@kindlysupport"
+        return f"{phrase_md}\n\n{body_md}\n\n{CHANNEL_FOOTER}" if body_md else f"{phrase_md}\n\n{CHANNEL_FOOTER}"
     return generate_caption(title, text_body)
 
 
@@ -2830,11 +2913,11 @@ def generate_post_caption_plain(post: dict[str, Any]) -> str:
     if source_kind == "phrase":
         quote, author = split_quote_and_author(title)
         phrase_title = _phrase_title_for_publish(quote or title)
-        body = (text_body or "").strip()
+        body = trim_phrase_body_to_budget((text_body or "").strip(), phrase_body_char_budget(title))
         title_line = phrase_title
         if author:
             title_line = f"{title_line} - {author}"
-        return f"{title_line}\n\n{body}\n\n@kindlysupport" if body else f"{title_line}\n\n@kindlysupport"
+        return f"{title_line}\n\n{body}\n\n{CHANNEL_FOOTER}" if body else f"{title_line}\n\n{CHANNEL_FOOTER}"
     return generate_caption(title, text_body)
 
 
@@ -2964,7 +3047,7 @@ def generate_post_caption_markdown_limited(post: dict[str, Any], max_len: int = 
     if author:
         title_md = f"{title_md} - {escape_markdown_v2(author)}"
 
-    tail = "\n\n@kindlysupport"
+    tail = f"\n\n{CHANNEL_FOOTER}"
     available = max(0, max_len - len(title_md) - len(tail) - 2)
     body_plain = body[:available].rstrip()
     # Keep paragraph break if truncation leaves enough content.
