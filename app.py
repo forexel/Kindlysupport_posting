@@ -2936,6 +2936,20 @@ def _remember_previous_text(post_id: int, post: dict[str, Any], previous_text: s
     update_post(post_id, preview_payload_json=preview)
 
 
+def _mark_post_dirty_for_republish(post_id: int, post: dict[str, Any], preview_override: Optional[dict[str, Any]] = None) -> None:
+    preview = (preview_override if isinstance(preview_override, dict) else _preview_payload_dict(post).copy()) or {}
+    preview.pop("published", None)
+    preview.pop("published_at", None)
+    preview.pop("telegram_send_error", None)
+    update_post(
+        post_id,
+        status="preview_ready",
+        scheduled_for=None,
+        published_message_id=None,
+        preview_payload_json=preview,
+    )
+
+
 def _normalize_post_heading(text: str) -> str:
     s = (text or "").strip()
     s = s.replace("*", "")
@@ -5970,6 +5984,8 @@ async def update_post_text(post_id: int, request: Request, session_id: Optional[
             rebuilt = render_phrase_card_image(str(latest.get("title") or ""), base_image_url)
             update_post(post_id, final_image_url=rebuilt)
             latest = fetch_post(post_id)
+    _mark_post_dirty_for_republish(post_id, latest)
+    latest = fetch_post(post_id)
     update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
     return fetch_post(post_id)
 
@@ -5996,6 +6012,8 @@ async def upload_post_image(post_id: int, request: Request, session_id: Optional
         final_image_url=final_image_url,
         preview_payload_json=preview,
     )
+    latest = fetch_post(post_id)
+    _mark_post_dirty_for_republish(post_id, latest, preview_override=preview)
     return fetch_post(post_id)
 
 
@@ -6121,6 +6139,8 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
         telegram_caption=caption,
         preview_payload_json=preview,
         last_regen_instruction=regen_instruction or None,
+        published_message_id=None,
+        scheduled_for=None,
     )
     post = fetch_post(post_id)
     tg_send = None
@@ -6325,6 +6345,8 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
             last_regen_instruction=instruction or None,
         )
 
+    latest = fetch_post(post_id)
+    _mark_post_dirty_for_republish(post_id, latest)
     latest = fetch_post(post_id)
     update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
     return fetch_post(post_id)
@@ -7556,6 +7578,8 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
         _remember_previous_text(post_id, post, post.get("text_body") or "")
         update_post(post_id, text_body=new_text_body)
         latest = fetch_post(post_id)
+        _mark_post_dirty_for_republish(post_id, latest)
+        latest = fetch_post(post_id)
         update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
         preview_err = _resend_preview_to_chat(post_id, chat.get("id"))
         if preview_err:
@@ -8024,6 +8048,8 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
         preview["previous_text_body"] = current_text
         preview["previous_text_saved_at"] = now_iso()
         update_post(post_id, text_body=previous_text, preview_payload_json=preview)
+        latest = fetch_post(post_id)
+        _mark_post_dirty_for_republish(post_id, latest, preview_override=preview)
         latest = fetch_post(post_id)
         update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
         preview_err = _resend_preview_to_chat(post_id, chat_id)
