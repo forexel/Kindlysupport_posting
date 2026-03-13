@@ -38,7 +38,7 @@ export function MoviesPage() {
   const [postText, setPostText] = useState('');
   const [imageUrl, setImageUrl] = useState('');
 
-  const [channels, setChannels] = useState({ telegram: true, vk: false, max: false, ok: false, pinterest: false, instagram: false });
+  const [channels, setChannels] = useState({ telegram: true, vk: false, vk_channel: false, max: false, ok: false, pinterest: false, instagram: false });
   const [scheduleType, setScheduleType] = useState<'now' | 'scheduled'>('now');
   const [scheduleDate, setScheduleDate] = useState('');
   const [scheduleTime, setScheduleTime] = useState('');

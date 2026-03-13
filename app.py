@@ -277,6 +277,8 @@ TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "@ForCreatingTestsBot
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "").strip()
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
+VK_CHANNEL_ACCESS_TOKEN = os.getenv("VK_CHANNEL_ACCESS_TOKEN", "").strip()
+VK_CHANNEL_GROUP_ID = os.getenv("VK_CHANNEL_GROUP_ID", "").strip()
 MAX_PUBLISH_URL = os.getenv("MAX_PUBLISH_URL", "").strip()
 MAX_ACCESS_TOKEN = os.getenv("MAX_ACCESS_TOKEN", "").strip()
 MAX_HTTP_HEADER = os.getenv("MAX_HTTP_HEADER", "Authorization").strip()
@@ -297,6 +299,7 @@ PINTEREST_BOARD_ID = os.getenv("PINTEREST_BOARD_ID", "").strip()
 ENABLE_INSTAGRAM = os.getenv("ENABLE_INSTAGRAM", "0").strip() in {"1", "true", "yes"}
 ENABLE_PINTEREST = os.getenv("ENABLE_PINTEREST", "0").strip() in {"1", "true", "yes"}
 ENABLE_VK = os.getenv("ENABLE_VK", "0").strip() in {"1", "true", "yes"}
+ENABLE_VK_CHANNEL = os.getenv("ENABLE_VK_CHANNEL", "0").strip() in {"1", "true", "yes"}
 ENABLE_MAX = os.getenv("ENABLE_MAX", "0").strip() in {"1", "true", "yes"}
 ENABLE_OK = os.getenv("ENABLE_OK", "0").strip() in {"1", "true", "yes"}
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
@@ -844,6 +847,14 @@ def runtime_vk_version() -> str:
     return setting_get("vk_api_version", VK_API_VERSION)
 
 
+def runtime_vk_channel_token() -> str:
+    return setting_get("vk_channel_access_token", VK_CHANNEL_ACCESS_TOKEN)
+
+
+def runtime_vk_channel_group_id() -> str:
+    return setting_get("vk_channel_group_id", VK_CHANNEL_GROUP_ID)
+
+
 def runtime_max_publish_url() -> str:
     return setting_get("max_publish_url", MAX_PUBLISH_URL).strip()
 
@@ -880,6 +891,10 @@ def runtime_enable_pinterest() -> bool:
 
 def runtime_enable_vk() -> bool:
     return bool_from_str(setting_get("enable_vk", "1" if ENABLE_VK else "0"))
+
+
+def runtime_enable_vk_channel() -> bool:
+    return bool_from_str(setting_get("enable_vk_channel", "1" if ENABLE_VK_CHANNEL else "0"))
 
 
 def runtime_enable_max() -> bool:
@@ -934,6 +949,8 @@ def bootstrap_runtime_settings() -> None:
         "vk_access_token": VK_ACCESS_TOKEN,
         "vk_group_id": VK_GROUP_ID,
         "vk_api_version": VK_API_VERSION,
+        "vk_channel_access_token": VK_CHANNEL_ACCESS_TOKEN,
+        "vk_channel_group_id": VK_CHANNEL_GROUP_ID,
         "max_publish_url": MAX_PUBLISH_URL,
         "max_access_token": MAX_ACCESS_TOKEN,
         "max_http_header": MAX_HTTP_HEADER,
@@ -943,6 +960,7 @@ def bootstrap_runtime_settings() -> None:
         "enable_instagram": "1" if ENABLE_INSTAGRAM else "0",
         "enable_pinterest": "1" if ENABLE_PINTEREST else "0",
         "enable_vk": "1" if ENABLE_VK else "0",
+        "enable_vk_channel": "1" if ENABLE_VK_CHANNEL else "0",
         "enable_max": "1" if ENABLE_MAX else "0",
         "enable_ok": "1" if ENABLE_OK else "0",
         "ocr_primary_engine": OCR_PRIMARY_ENGINE,
@@ -1449,6 +1467,8 @@ def build_preview_keyboard(post_id: int) -> dict[str, Any]:
         [
             [("Опубликовать", f"ks:pub:{post_id}")],
             [("Перегенерировать", f"ks:regen:{post_id}")],
+            [("Заменить текст вручную", f"ks:edittext:{post_id}")],
+            [("Вернуть прошлый текст", f"ks:restoretext:{post_id}")],
             [("Отмена", f"ks:cancel:{post_id}")],
         ]
     )
@@ -1942,14 +1962,16 @@ def vk_upload_photo(upload_url: str, image_bytes: bytes, filename: str = "publis
         raise HTTPException(status_code=502, detail=f"VK upload request failed: {str(e)[:800]}")
 
 
-def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
-    if not runtime_enable_vk():
-        raise HTTPException(status_code=503, detail="VK publishing temporarily disabled")
-    vk_token = runtime_vk_token()
-    vk_group_id = runtime_vk_group_id()
-    vk_version = runtime_vk_version()
+def vk_publish_post_to_group(
+    post: dict[str, Any],
+    *,
+    vk_token: str,
+    vk_group_id: str,
+    vk_version: str,
+    profile_label: str,
+) -> dict[str, Any]:
     if not vk_token or not vk_group_id:
-        raise HTTPException(status_code=400, detail="VK credentials not configured")
+        raise HTTPException(status_code=400, detail=f"{profile_label} credentials not configured")
     if not post.get("final_image_url"):
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     caption = generate_post_caption_plain(post)[:3500]
@@ -2012,11 +2034,36 @@ def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "VK token cannot upload photos for wall posts. "
+                    f"{profile_label} token cannot upload photos for wall posts. "
                     "Use a user token with wall/photos permissions and access to the target community."
                 ),
             )
         raise
+
+
+def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
+    if not runtime_enable_vk():
+        raise HTTPException(status_code=503, detail="VK publishing temporarily disabled")
+    return vk_publish_post_to_group(
+        post,
+        vk_token=runtime_vk_token(),
+        vk_group_id=runtime_vk_group_id(),
+        vk_version=runtime_vk_version(),
+        profile_label="VK",
+    )
+
+
+def vk_channel_publish_post(post: dict[str, Any]) -> dict[str, Any]:
+    if not runtime_enable_vk_channel():
+        raise HTTPException(status_code=503, detail="VK channel publishing temporarily disabled")
+    token = runtime_vk_channel_token() or runtime_vk_token()
+    return vk_publish_post_to_group(
+        post,
+        vk_token=token,
+        vk_group_id=runtime_vk_channel_group_id(),
+        vk_version=runtime_vk_version(),
+        profile_label="VK channel",
+    )
 
 
 def max_publish_post(post: dict[str, Any]) -> dict[str, Any]:
@@ -2789,6 +2836,100 @@ def generate_post_caption_plain(post: dict[str, Any]) -> str:
             title_line = f"{title_line} - {author}"
         return f"{title_line}\n\n{body}\n\n@kindlysupport" if body else f"{title_line}\n\n@kindlysupport"
     return generate_caption(title, text_body)
+
+
+def _preview_payload_dict(post: dict[str, Any]) -> dict[str, Any]:
+    preview = post.get("preview_payload") or {}
+    return preview if isinstance(preview, dict) else {}
+
+
+def _remember_previous_text(post_id: int, post: dict[str, Any], previous_text: str) -> None:
+    prev = (previous_text or "").strip()
+    if not prev:
+        return
+    preview = _preview_payload_dict(post).copy()
+    preview["previous_text_body"] = prev
+    preview["previous_text_saved_at"] = now_iso()
+    update_post(post_id, preview_payload_json=preview)
+
+
+def _normalize_post_heading(text: str) -> str:
+    s = (text or "").strip()
+    s = s.replace("*", "")
+    s = re.sub(r"[—–]+", "-", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" \n\r\t-").lower()
+
+
+def _candidate_post_headings(post: dict[str, Any]) -> list[str]:
+    title = (post.get("title") or "").strip()
+    source_kind = (post.get("source_kind") or "").strip()
+    candidates: list[str] = []
+    if source_kind == "phrase":
+        quote, author = split_quote_and_author(title)
+        phrase_title = _phrase_title_for_publish(quote or title)
+        candidates.append(phrase_title)
+        if author:
+            candidates.append(f"{phrase_title} - {author}")
+            candidates.append(f"{phrase_title} — {author}")
+    else:
+        candidates.append(title)
+        candidates.append(f"Притча: {title}")
+    return [x for x in candidates if x.strip()]
+
+
+def _looks_like_post_heading(post: dict[str, Any], text: str) -> bool:
+    candidate = _normalize_post_heading(text)
+    if not candidate:
+        return False
+    return candidate in {_normalize_post_heading(x) for x in _candidate_post_headings(post)}
+
+
+def extract_manual_replacement_text(post: dict[str, Any], raw_text: str) -> str:
+    raw = (raw_text or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(
+        r"^\s*(полная\s+замена\s+текста|текст\s+для\s+замены|текст)\s*:\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+    lines = [line.rstrip() for line in raw.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and lines[-1].strip().lower() == "@kindlysupport":
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+    cleaned = "\n".join(lines).strip()
+    if not cleaned:
+        return ""
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", cleaned) if part.strip()]
+    if len(paragraphs) >= 2 and _looks_like_post_heading(post, paragraphs[0]):
+        return "\n\n".join(paragraphs[1:]).strip()
+
+    split_lines = cleaned.splitlines()
+    if split_lines and _looks_like_post_heading(post, split_lines[0]):
+        return "\n".join(split_lines[1:]).strip()
+
+    return cleaned
+
+
+def _resend_preview_to_chat(post_id: int, chat_id: str | int) -> Optional[str]:
+    if chat_id is None:
+        return "chat_id is missing"
+    try:
+        cleanup_post_thread_messages_for_chat(post_id, chat_id)
+        latest = fetch_post(post_id)
+        sent = telegram_send_preview_to_chat(latest, chat_id)
+        result = (sent or {}).get("result") or {}
+        if result.get("message_id") is not None:
+            set_preview_message_id_for_chat(post_id, latest, chat_id, str(result["message_id"]))
+        return None
+    except Exception as e:
+        return str(e)
 
 
 def generate_post_caption_markdown_limited(post: dict[str, Any], max_len: int = 1024) -> str:
@@ -5154,7 +5295,7 @@ def start_background_scheduler() -> None:
     start_background_scheduler._started = True
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def index() -> Any:
     index_file = FRONTEND_DIST_DIR / "index.html"
     if index_file.exists():
@@ -5257,7 +5398,7 @@ def _legal_page_html(title: str, content: str) -> str:
 """
 
 
-@app.get("/legal/about", response_class=HTMLResponse)
+@app.api_route("/legal/about", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def legal_about() -> HTMLResponse:
     html = _legal_page_html(
         "Kindlysupport App Overview",
@@ -5265,19 +5406,20 @@ def legal_about() -> HTMLResponse:
         <h1>Kindlysupport Application Overview</h1>
         <div class="meta">Last updated: 2026-03-12</div>
         <p>
-          Kindlysupport is a content publishing tool used to prepare and publish social media posts,
-          including standard Pins to Pinterest boards selected by the account owner.
+          Kindlysupport is a user-authorized publishing tool for creators and small teams.
+          It helps users draft content and publish standard Pins to Pinterest boards selected by the account owner.
         </p>
         <h2>Application purpose</h2>
         <p>
-          The application helps a creator or team automate repetitive publishing tasks:
-          composing text, attaching an image, and sending the post to configured destinations.
+          The application assists with drafting and scheduling user-approved posts:
+          composing text, attaching an image, choosing a destination board, and publishing at a selected time.
         </p>
         <h2>Pinterest integration usage</h2>
         <ul>
+          <li>OAuth-based authorization is required for account access.</li>
           <li>Read boards to select destination board IDs.</li>
           <li>Create standard Pins with title, description, link, and image URL.</li>
-          <li>No actions are performed without explicit user setup and publish request.</li>
+          <li>No hidden actions are performed. Publishing is triggered only by explicit user setup and request.</li>
         </ul>
         <h2>Support</h2>
         <p>
@@ -5288,12 +5430,12 @@ def legal_about() -> HTMLResponse:
     return HTMLResponse(content=html)
 
 
-@app.get("/about", response_class=HTMLResponse)
+@app.api_route("/about", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def legal_about_alias() -> HTMLResponse:
     return legal_about()
 
 
-@app.get("/legal/privacy", response_class=HTMLResponse)
+@app.api_route("/legal/privacy", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def legal_privacy() -> HTMLResponse:
     html = _legal_page_html(
         "Kindlysupport Privacy Policy",
@@ -5319,9 +5461,11 @@ def legal_privacy() -> HTMLResponse:
         </ul>
         <h2>Pinterest-specific processing</h2>
         <ul>
+          <li>Pinterest access is authorized by OAuth and can be revoked by the user at any time.</li>
           <li>We use Pinterest access tokens only to perform actions you authorize.</li>
           <li>We may read boards and create Pins on boards you selected.</li>
-          <li>We do not sell Pinterest account data or share tokens with advertisers.</li>
+          <li>We do not collect Pinterest passwords, do not scrape Pinterest, and do not sell Pinterest account data.</li>
+          <li>We do not share Pinterest access tokens with advertisers or unrelated third parties.</li>
         </ul>
         <h2>Data sharing</h2>
         <p>
@@ -5330,8 +5474,8 @@ def legal_privacy() -> HTMLResponse:
         </p>
         <h2>Data retention</h2>
         <p>
-          We retain operational data only as long as needed for service operation, legal obligations,
-          and security review. You can request deletion by contacting us.
+          We retain operational logs for up to 30 days for reliability and security.
+          Integration settings are retained while your account is active and are deleted upon verified user request.
         </p>
         <h2>Security</h2>
         <p>
@@ -5352,7 +5496,7 @@ def legal_privacy() -> HTMLResponse:
     return HTMLResponse(content=html)
 
 
-@app.get("/privacy-policy", response_class=HTMLResponse)
+@app.api_route("/privacy-policy", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def legal_privacy_alias() -> HTMLResponse:
     return legal_privacy()
 
@@ -5414,6 +5558,7 @@ def get_config(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
         "instagram_configured": runtime_instagram_configured(),
         "pinterest_configured": bool(runtime_enable_pinterest() and runtime_pinterest_token() and runtime_pinterest_board_id()),
         "vk_configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
+        "vk_channel_configured": bool(runtime_enable_vk_channel() and (runtime_vk_channel_token() or runtime_vk_token()) and runtime_vk_channel_group_id()),
         "max_configured": bool(runtime_enable_max() and runtime_max_publish_url()),
         "ok_configured": bool(runtime_enable_ok() and runtime_ok_publish_url()),
     }
@@ -5441,6 +5586,9 @@ def get_settings(session_id: Optional[str] = Cookie(default=None, alias=SESSION_
         "vk_access_token": "***" if runtime_vk_token() else "",
         "vk_group_id": runtime_vk_group_id(),
         "vk_api_version": runtime_vk_version(),
+        "enable_vk_channel": runtime_enable_vk_channel(),
+        "vk_channel_access_token": "***" if runtime_vk_channel_token() else "",
+        "vk_channel_group_id": runtime_vk_channel_group_id(),
         "enable_max": runtime_enable_max(),
         "max_publish_url": runtime_max_publish_url(),
         "max_access_token": "***" if runtime_max_token() else "",
@@ -5487,6 +5635,9 @@ async def update_settings(request: Request, session_id: Optional[str] = Cookie(d
         "vk_access_token",
         "vk_group_id",
         "vk_api_version",
+        "enable_vk_channel",
+        "vk_channel_access_token",
+        "vk_channel_group_id",
         "enable_max",
         "max_publish_url",
         "max_access_token",
@@ -5808,7 +5959,7 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
 
     preview = {
         "chat": runtime_telegram_preview_chat(),
-        "buttons": ["Опубликовать", "Перегенерировать", "Отмена"],
+        "buttons": ["Опубликовать", "Перегенерировать", "Заменить текст вручную", "Вернуть прошлый текст", "Отмена"],
         "publish_options": ["Сейчас", "В указанное время и дату", "Заменить фразу"],
         "regenerate_options": ["Текст", "Картинку", "И то и то"],
         "note": "При перегенерации админ присылает текст-инструкцию, он учитывается в prompt изображения.",
@@ -5930,11 +6081,12 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
 
     if target in ("text", "both"):
         _stage("text", "Этап генерации текста...")
+        previous_text_body = (post.get("text_body") or "").strip()
         try:
             generated = expand_phrase_text(
                 title,
                 instruction=text_instruction,
-                previous_text=post.get("text_body") or "",
+                previous_text=previous_text_body,
             )
             text_body = (generated or "").strip() or text_body
         except Exception as e:
@@ -5944,6 +6096,8 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
             scenario = generate_image_scenario(title, text_body, scenario_instruction or "")
         except Exception:
             logger.exception("scenario_regen_failed post_id=%s", post_id)
+        if text_body.strip() and text_body.strip() != previous_text_body:
+            _remember_previous_text(post_id, post, previous_text_body)
         update_post(post_id, text_body=text_body)
         if scenario:
             update_post(post_id, selected_scenario=scenario)
@@ -6094,6 +6248,8 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
     ig_err = None
     vk_res = None
     vk_err = None
+    vk_channel_res = None
+    vk_channel_err = None
     pin_res = None
     pin_err = None
     max_res = None
@@ -6120,6 +6276,13 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
             vk_err = e.detail
         except Exception as e:
             vk_err = str(e)
+    if runtime_enable_vk_channel():
+        try:
+            vk_channel_res = vk_channel_publish_post(post)
+        except HTTPException as e:
+            vk_channel_err = e.detail
+        except Exception as e:
+            vk_channel_err = str(e)
     if runtime_enable_pinterest():
         try:
             pin_res = pinterest_publish_post(post)
@@ -6149,6 +6312,8 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
         published_channels.append("instagram")
     if vk_res:
         published_channels.append("vk")
+    if vk_channel_res:
+        published_channels.append("vk_channel")
     if pin_res:
         published_channels.append("pinterest")
     if max_res:
@@ -6167,6 +6332,9 @@ def publish_now_internal(post_id: int) -> dict[str, Any]:
         "vk": bool(vk_res),
         "vk_error": vk_err,
         "vk_result": vk_res,
+        "vk_channel": bool(vk_channel_res),
+        "vk_channel_error": vk_channel_err,
+        "vk_channel_result": vk_channel_res,
         "pinterest": bool(pin_res),
         "pinterest_error": pin_err,
         "pinterest_result": pin_res,
@@ -6218,6 +6386,8 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
         missing.extend([x for x in ["PINTEREST_ACCESS_TOKEN", "PINTEREST_BOARD_ID"] if x not in missing])
     if runtime_enable_vk() and (not runtime_vk_token() or not runtime_vk_group_id()):
         missing.extend([x for x in ["VK_ACCESS_TOKEN", "VK_GROUP_ID"] if x not in missing])
+    if runtime_enable_vk_channel() and (not (runtime_vk_channel_token() or runtime_vk_token()) or not runtime_vk_channel_group_id()):
+        missing.extend([x for x in ["VK_CHANNEL_ACCESS_TOKEN|VK_ACCESS_TOKEN", "VK_CHANNEL_GROUP_ID"] if x not in missing])
     if runtime_enable_max() and not runtime_max_publish_url():
         missing.append("MAX_PUBLISH_URL")
     if runtime_enable_ok() and not runtime_ok_publish_url():
@@ -6248,6 +6418,11 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
             "enabled": runtime_enable_vk(),
             "configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
             "needs": ["VK_ACCESS_TOKEN", "VK_GROUP_ID"],
+        },
+        "vk_channel": {
+            "enabled": runtime_enable_vk_channel(),
+            "configured": bool(runtime_enable_vk_channel() and (runtime_vk_channel_token() or runtime_vk_token()) and runtime_vk_channel_group_id()),
+            "needs": ["VK_CHANNEL_ACCESS_TOKEN|VK_ACCESS_TOKEN", "VK_CHANNEL_GROUP_ID"],
         },
         "max": {
             "enabled": runtime_enable_max(),
@@ -6301,6 +6476,17 @@ def publish_vk_endpoint(post_id: int, session_id: Optional[str] = Cookie(default
     return {"ok": True, "post_id": post_id, "vk": res}
 
 
+@app.post("/api/posts/{post_id}/publish/vk-channel")
+def publish_vk_channel_endpoint(post_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    if not runtime_enable_vk_channel():
+        raise HTTPException(status_code=503, detail="VK channel publishing temporarily disabled")
+    post = fetch_post(post_id)
+    post = ensure_phrase_post_ready_for_publish(post_id, post)
+    res = vk_channel_publish_post(post)
+    return {"ok": True, "post_id": post_id, "vk_channel": res}
+
+
 @app.post("/api/posts/{post_id}/publish/max")
 def publish_max_endpoint(post_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
@@ -6341,6 +6527,10 @@ async def publish_multi(post_id: int, request: Request, session_id: Optional[str
                 result["targets"]["telegram"] = {"ok": True, "result": tg_res}
             elif t == "vk":
                 result["targets"]["vk"] = {"ok": True, "result": vk_publish_post(post)}
+            elif t == "vk_channel":
+                if not runtime_enable_vk_channel():
+                    raise HTTPException(status_code=503, detail="VK channel disabled")
+                result["targets"]["vk_channel"] = {"ok": True, "result": vk_channel_publish_post(post)}
             elif t == "instagram":
                 if not runtime_enable_instagram():
                     raise HTTPException(status_code=503, detail="Instagram disabled")
@@ -7189,20 +7379,7 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
                 track_post_id=post_id,
             )
             return {"ok": True}
-        latest = fetch_post(post_id)
-        preview_err = None
-        try:
-            chat_id = chat.get("id")
-            # Remove previously tracked preview/progress messages to avoid duplicates.
-            cleanup_post_thread_messages_for_chat(post_id, chat_id)
-            latest = fetch_post(post_id)
-            sent = telegram_send_preview_to_chat(latest, chat_id)
-            result = (sent or {}).get("result") or {}
-            if result.get("message_id") is not None:
-                new_mid = str(result["message_id"])
-                set_preview_message_id_for_chat(post_id, latest, chat_id, new_mid)
-        except Exception as e:
-            preview_err = str(e)
+        preview_err = _resend_preview_to_chat(post_id, chat.get("id"))
         if preview_err:
             send_telegram_text(
                 chat.get("id"),
@@ -7213,6 +7390,39 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
             send_telegram_text(
                 chat.get("id"),
                 "Перегенерация выполнена. Новое превью отправлено.",
+                track_post_id=post_id,
+            )
+        return {"ok": True}
+    if st == "await_manual_text_replace":
+        if not post_id:
+            tg_state_clear(int(user_id))
+            send_telegram_text(chat.get("id"), "Не найден post_id. Начни заново с кнопок превью.")
+            return {"ok": True}
+        post = fetch_post(post_id)
+        new_text_body = extract_manual_replacement_text(post, text)
+        if not new_text_body:
+            send_telegram_text(
+                chat.get("id"),
+                "Не удалось извлечь текст для замены. Пришли только тело поста или весь пост целиком с заголовком и @kindlysupport.",
+                track_post_id=post_id,
+            )
+            return {"ok": True}
+        tg_state_clear(int(user_id))
+        _remember_previous_text(post_id, post, post.get("text_body") or "")
+        update_post(post_id, text_body=new_text_body)
+        latest = fetch_post(post_id)
+        update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
+        preview_err = _resend_preview_to_chat(post_id, chat.get("id"))
+        if preview_err:
+            send_telegram_text(
+                chat.get("id"),
+                f"Текст заменён вручную, но превью не отправилось: {preview_err[:220]}",
+                track_post_id=post_id,
+            )
+        else:
+            send_telegram_text(
+                chat.get("id"),
+                "Текст заменён вручную. Предыдущее тело поста сохранено, новое превью отправлено.",
                 track_post_id=post_id,
             )
         return {"ok": True}
@@ -7235,20 +7445,7 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True}
         tg_state_clear(int(user_id))
         await publish(post_id, _mock_request({"mode": "replace_phrase", "replacement_phrase": text}), session_id="telegram-internal")  # type: ignore[arg-type]
-        latest = fetch_post(post_id)
-        preview_err = None
-        try:
-            chat_id = chat.get("id")
-            # Remove previously tracked preview/progress messages to avoid duplicates.
-            cleanup_post_thread_messages_for_chat(post_id, chat_id)
-            latest = fetch_post(post_id)
-            sent = telegram_send_preview_to_chat(latest, chat_id)
-            result = (sent or {}).get("result") or {}
-            if result.get("message_id") is not None:
-                new_mid = str(result["message_id"])
-                set_preview_message_id_for_chat(post_id, latest, chat_id, new_mid)
-        except Exception as e:
-            preview_err = str(e)
+        preview_err = _resend_preview_to_chat(post_id, chat.get("id"))
         if preview_err:
             send_telegram_text(
                 chat.get("id"),
@@ -7646,6 +7843,61 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
                 track_post_id=post_id,
             )
         return {"ok": True}
+    if action == "edittext":
+        _delete_callback_source_message(cq)
+        tg_state_set(int(user_id), "await_manual_text_replace", {"post_id": post_id})
+        if cb_id:
+            answer_callback(cb_id, "Пришли новый текст")
+        if chat_id:
+            send_telegram_text(
+                chat_id,
+                (
+                    "Пришли текст для ручной замены.\n"
+                    "Можно отправить только тело поста.\n"
+                    "Если пришлёшь весь пост целиком, система возьмёт текст между заголовком и @kindlysupport.\n"
+                    "LLM здесь не используется."
+                ),
+                track_post_id=post_id,
+            )
+        return {"ok": True}
+    if action == "restoretext":
+        _delete_callback_source_message(cq)
+        post = fetch_post(post_id)
+        preview = _preview_payload_dict(post)
+        previous_text = str(preview.get("previous_text_body") or "").strip()
+        if not previous_text:
+            if cb_id:
+                answer_callback(cb_id, "Нет сохранённого текста")
+            if chat_id:
+                send_telegram_text(
+                    chat_id,
+                    "Для этого поста нет сохранённого предыдущего текста.",
+                    track_post_id=post_id,
+                )
+            return {"ok": True}
+        current_text = (post.get("text_body") or "").strip()
+        preview["previous_text_body"] = current_text
+        preview["previous_text_saved_at"] = now_iso()
+        update_post(post_id, text_body=previous_text, preview_payload_json=preview)
+        latest = fetch_post(post_id)
+        update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
+        preview_err = _resend_preview_to_chat(post_id, chat_id)
+        if cb_id:
+            answer_callback(cb_id, "Текст восстановлен")
+        if chat_id:
+            if preview_err:
+                send_telegram_text(
+                    chat_id,
+                    f"Предыдущий текст восстановлен, но превью не отправилось: {preview_err[:220]}",
+                    track_post_id=post_id,
+                )
+            else:
+                send_telegram_text(
+                    chat_id,
+                    "Предыдущий текст восстановлен. Текущая версия сохранена для обратного отката.",
+                    track_post_id=post_id,
+                )
+        return {"ok": True}
     if action == "regenpick":
         _delete_callback_source_message(cq)
         target = extra or "both"
@@ -7795,7 +8047,7 @@ def pricing_note(session_id: Optional[str] = Cookie(default=None, alias=SESSION_
     }
 
 
-@app.get("/{full_path:path}", response_class=HTMLResponse)
+@app.api_route("/{full_path:path}", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def spa_fallback(full_path: str) -> Any:
     if full_path.startswith("api/") or full_path in {"health"}:
         raise HTTPException(status_code=404, detail="not found")

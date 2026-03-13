@@ -30,6 +30,9 @@ export function SettingsPage() {
   const [vkEnabled, setVkEnabled] = useState(false);
   const [vkAccessToken, setVkAccessToken] = useState('');
   const [vkGroupId, setVkGroupId] = useState('');
+  const [vkChannelEnabled, setVkChannelEnabled] = useState(false);
+  const [vkChannelAccessToken, setVkChannelAccessToken] = useState('');
+  const [vkChannelGroupId, setVkChannelGroupId] = useState('');
   const [maxEnabled, setMaxEnabled] = useState(false);
   const [maxPublishUrl, setMaxPublishUrl] = useState('');
   const [maxAccessToken, setMaxAccessToken] = useState('');
@@ -77,6 +80,9 @@ export function SettingsPage() {
       setVkEnabled(Boolean(s.enable_vk));
       setVkAccessToken(s.vk_access_token || '');
       setVkGroupId(s.vk_group_id || '');
+      setVkChannelEnabled(Boolean(s.enable_vk_channel));
+      setVkChannelAccessToken(s.vk_channel_access_token || '');
+      setVkChannelGroupId(s.vk_channel_group_id || '');
       setMaxEnabled(Boolean(s.enable_max));
       setMaxPublishUrl(s.max_publish_url || '');
       setMaxAccessToken(s.max_access_token || '');
@@ -116,6 +122,8 @@ export function SettingsPage() {
         telegram_mode: telegramMode,
         enable_vk: vkEnabled,
         vk_group_id: vkGroupId,
+        enable_vk_channel: vkChannelEnabled,
+        vk_channel_group_id: vkChannelGroupId,
         enable_max: maxEnabled,
         max_publish_url: maxPublishUrl,
         max_http_header: maxHttpHeader,
@@ -135,6 +143,7 @@ export function SettingsPage() {
       if (botToken && botToken !== '***') payload.telegram_bot_token = botToken;
       if (webhookSecret && webhookSecret !== '***') payload.telegram_webhook_secret = webhookSecret;
       if (vkAccessToken && vkAccessToken !== '***') payload.vk_access_token = vkAccessToken;
+      if (vkChannelAccessToken && vkChannelAccessToken !== '***') payload.vk_channel_access_token = vkChannelAccessToken;
       if (maxAccessToken && maxAccessToken !== '***') payload.max_access_token = maxAccessToken;
       if (okAccessToken && okAccessToken !== '***') payload.ok_access_token = okAccessToken;
       if (igAccessToken && igAccessToken !== '***') payload.instagram_access_token = igAccessToken;
@@ -216,6 +225,15 @@ export function SettingsPage() {
         : readiness?.vk?.configured
           ? 'ОК'
           : `Проблема: ${missing.filter((x) => x.startsWith('VK_')).join(', ') || 'неполная конфигурация'}`,
+    },
+    {
+      name: 'VK Channel',
+      ok: !readiness?.vk_channel?.enabled || Boolean(readiness?.vk_channel?.configured),
+      detail: !readiness?.vk_channel?.enabled
+        ? 'Выключено'
+        : readiness?.vk_channel?.configured
+          ? 'ОК'
+          : `Проблема: ${Array.isArray(readiness?.vk_channel?.needs) ? readiness.vk_channel.needs.join(', ') : 'неполная конфигурация'}`,
     },
     {
       name: 'MAX',
@@ -371,6 +389,14 @@ export function SettingsPage() {
               <div className="space-y-2"><Label className="text-zinc-200">Access Token</Label><Input type="password" value={vkAccessToken} onChange={(e) => setVkAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
               <div className="space-y-2"><Label className="text-zinc-200">Group ID</Label><Input value={vkGroupId} onChange={(e) => setVkGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
             </div>
+            <Separator className="bg-zinc-800" />
+            <h3 className="text-lg font-semibold text-zinc-100">VK Канал (второе сообщество)</h3>
+            <div className="flex items-center gap-2"><input type="checkbox" checked={vkChannelEnabled} onChange={(e) => setVkChannelEnabled(e.target.checked)} /><span className="text-zinc-300">Включить VK Канал</span></div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2"><Label className="text-zinc-200">Channel Access Token (optional)</Label><Input type="password" value={vkChannelAccessToken} onChange={(e) => setVkChannelAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">Channel Group ID</Label><Input value={vkChannelGroupId} onChange={(e) => setVkChannelGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+            </div>
+            <p className="text-xs text-zinc-400">Если token канала пустой, используется основной VK token.</p>
           </Card>
         </TabsContent>
 

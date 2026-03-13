@@ -99,6 +99,7 @@ export function PublicationsPage() {
             <SelectItem value="all" className="text-zinc-200">Все каналы</SelectItem>
             <SelectItem value="telegram" className="text-zinc-200">Telegram</SelectItem>
             <SelectItem value="vk" className="text-zinc-200">VK</SelectItem>
+            <SelectItem value="vk_channel" className="text-zinc-200">VK Channel</SelectItem>
             <SelectItem value="max" className="text-zinc-200">MAX</SelectItem>
             <SelectItem value="ok" className="text-zinc-200">OK</SelectItem>
             <SelectItem value="pinterest" className="text-zinc-200">Pinterest</SelectItem>
