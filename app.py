@@ -279,6 +279,8 @@ VK_GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
 VK_CHANNEL_ACCESS_TOKEN = os.getenv("VK_CHANNEL_ACCESS_TOKEN", "").strip()
 VK_CHANNEL_GROUP_ID = os.getenv("VK_CHANNEL_GROUP_ID", "").strip()
+VK_CHANNEL_PRIVATE_CLIENT_ID = os.getenv("VK_CHANNEL_PRIVATE_CLIENT_ID", "6287487").strip()
+VK_CHANNEL_PRIVATE_API_VERSION = os.getenv("VK_CHANNEL_PRIVATE_API_VERSION", "5.274").strip()
 MAX_PUBLISH_URL = os.getenv("MAX_PUBLISH_URL", "").strip()
 MAX_ACCESS_TOKEN = os.getenv("MAX_ACCESS_TOKEN", "").strip()
 MAX_HTTP_HEADER = os.getenv("MAX_HTTP_HEADER", "Authorization").strip()
@@ -2053,17 +2055,112 @@ def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def normalize_vk_channel_id(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    match = re.search(r"-?\d+", value)
+    if not match:
+        return ""
+    digits = match.group(0).lstrip("-")
+    return f"-{digits}" if digits else ""
+
+
 def vk_channel_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     if not runtime_enable_vk_channel():
         raise HTTPException(status_code=503, detail="VK channel publishing temporarily disabled")
     token = runtime_vk_channel_token() or runtime_vk_token()
-    return vk_publish_post_to_group(
-        post,
-        vk_token=token,
-        vk_group_id=runtime_vk_channel_group_id(),
-        vk_version=runtime_vk_version(),
-        profile_label="VK channel",
-    )
+    channel_id = normalize_vk_channel_id(runtime_vk_channel_group_id())
+    wall_group_id = str(runtime_vk_group_id() or "").strip()
+    if not token or not channel_id or not wall_group_id:
+        raise HTTPException(status_code=400, detail="VK channel credentials not configured")
+    if not post.get("final_image_url"):
+        raise HTTPException(status_code=400, detail="Post has no final_image_url")
+    caption = generate_post_caption_plain(post)[:3500]
+    media_key = media_key_from_url(str(post["final_image_url"]))
+    if media_key:
+        try:
+            image_bytes, _ = storage_get_bytes(media_key)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"VK channel image read failed: {str(e)[:800]}")
+    else:
+        try:
+            image_bytes, _ = download_remote_image(str(post["final_image_url"]))
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"VK channel image download failed: {str(e)[:800]}")
+    try:
+        upload = vk_api_call(
+            "photos.getWallUploadServer",
+            {
+                "group_id": wall_group_id,
+                "client_id": VK_CHANNEL_PRIVATE_CLIENT_ID,
+            },
+            vk_token=token,
+            vk_version=VK_CHANNEL_PRIVATE_API_VERSION,
+        )
+        upload_url = str((upload or {}).get("upload_url") or "").strip()
+        if not upload_url:
+            raise HTTPException(status_code=502, detail="VK channel upload server URL is empty")
+        upload_res = vk_upload_photo(upload_url, image_bytes, filename=f"channel_post_{post.get('id') or 'x'}.jpg")
+        saved = vk_api_call(
+            "photos.saveWallPhoto",
+            {
+                "group_id": wall_group_id,
+                "photo": upload_res.get("photo"),
+                "server": upload_res.get("server"),
+                "hash": upload_res.get("hash"),
+                "client_id": VK_CHANNEL_PRIVATE_CLIENT_ID,
+            },
+            vk_token=token,
+            vk_version=VK_CHANNEL_PRIVATE_API_VERSION,
+        )
+        if not isinstance(saved, list) or not saved:
+            raise HTTPException(status_code=502, detail="VK channel saveWallPhoto returned empty list")
+        photo = saved[0] if isinstance(saved[0], dict) else {}
+        owner_id = photo.get("owner_id")
+        photo_id = photo.get("id")
+        if owner_id is None or photo_id is None:
+            raise HTTPException(status_code=502, detail="VK channel saveWallPhoto missing owner_id/id")
+        attachment = f"photo{owner_id}_{photo_id}"
+        send_res = vk_api_call(
+            "channels.sendMessage",
+            {
+                "client_id": VK_CHANNEL_PRIVATE_CLIENT_ID,
+                "channel_id": channel_id,
+                "message": caption,
+                "attachments": attachment,
+                "close_comments": 0,
+                "mark_as_ads": 0,
+                "mute_notifications": 0,
+                "signed": 0,
+                "guid": str(uuid4()),
+            },
+            vk_token=token,
+            vk_version=VK_CHANNEL_PRIVATE_API_VERSION,
+        )
+        return {
+            "channel_send": send_res,
+            "attachment": attachment,
+            "photo": photo,
+            "channel_id": channel_id,
+            "wall_group_id": wall_group_id,
+            "mode": "channel_private_api",
+        }
+    except HTTPException as e:
+        detail = str(e.detail or "")
+        if (
+            "photos.getWallUploadServer" in detail
+            or "photos.saveWallPhoto" in detail
+            or "channels.sendMessage" in detail
+        ) and "Group authorization" in detail:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "VK channel requires a user token from the account that can publish into the community channel. "
+                    "A community token is not sufficient for the private channel API flow."
+                ),
+            )
+        raise
 
 
 def max_publish_post(post: dict[str, Any]) -> dict[str, Any]:
@@ -6553,8 +6650,12 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
         missing.extend([x for x in ["PINTEREST_ACCESS_TOKEN", "PINTEREST_BOARD_ID"] if x not in missing])
     if runtime_enable_vk() and (not runtime_vk_token() or not runtime_vk_group_id()):
         missing.extend([x for x in ["VK_ACCESS_TOKEN", "VK_GROUP_ID"] if x not in missing])
-    if runtime_enable_vk_channel() and (not (runtime_vk_channel_token() or runtime_vk_token()) or not runtime_vk_channel_group_id()):
-        missing.extend([x for x in ["VK_CHANNEL_ACCESS_TOKEN|VK_ACCESS_TOKEN", "VK_CHANNEL_GROUP_ID"] if x not in missing])
+    if runtime_enable_vk_channel() and (
+        not (runtime_vk_channel_token() or runtime_vk_token())
+        or not runtime_vk_channel_group_id()
+        or not runtime_vk_group_id()
+    ):
+        missing.extend([x for x in ["VK_CHANNEL_ACCESS_TOKEN|VK_ACCESS_TOKEN", "VK_CHANNEL_GROUP_ID", "VK_GROUP_ID"] if x not in missing])
     if runtime_enable_max() and not runtime_max_publish_url():
         missing.append("MAX_PUBLISH_URL")
     if runtime_enable_ok() and not runtime_ok_publish_url():
@@ -6588,8 +6689,13 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
         },
         "vk_channel": {
             "enabled": runtime_enable_vk_channel(),
-            "configured": bool(runtime_enable_vk_channel() and (runtime_vk_channel_token() or runtime_vk_token()) and runtime_vk_channel_group_id()),
-            "needs": ["VK_CHANNEL_ACCESS_TOKEN|VK_ACCESS_TOKEN", "VK_CHANNEL_GROUP_ID"],
+            "configured": bool(
+                runtime_enable_vk_channel()
+                and (runtime_vk_channel_token() or runtime_vk_token())
+                and runtime_vk_channel_group_id()
+                and runtime_vk_group_id()
+            ),
+            "needs": ["VK_CHANNEL_ACCESS_TOKEN|VK_ACCESS_TOKEN", "VK_CHANNEL_GROUP_ID", "VK_GROUP_ID"],
         },
         "max": {
             "enabled": runtime_enable_max(),
