@@ -7,6 +7,7 @@ import { GeneratePostPage } from "./pages/GeneratePostPage";
 import { ParablesPage } from "./pages/ParablesPage";
 import { MoviesPage } from "./pages/MoviesPage";
 import { PublicationsPage } from "./pages/PublicationsPage";
+import { PostDetailsPage } from "./pages/PostDetailsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { NotFound } from "./pages/NotFound";
 
@@ -26,6 +27,7 @@ export const router = createBrowserRouter([
       { path: "parables", Component: ParablesPage },
       { path: "movies", Component: MoviesPage },
       { path: "publications", Component: PublicationsPage },
+      { path: "publications/:postId", Component: PostDetailsPage },
       { path: "settings", Component: SettingsPage },
       { path: "*", Component: NotFound },
     ],

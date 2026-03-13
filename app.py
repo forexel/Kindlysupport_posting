@@ -2932,6 +2932,22 @@ def _resend_preview_to_chat(post_id: int, chat_id: str | int) -> Optional[str]:
         return str(e)
 
 
+def _store_uploaded_image_data_url(post_id: int, image_data_url: str) -> str:
+    raw = (image_data_url or "").strip()
+    dm = re.match(r"^data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$", raw)
+    if not dm:
+        raise HTTPException(status_code=400, detail="image_data_url must be a data:image/* base64 URL")
+    try:
+        image_bytes = base64.b64decode(dm.group(2), validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid base64 image payload")
+    mime_map = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg", "webp": "image/webp"}
+    detected_mime = mime_map.get(dm.group(1).lower(), "image/jpeg")
+    normalized_bytes, normalized_ctype = normalize_image_to_square_1024(image_bytes, detected_mime)
+    key = f"original/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/manual_post_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
+    return storage_put_bytes(key, normalized_bytes, normalized_ctype)
+
+
 def generate_post_caption_markdown_limited(post: dict[str, Any], max_len: int = 1024) -> str:
     source_kind = (post.get("source_kind") or "").strip()
     title = (post.get("title") or "").strip()
@@ -5843,6 +5859,7 @@ def get_post(post_id: int, session_id: Optional[str] = Cookie(default=None, alia
 @app.put("/api/posts/{post_id}")
 async def update_post_text(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     ensure_auth(session_id)
+    post = fetch_post(post_id)
     payload = await request.json()
     updates = {}
     for key in ("title", "text_body"):
@@ -5850,7 +5867,37 @@ async def update_post_text(post_id: int, request: Request, session_id: Optional[
             updates[key] = (payload.get(key) or "").strip()
     if not updates:
         raise HTTPException(status_code=400, detail="nothing to update")
+    next_text = updates.get("text_body")
+    if next_text is not None and next_text != (post.get("text_body") or ""):
+        _remember_previous_text(post_id, post, post.get("text_body") or "")
     update_post(post_id, **updates)
+    latest = fetch_post(post_id)
+    update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
+    return fetch_post(post_id)
+
+
+@app.post("/api/posts/{post_id}/upload-image")
+async def upload_post_image(post_id: int, request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    post = fetch_post(post_id)
+    payload = await request.json()
+    image_data_url = (payload.get("image_data_url") or "").strip()
+    if not image_data_url:
+        raise HTTPException(status_code=400, detail="image_data_url required")
+    original_image_url = _store_uploaded_image_data_url(post_id, image_data_url)
+    final_image_url = original_image_url
+    if post.get("source_kind") == "phrase":
+        final_image_url = render_phrase_card_image(str(post.get("title") or ""), original_image_url)
+    preview = _preview_payload_dict(post).copy()
+    preview["original_image_url"] = original_image_url
+    preview["base_image_url"] = original_image_url
+    preview["image_error"] = None
+    preview["image_uploaded_manually_at"] = now_iso()
+    update_post(
+        post_id,
+        final_image_url=final_image_url,
+        preview_payload_json=preview,
+    )
     return fetch_post(post_id)
 
 
