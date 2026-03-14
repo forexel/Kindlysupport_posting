@@ -28,10 +28,14 @@ export function SettingsPage() {
   const [telegramMode, setTelegramMode] = useState<'webhook' | 'polling'>('webhook');
 
   const [vkEnabled, setVkEnabled] = useState(false);
-  const [vkAccessToken, setVkAccessToken] = useState('');
   const [vkGroupId, setVkGroupId] = useState('');
+  const [vkOauthClientId, setVkOauthClientId] = useState('');
+  const [vkOauthClientSecret, setVkOauthClientSecret] = useState('');
+  const [vkOauthScope, setVkOauthScope] = useState('wall photos groups');
+  const [vkOauthRedirectUri, setVkOauthRedirectUri] = useState('');
+  const [vkAuthStatus, setVkAuthStatus] = useState<any>(null);
+  const [vkAuthLoading, setVkAuthLoading] = useState(false);
   const [vkChannelEnabled, setVkChannelEnabled] = useState(false);
-  const [vkChannelAccessToken, setVkChannelAccessToken] = useState('');
   const [vkChannelGroupId, setVkChannelGroupId] = useState('');
   const [maxEnabled, setMaxEnabled] = useState(false);
   const [maxPublishUrl, setMaxPublishUrl] = useState('');
@@ -78,10 +82,13 @@ export function SettingsPage() {
       setWebhookSecret(s.telegram_webhook_secret || '');
       setTelegramMode(s.telegram_mode === 'polling' ? 'polling' : 'webhook');
       setVkEnabled(Boolean(s.enable_vk));
-      setVkAccessToken(s.vk_access_token || '');
       setVkGroupId(s.vk_group_id || '');
+      setVkOauthClientId(s.vk_oauth_client_id || '');
+      setVkOauthClientSecret(s.vk_oauth_client_secret || '');
+      setVkOauthScope(s.vk_oauth_scope || 'wall photos groups');
+      setVkOauthRedirectUri(s.vk_oauth_redirect_uri || '');
+      setVkAuthStatus(s.vk_auth || null);
       setVkChannelEnabled(Boolean(s.enable_vk_channel));
-      setVkChannelAccessToken(s.vk_channel_access_token || '');
       setVkChannelGroupId(s.vk_channel_group_id || '');
       setMaxEnabled(Boolean(s.enable_max));
       setMaxPublishUrl(s.max_publish_url || '');
@@ -109,6 +116,24 @@ export function SettingsPage() {
 
   useEffect(() => { load(); }, []);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const status = params.get('vk_oauth');
+    const message = params.get('vk_oauth_message');
+    if (!status) return;
+    if (status === 'success') {
+      toast.success('VK авторизация завершена');
+      load();
+      loadReadiness(false);
+    } else {
+      toast.error(message || 'VK авторизация не завершилась');
+    }
+    params.delete('vk_oauth');
+    params.delete('vk_oauth_message');
+    const next = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}`;
+    window.history.replaceState({}, '', next);
+  }, []);
+
   const handleSave = async () => {
     setSaving(true);
     try {
@@ -122,6 +147,8 @@ export function SettingsPage() {
         telegram_mode: telegramMode,
         enable_vk: vkEnabled,
         vk_group_id: vkGroupId,
+        vk_oauth_client_id: vkOauthClientId,
+        vk_oauth_scope: vkOauthScope,
         enable_vk_channel: vkChannelEnabled,
         vk_channel_group_id: vkChannelGroupId,
         enable_max: maxEnabled,
@@ -142,8 +169,7 @@ export function SettingsPage() {
       if (apiKey && apiKey !== '***') payload.openrouter_api_key = apiKey;
       if (botToken && botToken !== '***') payload.telegram_bot_token = botToken;
       if (webhookSecret && webhookSecret !== '***') payload.telegram_webhook_secret = webhookSecret;
-      if (vkAccessToken && vkAccessToken !== '***') payload.vk_access_token = vkAccessToken;
-      if (vkChannelAccessToken && vkChannelAccessToken !== '***') payload.vk_channel_access_token = vkChannelAccessToken;
+      if (vkOauthClientSecret && vkOauthClientSecret !== '***') payload.vk_oauth_client_secret = vkOauthClientSecret;
       if (maxAccessToken && maxAccessToken !== '***') payload.max_access_token = maxAccessToken;
       if (okAccessToken && okAccessToken !== '***') payload.ok_access_token = okAccessToken;
       if (igAccessToken && igAccessToken !== '***') payload.instagram_access_token = igAccessToken;
@@ -190,6 +216,30 @@ export function SettingsPage() {
     try {
       await api('/api/telegram/set-webhook', 'POST', { public_url: webhookUrl });
       toast.success('Webhook установлен');
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    }
+  };
+
+  const handleVkAuthorize = async () => {
+    setVkAuthLoading(true);
+    try {
+      const res = await api<{ authorize_url: string }>('/api/vk/oauth/start', 'POST', {});
+      if (!res.authorize_url) throw new Error('VK authorize_url не получен');
+      window.location.href = res.authorize_url;
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setVkAuthLoading(false);
+    }
+  };
+
+  const handleVkDisconnect = async () => {
+    try {
+      await api('/api/vk/oauth/disconnect', 'POST', {});
+      toast.success('VK авторизация сброшена');
+      await load();
+      await loadReadiness(false);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
@@ -386,17 +436,44 @@ export function SettingsPage() {
             <h2 className="text-xl font-semibold text-zinc-50">VK</h2>
             <div className="flex items-center gap-2"><input type="checkbox" checked={vkEnabled} onChange={(e) => setVkEnabled(e.target.checked)} /><span className="text-zinc-300">Включить VK</span></div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="space-y-2"><Label className="text-zinc-200">Access Token</Label><Input type="password" value={vkAccessToken} onChange={(e) => setVkAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
               <div className="space-y-2"><Label className="text-zinc-200">Group ID</Label><Input value={vkGroupId} onChange={(e) => setVkGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">VK App ID</Label><Input value={vkOauthClientId} onChange={(e) => setVkOauthClientId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2"><Label className="text-zinc-200">VK App Secret / Protected Key</Label><Input type="password" value={vkOauthClientSecret} onChange={(e) => setVkOauthClientSecret(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">OAuth Scope</Label><Input value={vkOauthScope} onChange={(e) => setVkOauthScope(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-zinc-200">Redirect URI</Label>
+              <Input value={vkOauthRedirectUri} readOnly className="bg-zinc-950 border-zinc-800 text-zinc-400" />
+            </div>
+            <div className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4 space-y-2">
+              <div className="text-sm text-zinc-200">Статус авторизации VK</div>
+              <div className="text-sm text-zinc-400">
+                {vkAuthStatus?.connected ? 'Подключено' : 'Не подключено'}
+                {vkAuthStatus?.source ? `, источник: ${vkAuthStatus.source}` : ''}
+                {vkAuthStatus?.user_id ? `, user_id: ${vkAuthStatus.user_id}` : ''}
+              </div>
+              <div className="text-xs text-zinc-500">
+                {vkAuthStatus?.expires_at ? `Access token истекает: ${vkAuthStatus.expires_at}` : 'Срок действия access token пока неизвестен'}
+                {vkAuthStatus?.has_refresh_token ? ', refresh token сохранен' : ', refresh token не сохранен'}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={handleVkAuthorize} disabled={vkAuthLoading} variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700">
+                  {vkAuthLoading ? 'Перенаправление...' : 'Авторизоваться через VK'}
+                </Button>
+                <Button onClick={handleVkDisconnect} variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700">
+                  Сбросить VK авторизацию
+                </Button>
+              </div>
             </div>
             <Separator className="bg-zinc-800" />
-            <h3 className="text-lg font-semibold text-zinc-100">VK Канал (второе сообщество)</h3>
+            <h3 className="text-lg font-semibold text-zinc-100">VK Канал</h3>
             <div className="flex items-center gap-2"><input type="checkbox" checked={vkChannelEnabled} onChange={(e) => setVkChannelEnabled(e.target.checked)} /><span className="text-zinc-300">Включить VK Канал</span></div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="space-y-2"><Label className="text-zinc-200">Channel Access Token (optional)</Label><Input type="password" value={vkChannelAccessToken} onChange={(e) => setVkChannelAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
-              <div className="space-y-2"><Label className="text-zinc-200">Channel Group ID</Label><Input value={vkChannelGroupId} onChange={(e) => setVkChannelGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
+              <div className="space-y-2"><Label className="text-zinc-200">Channel ID</Label><Input value={vkChannelGroupId} onChange={(e) => setVkChannelGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
             </div>
-            <p className="text-xs text-zinc-400">Если token канала пустой, используется основной VK token.</p>
+            <p className="text-xs text-zinc-400">Канал использует ту же VK OAuth-сессию, что и основная публикация в сообщество. Отдельный токен для канала больше не нужен.</p>
           </Card>
         </TabsContent>
 

@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import re
+import hashlib
 import difflib
 import secrets
 import sqlite3
@@ -18,7 +19,7 @@ import binascii
 import textwrap
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Optional
 from uuid import uuid4
 from pathlib import Path
@@ -277,6 +278,12 @@ TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "@ForCreatingTestsBot
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "").strip()
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199").strip()
+VK_OAUTH_CLIENT_ID = os.getenv("VK_OAUTH_CLIENT_ID", "").strip()
+VK_OAUTH_CLIENT_SECRET = os.getenv("VK_OAUTH_CLIENT_SECRET", "").strip()
+VK_OAUTH_SCOPE = os.getenv("VK_OAUTH_SCOPE", "wall photos groups").strip()
+VK_OAUTH_AUTHORIZE_URL = os.getenv("VK_OAUTH_AUTHORIZE_URL", "https://id.vk.com/authorize").strip()
+VK_OAUTH_TOKEN_URL = os.getenv("VK_OAUTH_TOKEN_URL", "https://id.vk.ru/oauth2/auth").strip()
+VK_OAUTH_REDIRECT_URI = os.getenv("VK_OAUTH_REDIRECT_URI", "").strip()
 VK_CHANNEL_ACCESS_TOKEN = os.getenv("VK_CHANNEL_ACCESS_TOKEN", "").strip()
 VK_CHANNEL_GROUP_ID = os.getenv("VK_CHANNEL_GROUP_ID", "").strip()
 VK_CHANNEL_PRIVATE_CLIENT_ID = os.getenv("VK_CHANNEL_PRIVATE_CLIENT_ID", "6287487").strip()
@@ -308,6 +315,7 @@ SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Moscow").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").strip()
 APP_SECURE_COOKIES = os.getenv("APP_SECURE_COOKIES", "0").strip() in {"1", "true", "yes"}
+VK_TOKEN_REFRESH_LOCK = Lock()
 
 
 def _build_trusted_hosts(app_base_url: str, env_hosts: str) -> list[str]:
@@ -701,6 +709,11 @@ def kv_set(key: str, value: str) -> None:
             )
 
 
+def kv_delete(key: str) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM app_kv WHERE key = ?", (key,))
+
+
 def settings_key(name: str) -> str:
     return f"setting:{name}"
 
@@ -841,12 +854,51 @@ def runtime_vk_token() -> str:
     return setting_get("vk_access_token", VK_ACCESS_TOKEN)
 
 
+def runtime_vk_refresh_token() -> str:
+    return setting_get("vk_refresh_token", "").strip()
+
+
+def runtime_vk_token_expires_at() -> str:
+    return setting_get("vk_token_expires_at", "").strip()
+
+
+def runtime_vk_user_id() -> str:
+    return setting_get("vk_user_id", "").strip()
+
+
 def runtime_vk_group_id() -> str:
     return setting_get("vk_group_id", VK_GROUP_ID)
 
 
 def runtime_vk_version() -> str:
     return setting_get("vk_api_version", VK_API_VERSION)
+
+
+def runtime_vk_oauth_client_id() -> str:
+    return setting_get("vk_oauth_client_id", VK_OAUTH_CLIENT_ID).strip()
+
+
+def runtime_vk_oauth_client_secret() -> str:
+    return setting_get("vk_oauth_client_secret", VK_OAUTH_CLIENT_SECRET).strip()
+
+
+def runtime_vk_oauth_scope() -> str:
+    return setting_get("vk_oauth_scope", VK_OAUTH_SCOPE).strip() or "wall photos groups"
+
+
+def runtime_vk_oauth_authorize_url() -> str:
+    return setting_get("vk_oauth_authorize_url", VK_OAUTH_AUTHORIZE_URL).strip() or "https://id.vk.com/authorize"
+
+
+def runtime_vk_oauth_token_url() -> str:
+    return setting_get("vk_oauth_token_url", VK_OAUTH_TOKEN_URL).strip() or "https://id.vk.ru/oauth2/auth"
+
+
+def runtime_vk_oauth_redirect_uri() -> str:
+    stored = setting_get("vk_oauth_redirect_uri", VK_OAUTH_REDIRECT_URI).strip()
+    if stored:
+        return stored
+    return f"{APP_BASE_URL.rstrip('/')}/api/vk/oauth/callback"
 
 
 def runtime_vk_channel_token() -> str:
@@ -949,8 +1001,18 @@ def bootstrap_runtime_settings() -> None:
         "pinterest_access_token": PINTEREST_ACCESS_TOKEN,
         "pinterest_board_id": PINTEREST_BOARD_ID,
         "vk_access_token": VK_ACCESS_TOKEN,
+        "vk_refresh_token": "",
+        "vk_token_expires_at": "",
+        "vk_user_id": "",
+        "vk_device_id": "",
         "vk_group_id": VK_GROUP_ID,
         "vk_api_version": VK_API_VERSION,
+        "vk_oauth_client_id": VK_OAUTH_CLIENT_ID,
+        "vk_oauth_client_secret": VK_OAUTH_CLIENT_SECRET,
+        "vk_oauth_scope": VK_OAUTH_SCOPE,
+        "vk_oauth_authorize_url": VK_OAUTH_AUTHORIZE_URL,
+        "vk_oauth_token_url": VK_OAUTH_TOKEN_URL,
+        "vk_oauth_redirect_uri": VK_OAUTH_REDIRECT_URI,
         "vk_channel_access_token": VK_CHANNEL_ACCESS_TOKEN,
         "vk_channel_group_id": VK_CHANNEL_GROUP_ID,
         "max_publish_url": MAX_PUBLISH_URL,
@@ -1885,6 +1947,156 @@ def pinterest_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     return res
 
 
+def urlencoded_json_request(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int = 30,
+    headers: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    body = urllib.parse.urlencode(payload, doseq=True).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=502, detail=f"HTTP {e.code}: {detail[:1200]}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"HTTP request failed: {str(e)[:800]}")
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        raise HTTPException(status_code=502, detail="HTTP request returned invalid JSON")
+
+
+def _vk_oauth_state_key(state: str) -> str:
+    return f"vk_oauth_state:{state}"
+
+
+def _vk_pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _parse_iso_dt(value: str) -> Optional[datetime]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
+
+
+def vk_oauth_is_configured() -> bool:
+    return bool(runtime_vk_oauth_client_id() and runtime_vk_oauth_authorize_url() and runtime_vk_oauth_token_url())
+
+
+def vk_store_tokens(token_data: dict[str, Any]) -> None:
+    access_token = str(token_data.get("access_token") or "").strip()
+    refresh_token = str(token_data.get("refresh_token") or "").strip()
+    expires_in = int(token_data.get("expires_in") or 0)
+    user_id = str(token_data.get("user_id") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=502, detail="VK OAuth token response has no access_token")
+    expires_at = ""
+    if expires_in > 0:
+        expires_at = (datetime.now(tz=UTC) + timedelta(seconds=expires_in)).isoformat()
+    setting_set("vk_access_token", access_token)
+    if refresh_token:
+        setting_set("vk_refresh_token", refresh_token)
+    if expires_at:
+        setting_set("vk_token_expires_at", expires_at)
+    else:
+        setting_set("vk_token_expires_at", "")
+    if user_id:
+        setting_set("vk_user_id", user_id)
+    setting_set("vk_channel_access_token", "")
+
+
+def vk_token_status() -> dict[str, Any]:
+    access_token = runtime_vk_token()
+    refresh_token = runtime_vk_refresh_token()
+    expires_at = runtime_vk_token_expires_at()
+    expires_dt = _parse_iso_dt(expires_at)
+    now = datetime.now(tz=UTC)
+    expires_in_sec = int((expires_dt - now).total_seconds()) if expires_dt else None
+    return {
+        "connected": bool(access_token or refresh_token),
+        "has_refresh_token": bool(refresh_token),
+        "user_id": runtime_vk_user_id() or None,
+        "expires_at": expires_at or None,
+        "expires_in_sec": expires_in_sec,
+        "source": "oauth" if refresh_token else ("manual" if access_token else "none"),
+        "oauth_configured": vk_oauth_is_configured(),
+        "redirect_uri": runtime_vk_oauth_redirect_uri(),
+    }
+
+
+def vk_refresh_access_token_if_needed(force: bool = False) -> str:
+    token = runtime_vk_token()
+    refresh_token = runtime_vk_refresh_token()
+    expires_dt = _parse_iso_dt(runtime_vk_token_expires_at())
+    if not refresh_token or not vk_oauth_is_configured():
+        return token
+    now = datetime.now(tz=UTC)
+    if not force and token and expires_dt and expires_dt > now + timedelta(minutes=10):
+        return token
+    with VK_TOKEN_REFRESH_LOCK:
+        token = runtime_vk_token()
+        refresh_token = runtime_vk_refresh_token()
+        expires_dt = _parse_iso_dt(runtime_vk_token_expires_at())
+        if not refresh_token:
+            return token
+        if not force and token and expires_dt and expires_dt > datetime.now(tz=UTC) + timedelta(minutes=10):
+            return token
+        payload: dict[str, Any] = {
+            "grant_type": "refresh_token",
+            "client_id": runtime_vk_oauth_client_id(),
+            "refresh_token": refresh_token,
+        }
+        client_secret = runtime_vk_oauth_client_secret()
+        if client_secret:
+            payload["client_secret"] = client_secret
+        device_id = setting_get("vk_device_id", "").strip()
+        if device_id:
+            payload["device_id"] = device_id
+        res = urlencoded_json_request(runtime_vk_oauth_token_url(), payload, timeout=40)
+        if res.get("error"):
+            raise HTTPException(status_code=502, detail=f"VK OAuth refresh failed: {res.get('error_description') or res.get('error')}")
+        vk_store_tokens(res)
+        return runtime_vk_token()
+
+
+def vk_exchange_code_for_tokens(code: str, verifier: str, device_id: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "grant_type": "authorization_code",
+        "client_id": runtime_vk_oauth_client_id(),
+        "redirect_uri": runtime_vk_oauth_redirect_uri(),
+        "code": code,
+        "code_verifier": verifier,
+    }
+    client_secret = runtime_vk_oauth_client_secret()
+    if client_secret:
+        payload["client_secret"] = client_secret
+    if device_id:
+        payload["device_id"] = device_id
+    res = urlencoded_json_request(runtime_vk_oauth_token_url(), payload, timeout=40)
+    if res.get("error"):
+        raise HTTPException(status_code=502, detail=f"VK OAuth code exchange failed: {res.get('error_description') or res.get('error')}")
+    vk_store_tokens(res)
+    if device_id:
+        setting_set("vk_device_id", device_id)
+    return res
+
+
 def vk_api_call(
     method: str,
     params: dict[str, Any],
@@ -2046,9 +2258,10 @@ def vk_publish_post_to_group(
 def vk_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     if not runtime_enable_vk():
         raise HTTPException(status_code=503, detail="VK publishing temporarily disabled")
+    token = vk_refresh_access_token_if_needed()
     return vk_publish_post_to_group(
         post,
-        vk_token=runtime_vk_token(),
+        vk_token=token,
         vk_group_id=runtime_vk_group_id(),
         vk_version=runtime_vk_version(),
         profile_label="VK",
@@ -2069,7 +2282,7 @@ def normalize_vk_channel_id(raw: Any) -> str:
 def vk_channel_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     if not runtime_enable_vk_channel():
         raise HTTPException(status_code=503, detail="VK channel publishing temporarily disabled")
-    token = runtime_vk_channel_token() or runtime_vk_token()
+    token = vk_refresh_access_token_if_needed() or runtime_vk_channel_token()
     channel_id = normalize_vk_channel_id(runtime_vk_channel_group_id())
     wall_group_id = str(runtime_vk_group_id() or "").strip()
     if not token or not channel_id or not wall_group_id:
@@ -5789,8 +6002,8 @@ def get_config(session_id: Optional[str] = Cookie(default=None, alias=SESSION_CO
         "timezone": APP_TIMEZONE,
         "instagram_configured": runtime_instagram_configured(),
         "pinterest_configured": bool(runtime_enable_pinterest() and runtime_pinterest_token() and runtime_pinterest_board_id()),
-        "vk_configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
-        "vk_channel_configured": bool(runtime_enable_vk_channel() and (runtime_vk_channel_token() or runtime_vk_token()) and runtime_vk_channel_group_id()),
+        "vk_configured": bool(runtime_enable_vk() and (runtime_vk_token() or runtime_vk_refresh_token()) and runtime_vk_group_id()),
+        "vk_channel_configured": bool(runtime_enable_vk_channel() and (runtime_vk_channel_token() or runtime_vk_token() or runtime_vk_refresh_token()) and runtime_vk_channel_group_id()),
         "max_configured": bool(runtime_enable_max() and runtime_max_publish_url()),
         "ok_configured": bool(runtime_enable_ok() and runtime_ok_publish_url()),
     }
@@ -5816,8 +6029,18 @@ def get_settings(session_id: Optional[str] = Cookie(default=None, alias=SESSION_
         "telegram_mode": runtime_telegram_mode(),
         "enable_vk": runtime_enable_vk(),
         "vk_access_token": "***" if runtime_vk_token() else "",
+        "vk_refresh_token": "***" if runtime_vk_refresh_token() else "",
+        "vk_token_expires_at": runtime_vk_token_expires_at(),
+        "vk_user_id": runtime_vk_user_id(),
         "vk_group_id": runtime_vk_group_id(),
         "vk_api_version": runtime_vk_version(),
+        "vk_oauth_client_id": runtime_vk_oauth_client_id(),
+        "vk_oauth_client_secret": "***" if runtime_vk_oauth_client_secret() else "",
+        "vk_oauth_scope": runtime_vk_oauth_scope(),
+        "vk_oauth_authorize_url": runtime_vk_oauth_authorize_url(),
+        "vk_oauth_token_url": runtime_vk_oauth_token_url(),
+        "vk_oauth_redirect_uri": runtime_vk_oauth_redirect_uri(),
+        "vk_auth": vk_token_status(),
         "enable_vk_channel": runtime_enable_vk_channel(),
         "vk_channel_access_token": "***" if runtime_vk_channel_token() else "",
         "vk_channel_group_id": runtime_vk_channel_group_id(),
@@ -5865,8 +6088,18 @@ async def update_settings(request: Request, session_id: Optional[str] = Cookie(d
         "telegram_mode",
         "enable_vk",
         "vk_access_token",
+        "vk_refresh_token",
+        "vk_token_expires_at",
+        "vk_user_id",
+        "vk_device_id",
         "vk_group_id",
         "vk_api_version",
+        "vk_oauth_client_id",
+        "vk_oauth_client_secret",
+        "vk_oauth_scope",
+        "vk_oauth_authorize_url",
+        "vk_oauth_token_url",
+        "vk_oauth_redirect_uri",
         "enable_vk_channel",
         "vk_channel_access_token",
         "vk_channel_group_id",
@@ -5939,6 +6172,102 @@ async def update_settings(request: Request, session_id: Optional[str] = Cookie(d
         setting_set("openrouter_vision_model", LOCKED_OPENROUTER_VISION_MODEL)
         setting_set("openrouter_image_model", LOCKED_OPENROUTER_IMAGE_MODEL)
     return {"ok": True, "updated": updated, "blocked": blocked, "models_locked": LOCK_PROVIDER_MODELS}
+
+
+@app.post("/api/vk/oauth/start")
+async def vk_oauth_start(
+    request: Request,
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    ensure_auth(session_id)
+    if not vk_oauth_is_configured():
+        raise HTTPException(status_code=400, detail="VK OAuth not configured: set VK app id/secret first")
+    verifier = base64.urlsafe_b64encode(os.urandom(48)).decode("ascii").rstrip("=")
+    state = secrets.token_urlsafe(24)
+    challenge = _vk_pkce_challenge(verifier)
+    expires_at = (datetime.now(tz=UTC) + timedelta(minutes=15)).isoformat()
+    kv_set(
+        _vk_oauth_state_key(state),
+        json.dumps(
+            {
+                "verifier": verifier,
+                "expires_at": expires_at,
+                "session_id": session_id or "",
+            },
+            ensure_ascii=False,
+        ),
+    )
+    params = {
+        "response_type": "code",
+        "client_id": runtime_vk_oauth_client_id(),
+        "redirect_uri": runtime_vk_oauth_redirect_uri(),
+        "scope": runtime_vk_oauth_scope(),
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    authorize_url = f"{runtime_vk_oauth_authorize_url()}?{urllib.parse.urlencode(params)}"
+    return {"ok": True, "authorize_url": authorize_url}
+
+
+@app.post("/api/vk/oauth/disconnect")
+async def vk_oauth_disconnect(
+    request: Request,
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    ensure_auth(session_id)
+    for key in [
+        "vk_access_token",
+        "vk_refresh_token",
+        "vk_token_expires_at",
+        "vk_user_id",
+        "vk_device_id",
+        "vk_channel_access_token",
+    ]:
+        setting_set(key, "")
+    return {"ok": True}
+
+
+@app.get("/api/vk/oauth/callback", response_class=HTMLResponse)
+def vk_oauth_callback(
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    device_id: str = Query(default=""),
+    error: str = Query(default=""),
+    error_description: str = Query(default=""),
+) -> HTMLResponse:
+    redirect_base = "/settings"
+
+    def _redirect_with_params(**params: str) -> HTMLResponse:
+        qs = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+        target = f"{redirect_base}?{qs}" if qs else redirect_base
+        html = f"""<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url={target}"></head><body><script>window.location.replace({json.dumps(target)});</script></body></html>"""
+        return HTMLResponse(html)
+
+    if error:
+        return _redirect_with_params(vk_oauth="error", vk_oauth_message=error_description or error)
+    raw = kv_get(_vk_oauth_state_key(state))
+    if not raw:
+        return _redirect_with_params(vk_oauth="error", vk_oauth_message="VK OAuth state not found or expired")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        kv_delete(_vk_oauth_state_key(state))
+        return _redirect_with_params(vk_oauth="error", vk_oauth_message="VK OAuth state is invalid")
+    expires_at = _parse_iso_dt(str(data.get("expires_at") or ""))
+    if not code or not state or not data.get("verifier") or not expires_at or expires_at <= datetime.now(tz=UTC):
+        kv_delete(_vk_oauth_state_key(state))
+        return _redirect_with_params(vk_oauth="error", vk_oauth_message="VK OAuth code is missing or expired")
+    try:
+        vk_exchange_code_for_tokens(code, str(data.get("verifier") or ""), device_id=device_id)
+    except HTTPException as e:
+        kv_delete(_vk_oauth_state_key(state))
+        return _redirect_with_params(vk_oauth="error", vk_oauth_message=str(e.detail or "VK OAuth failed"))
+    except Exception as e:
+        kv_delete(_vk_oauth_state_key(state))
+        return _redirect_with_params(vk_oauth="error", vk_oauth_message=str(e))
+    kv_delete(_vk_oauth_state_key(state))
+    return _redirect_with_params(vk_oauth="success")
 
 
 @app.post("/api/posts")
@@ -6670,7 +6999,7 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
         missing.extend([x for x in runtime_instagram_needs() if x not in missing])
     if runtime_enable_pinterest() and (not runtime_pinterest_token() or not runtime_pinterest_board_id()):
         missing.extend([x for x in ["PINTEREST_ACCESS_TOKEN", "PINTEREST_BOARD_ID"] if x not in missing])
-    if runtime_enable_vk() and (not runtime_vk_token() or not runtime_vk_group_id()):
+    if runtime_enable_vk() and (not (runtime_vk_token() or runtime_vk_refresh_token()) or not runtime_vk_group_id()):
         missing.extend([x for x in ["VK_ACCESS_TOKEN", "VK_GROUP_ID"] if x not in missing])
     if runtime_enable_vk_channel() and (
         not (runtime_vk_channel_token() or runtime_vk_token())
@@ -6706,14 +7035,15 @@ def integrations_readiness(session_id: Optional[str] = Cookie(default=None, alia
         },
         "vk": {
             "enabled": runtime_enable_vk(),
-            "configured": bool(runtime_enable_vk() and runtime_vk_token() and runtime_vk_group_id()),
+            "configured": bool(runtime_enable_vk() and (runtime_vk_token() or runtime_vk_refresh_token()) and runtime_vk_group_id()),
             "needs": ["VK_ACCESS_TOKEN", "VK_GROUP_ID"],
+            "auth": vk_token_status(),
         },
         "vk_channel": {
             "enabled": runtime_enable_vk_channel(),
             "configured": bool(
                 runtime_enable_vk_channel()
-                and (runtime_vk_channel_token() or runtime_vk_token())
+                and (runtime_vk_channel_token() or runtime_vk_token() or runtime_vk_refresh_token())
                 and runtime_vk_channel_group_id()
                 and runtime_vk_group_id()
             ),
