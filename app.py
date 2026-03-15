@@ -851,7 +851,14 @@ def runtime_pinterest_board_id() -> str:
 
 
 def runtime_vk_token() -> str:
+    publish_token = setting_get("vk_publish_access_token", "").strip()
+    if publish_token:
+        return publish_token
     return setting_get("vk_access_token", VK_ACCESS_TOKEN)
+
+
+def runtime_vk_publish_token() -> str:
+    return setting_get("vk_publish_access_token", "").strip()
 
 
 def runtime_vk_refresh_token() -> str:
@@ -6046,7 +6053,7 @@ def get_settings(session_id: Optional[str] = Cookie(default=None, alias=SESSION_
         "telegram_webhook_secret": "***" if runtime_telegram_webhook_secret() else "",
         "telegram_mode": runtime_telegram_mode(),
         "enable_vk": runtime_enable_vk(),
-        "vk_access_token": "***" if runtime_vk_token() else "",
+        "vk_access_token": "***" if runtime_vk_publish_token() else "",
         "vk_refresh_token": "***" if runtime_vk_refresh_token() else "",
         "vk_token_expires_at": runtime_vk_token_expires_at(),
         "vk_user_id": runtime_vk_user_id(),
@@ -6177,6 +6184,10 @@ async def update_settings(request: Request, session_id: Optional[str] = Cookie(d
             if val not in {"direct", "external_queue"}:
                 raise HTTPException(status_code=400, detail="instagram_delivery_mode must be direct|external_queue")
             setting_set("instagram_delivery_mode", val)
+            updated.append(key)
+            continue
+        if key == "vk_access_token":
+            setting_set("vk_publish_access_token", str(value or "").strip())
             updated.append(key)
             continue
         if key.startswith("enable_"):
