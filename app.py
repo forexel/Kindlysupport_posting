@@ -3242,9 +3242,8 @@ def generate_vk_channel_caption(post: dict[str, Any]) -> str:
         title_line = phrase_title
         if author:
             title_line = f"{title_line} - {author}"
-        title_line = f"**{title_line}**"
         return f"{title_line}\n\n{body}\n\n{CHANNEL_FOOTER}" if body else f"{title_line}\n\n{CHANNEL_FOOTER}"
-    title_line = f"**{title}**" if title else ""
+    title_line = title if title else ""
     body = (text_body or "").strip()
     if title_line and body:
         return f"{title_line}\n\n{body}\n\n{CHANNEL_FOOTER}"
