@@ -28,6 +28,7 @@ export function SettingsPage() {
   const [telegramMode, setTelegramMode] = useState<'webhook' | 'polling'>('webhook');
 
   const [vkEnabled, setVkEnabled] = useState(false);
+  const [vkAccessToken, setVkAccessToken] = useState('');
   const [vkGroupId, setVkGroupId] = useState('');
   const [vkOauthClientId, setVkOauthClientId] = useState('');
   const [vkOauthClientSecret, setVkOauthClientSecret] = useState('');
@@ -36,6 +37,7 @@ export function SettingsPage() {
   const [vkAuthStatus, setVkAuthStatus] = useState<any>(null);
   const [vkAuthLoading, setVkAuthLoading] = useState(false);
   const [vkChannelEnabled, setVkChannelEnabled] = useState(false);
+  const [vkChannelAccessToken, setVkChannelAccessToken] = useState('');
   const [vkChannelGroupId, setVkChannelGroupId] = useState('');
   const [maxEnabled, setMaxEnabled] = useState(false);
   const [maxPublishUrl, setMaxPublishUrl] = useState('');
@@ -82,6 +84,7 @@ export function SettingsPage() {
       setWebhookSecret(s.telegram_webhook_secret || '');
       setTelegramMode(s.telegram_mode === 'polling' ? 'polling' : 'webhook');
       setVkEnabled(Boolean(s.enable_vk));
+      setVkAccessToken(s.vk_access_token || '');
       setVkGroupId(s.vk_group_id || '');
       setVkOauthClientId(s.vk_oauth_client_id || '');
       setVkOauthClientSecret(s.vk_oauth_client_secret || '');
@@ -89,6 +92,7 @@ export function SettingsPage() {
       setVkOauthRedirectUri(s.vk_oauth_redirect_uri || '');
       setVkAuthStatus(s.vk_auth || null);
       setVkChannelEnabled(Boolean(s.enable_vk_channel));
+      setVkChannelAccessToken(s.vk_channel_access_token || '');
       setVkChannelGroupId(s.vk_channel_group_id || '');
       setMaxEnabled(Boolean(s.enable_max));
       setMaxPublishUrl(s.max_publish_url || '');
@@ -169,7 +173,9 @@ export function SettingsPage() {
       if (apiKey && apiKey !== '***') payload.openrouter_api_key = apiKey;
       if (botToken && botToken !== '***') payload.telegram_bot_token = botToken;
       if (webhookSecret && webhookSecret !== '***') payload.telegram_webhook_secret = webhookSecret;
+      if (vkAccessToken && vkAccessToken !== '***') payload.vk_access_token = vkAccessToken;
       if (vkOauthClientSecret && vkOauthClientSecret !== '***') payload.vk_oauth_client_secret = vkOauthClientSecret;
+      if (vkChannelAccessToken && vkChannelAccessToken !== '***') payload.vk_channel_access_token = vkChannelAccessToken;
       if (maxAccessToken && maxAccessToken !== '***') payload.max_access_token = maxAccessToken;
       if (okAccessToken && okAccessToken !== '***') payload.ok_access_token = okAccessToken;
       if (igAccessToken && igAccessToken !== '***') payload.instagram_access_token = igAccessToken;
@@ -436,6 +442,7 @@ export function SettingsPage() {
             <h2 className="text-xl font-semibold text-zinc-50">VK</h2>
             <div className="flex items-center gap-2"><input type="checkbox" checked={vkEnabled} onChange={(e) => setVkEnabled(e.target.checked)} /><span className="text-zinc-300">Включить VK</span></div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2"><Label className="text-zinc-200">Legacy VK Access Token (fallback)</Label><Input type="password" value={vkAccessToken} onChange={(e) => setVkAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
               <div className="space-y-2"><Label className="text-zinc-200">Group ID</Label><Input value={vkGroupId} onChange={(e) => setVkGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
               <div className="space-y-2"><Label className="text-zinc-200">VK App ID</Label><Input value={vkOauthClientId} onChange={(e) => setVkOauthClientId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
             </div>
@@ -471,9 +478,10 @@ export function SettingsPage() {
             <h3 className="text-lg font-semibold text-zinc-100">VK Канал</h3>
             <div className="flex items-center gap-2"><input type="checkbox" checked={vkChannelEnabled} onChange={(e) => setVkChannelEnabled(e.target.checked)} /><span className="text-zinc-300">Включить VK Канал</span></div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2"><Label className="text-zinc-200">Legacy Channel Token (optional)</Label><Input type="password" value={vkChannelAccessToken} onChange={(e) => setVkChannelAccessToken(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
               <div className="space-y-2"><Label className="text-zinc-200">Channel ID</Label><Input value={vkChannelGroupId} onChange={(e) => setVkChannelGroupId(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
             </div>
-            <p className="text-xs text-zinc-400">Канал использует ту же VK OAuth-сессию, что и основная публикация в сообщество. Отдельный токен для канала больше не нужен.</p>
+            <p className="text-xs text-zinc-400">По умолчанию канал использует ту же VK OAuth-сессию или основной VK access token. Отдельный токен нужен только для legacy тестов.</p>
           </Card>
         </TabsContent>
 
