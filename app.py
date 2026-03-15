@@ -2188,7 +2188,7 @@ def vk_publish_post_to_group(
         raise HTTPException(status_code=400, detail=f"{profile_label} credentials not configured")
     if not post.get("final_image_url"):
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
-    caption = generate_post_caption_plain(post)[:3500]
+    caption = generate_vk_caption_plain(post)[:3500]
     media_key = media_key_from_url(str(post["final_image_url"]))
     if media_key:
         try:
@@ -3231,6 +3231,25 @@ def generate_post_caption_plain(post: dict[str, Any]) -> str:
     return generate_caption(title, text_body)
 
 
+def generate_vk_caption_plain(post: dict[str, Any]) -> str:
+    source_kind = (post.get("source_kind") or "").strip()
+    title = (post.get("title") or "").strip()
+    text_body = (post.get("text_body") or "").strip()
+    if source_kind == "phrase":
+        quote, author = split_quote_and_author(title)
+        phrase_title = _phrase_title_for_publish(quote or title)
+        body = trim_phrase_body_to_budget((text_body or "").strip(), phrase_body_char_budget(title))
+        title_line = phrase_title
+        if author:
+            title_line = f"{title_line} - {author}"
+        return f"{title_line}\n\n{body}" if body else title_line
+    title_line = f"Притча: {title}" if title else ""
+    body = (text_body or "").strip()
+    if title_line and body:
+        return f"{title_line}\n{body}"
+    return title_line or body
+
+
 def generate_vk_channel_caption(post: dict[str, Any]) -> str:
     source_kind = (post.get("source_kind") or "").strip()
     title = (post.get("title") or "").strip()
@@ -3242,14 +3261,14 @@ def generate_vk_channel_caption(post: dict[str, Any]) -> str:
         title_line = phrase_title
         if author:
             title_line = f"{title_line} - {author}"
-        return f"{title_line}\n\n{body}\n\n{CHANNEL_FOOTER}" if body else f"{title_line}\n\n{CHANNEL_FOOTER}"
+        return f"{title_line}\n\n{body}" if body else title_line
     title_line = title if title else ""
     body = (text_body or "").strip()
     if title_line and body:
-        return f"{title_line}\n\n{body}\n\n{CHANNEL_FOOTER}"
+        return f"{title_line}\n\n{body}"
     if title_line:
-        return f"{title_line}\n\n{CHANNEL_FOOTER}"
-    return generate_post_caption_plain(post)
+        return title_line
+    return generate_vk_caption_plain(post)
 
 
 def _preview_payload_dict(post: dict[str, Any]) -> dict[str, Any]:
