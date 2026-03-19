@@ -17,12 +17,14 @@ import csv
 import io
 import binascii
 import textwrap
+import gzip
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread
 from typing import Any, Callable, Optional
 from uuid import uuid4
 from pathlib import Path
+from html import unescape
 
 from fastapi import Cookie, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -535,6 +537,21 @@ def init_db() -> None:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS parables (
+                    id BIGSERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    text_body TEXT NOT NULL,
+                    source_url TEXT UNIQUE,
+                    source_site TEXT,
+                    source_external_id TEXT,
+                    category TEXT,
+                    section_title TEXT,
+                    source_ref TEXT,
+                    source_published_at TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS films (
                     id BIGSERIAL PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -548,6 +565,7 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_posts_status_updated ON posts(status, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_posts_scheduled_for ON posts(scheduled_for);
                 CREATE INDEX IF NOT EXISTS idx_phrases_published_id ON phrases(is_published, id);
+                CREATE INDEX IF NOT EXISTS idx_parables_source_site_id ON parables(source_site, source_external_id);
                 CREATE INDEX IF NOT EXISTS idx_image_logs_post_created ON image_generation_logs(post_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_films_title ON films(title);
                 """
@@ -628,6 +646,21 @@ def init_db() -> None:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS parables (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    text_body TEXT NOT NULL,
+                    source_url TEXT UNIQUE,
+                    source_site TEXT,
+                    source_external_id TEXT,
+                    category TEXT,
+                    section_title TEXT,
+                    source_ref TEXT,
+                    source_published_at TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS films (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
@@ -641,6 +674,7 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_posts_status_updated ON posts(status, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_posts_scheduled_for ON posts(scheduled_for);
                 CREATE INDEX IF NOT EXISTS idx_phrases_published_id ON phrases(is_published, id);
+                CREATE INDEX IF NOT EXISTS idx_parables_source_site_id ON parables(source_site, source_external_id);
                 CREATE INDEX IF NOT EXISTS idx_image_logs_post_created ON image_generation_logs(post_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_films_title ON films(title);
                 """
@@ -662,6 +696,13 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS csrf_token TEXT")
             conn.execute("ALTER TABLE phrases ADD COLUMN IF NOT EXISTS author TEXT")
             conn.execute("ALTER TABLE phrases ADD COLUMN IF NOT EXISTS topic TEXT")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS source_site TEXT")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS source_external_id TEXT")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS category TEXT")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS section_title TEXT")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS source_ref TEXT")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS source_published_at TEXT")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS tags_json TEXT NOT NULL DEFAULT '[]'")
         else:
             try:
                 conn.execute("ALTER TABLE phrases ADD COLUMN author TEXT")
@@ -671,6 +712,19 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE phrases ADD COLUMN topic TEXT")
             except Exception:
                 pass
+            for sql in (
+                "ALTER TABLE parables ADD COLUMN source_site TEXT",
+                "ALTER TABLE parables ADD COLUMN source_external_id TEXT",
+                "ALTER TABLE parables ADD COLUMN category TEXT",
+                "ALTER TABLE parables ADD COLUMN section_title TEXT",
+                "ALTER TABLE parables ADD COLUMN source_ref TEXT",
+                "ALTER TABLE parables ADD COLUMN source_published_at TEXT",
+                "ALTER TABLE parables ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
+            ):
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
 
 
 def ensure_auth(session_id: Optional[str]) -> None:
@@ -1241,6 +1295,32 @@ def row_to_post(row: Any) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def row_to_parable(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "text_body": row["text_body"],
+        "source_url": row["source_url"],
+        "source_site": row["source_site"],
+        "source_external_id": row["source_external_id"],
+        "category": row["category"],
+        "section_title": row["section_title"],
+        "source_ref": row["source_ref"],
+        "source_published_at": row["source_published_at"],
+        "tags": json.loads(row["tags_json"] or "[]"),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def fetch_parable(parable_id: int) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM parables WHERE id = ?", (parable_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="parable not found")
+    return row_to_parable(row)
 
 
 def fetch_post(post_id: int) -> dict[str, Any]:
@@ -4906,6 +4986,294 @@ def local_ocr_extract_phrases_from_image(image_url: str, fast_mode: bool = False
         return local_ocr_extract_text_from_image(image_url), []
 
 
+PRITCHI_SITEMAP_URL = "https://pritchi.ru/sitemap_parable.xml.gz"
+
+
+def _fetch_text_url(url: str, encoding: str = "utf-8", retries: int = 4) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    last_error: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+            return raw.decode(encoding, errors="replace")
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 429:
+                time.sleep(min(30, 3 * (attempt + 1)))
+                continue
+            if 500 <= exc.code < 600 and attempt + 1 < retries:
+                time.sleep(min(15, 2 * (attempt + 1)))
+                continue
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(min(10, attempt + 1))
+                continue
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"failed to fetch url: {url}")
+
+
+def fetch_pritchi_sitemap_urls() -> list[str]:
+    req = urllib.request.Request(PRITCHI_SITEMAP_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    try:
+        xml_text = gzip.decompress(raw).decode("utf-8", errors="replace")
+    except Exception:
+        xml_text = raw.decode("utf-8", errors="replace")
+    urls = re.findall(r"<loc>(https://pritchi\.ru/id_\d+)</loc>", xml_text)
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _strip_html_tags(html_fragment: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", html_fragment, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\r", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
+def scrape_pritchi_parable(url: str) -> dict[str, Any]:
+    source_url = validate_public_http_url(url)
+    if "pritchi.ru/id_" not in source_url.lower():
+        raise HTTPException(status_code=400, detail="supported only for pritchi.ru/id_*")
+    html = _fetch_text_url(source_url, encoding="cp1251")
+
+    title_match = re.search(r'<h1[^>]*class="[^"]*post-title[^"]*"[^>]*>(.*?)</h1>', html, flags=re.IGNORECASE | re.DOTALL)
+    text_match = re.search(r'<div[^>]*class="[^"]*textblock[^"]*"[^>]*>(.*?)</div>', html, flags=re.IGNORECASE | re.DOTALL)
+    category_match = re.search(r'<span[^>]*class="[^"]*post-cat[^"]*"[^>]*>(.*?)</span>', html, flags=re.IGNORECASE | re.DOTALL)
+    source_ref_match = re.search(r"Источник:\s*(.*?)(?:</span>|<br)", html, flags=re.IGNORECASE | re.DOTALL)
+    published_match = re.search(r"Дата публикации:\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})", html, flags=re.IGNORECASE)
+    ext_id_match = re.search(r"/id_(\d+)", source_url)
+    if not title_match or not text_match:
+        raise HTTPException(status_code=502, detail=f"pritchi parse failed for {source_url}")
+
+    tags_block_match = re.search(r'<div[^>]*class="[^"]*tags[^"]*"[^>]*>(.*?)</div>', html, flags=re.IGNORECASE | re.DOTALL)
+    tags = []
+    if tags_block_match:
+        tag_matches = re.findall(r'<a[^>]*rel="tag"[^>]*>(.*?)</a>', tags_block_match.group(1), flags=re.IGNORECASE | re.DOTALL)
+        tags = [_strip_html_tags(tag) for tag in tag_matches if _strip_html_tags(tag)]
+
+    breadcrumb_parts = [
+        _strip_html_tags(x)
+        for x in re.findall(r'<a[^>]*class="[^"]*text-nowrap[^"]*"[^>]*>(.*?)</a>', html, flags=re.IGNORECASE | re.DOTALL)
+    ]
+    section_title = breadcrumb_parts[-1] if breadcrumb_parts else ""
+
+    source_published_at = ""
+    if published_match:
+        try:
+            source_published_at = datetime.strptime(published_match.group(1), "%d.%m.%Y").date().isoformat()
+        except ValueError:
+            source_published_at = published_match.group(1)
+
+    title = _strip_html_tags(title_match.group(1))
+    text_body = _strip_html_tags(text_match.group(1))
+    if not title or not text_body:
+        raise HTTPException(status_code=502, detail=f"pritchi parse produced empty content for {source_url}")
+
+    return {
+        "title": title,
+        "text_body": text_body,
+        "source_url": source_url,
+        "source_site": "pritchi.ru",
+        "source_external_id": ext_id_match.group(1) if ext_id_match else "",
+        "category": _strip_html_tags(category_match.group(1)) if category_match else "",
+        "section_title": section_title,
+        "source_ref": _strip_html_tags(source_ref_match.group(1)) if source_ref_match else "",
+        "source_published_at": source_published_at,
+        "tags": tags,
+    }
+
+
+def upsert_parable(
+    title: str,
+    text_body: str,
+    source_url: Optional[str] = None,
+    source_site: str = "",
+    source_external_id: str = "",
+    category: str = "",
+    section_title: str = "",
+    source_ref: str = "",
+    source_published_at: str = "",
+    tags: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    clean_title = re.sub(r"\s+", " ", (title or "").strip())
+    clean_text = re.sub(r"\s+", " ", (text_body or "").strip())
+    clean_source_url = (source_url or "").strip() or None
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="parable title required")
+    if not clean_text:
+        raise HTTPException(status_code=400, detail="parable text_body required")
+    tags_json = tags or []
+    now = now_iso()
+    with db() as conn:
+        existing = None
+        if clean_source_url:
+            existing = conn.execute("SELECT * FROM parables WHERE source_url = ? LIMIT 1", (clean_source_url,)).fetchone()
+        if existing is None:
+            existing = conn.execute(
+                "SELECT * FROM parables WHERE title = ? AND text_body = ? LIMIT 1",
+                (clean_title, clean_text),
+            ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE parables
+                SET title = ?, text_body = ?, source_url = ?, source_site = ?, source_external_id = ?,
+                    category = ?, section_title = ?, source_ref = ?, source_published_at = ?, tags_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_title,
+                    clean_text,
+                    clean_source_url,
+                    source_site.strip() or None,
+                    source_external_id.strip() or None,
+                    category.strip() or None,
+                    section_title.strip() or None,
+                    source_ref.strip() or None,
+                    source_published_at.strip() or None,
+                    json.dumps(tags_json, ensure_ascii=False),
+                    now,
+                    existing["id"],
+                ),
+            )
+            row = conn.execute("SELECT * FROM parables WHERE id = ?", (existing["id"],)).fetchone()
+            return row_to_parable(row)
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO parables (
+                    title, text_body, source_url, source_site, source_external_id, category,
+                    section_title, source_ref, source_published_at, tags_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING *
+                """,
+                (
+                    clean_title,
+                    clean_text,
+                    clean_source_url,
+                    source_site.strip() or None,
+                    source_external_id.strip() or None,
+                    category.strip() or None,
+                    section_title.strip() or None,
+                    source_ref.strip() or None,
+                    source_published_at.strip() or None,
+                    json.dumps(tags_json, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            ).fetchone()
+            return row_to_parable(row)
+        cur = conn.execute(
+            """
+            INSERT INTO parables (
+                title, text_body, source_url, source_site, source_external_id, category,
+                section_title, source_ref, source_published_at, tags_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_title,
+                clean_text,
+                clean_source_url,
+                source_site.strip() or None,
+                source_external_id.strip() or None,
+                category.strip() or None,
+                section_title.strip() or None,
+                source_ref.strip() or None,
+                source_published_at.strip() or None,
+                json.dumps(tags_json, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM parables WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return row_to_parable(row)
+
+
+def create_post_from_parable_entity(parable_id: int) -> dict[str, Any]:
+    parable = fetch_parable(parable_id)
+    now = now_iso()
+    with db() as conn:
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
+                RETURNING id
+                """,
+                (
+                    parable["title"],
+                    parable["text_body"],
+                    f"parable:{parable_id}",
+                    "parable",
+                    parable["text_body"],
+                    now,
+                    now,
+                ),
+            ).fetchone()
+            post_id = int(row["id"])
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
+                """,
+                (
+                    parable["title"],
+                    parable["text_body"],
+                    f"parable:{parable_id}",
+                    "parable",
+                    parable["text_body"],
+                    now,
+                    now,
+                ),
+            )
+            post_id = int(cur.lastrowid)
+    return fetch_post(post_id)
+
+
+def import_pritchi_parables(limit: int = 0, offset: int = 0, crawl_delay_seconds: float = 3.0) -> dict[str, Any]:
+    urls = fetch_pritchi_sitemap_urls()
+    if offset > 0:
+        urls = urls[offset:]
+    if limit and limit > 0:
+        urls = urls[:limit]
+    imported = 0
+    failed = 0
+    last_error = ""
+    for idx, url in enumerate(urls, start=1):
+        try:
+            upsert_parable(**scrape_pritchi_parable(url))
+            imported += 1
+        except Exception as exc:
+            failed += 1
+            last_error = str(exc)[:300]
+            logger.exception("pritchi_import_item_failed url=%s", url)
+        if idx % 200 == 0:
+            logger.info("pritchi_import_progress processed=%s imported=%s failed=%s", idx, imported, failed)
+        if crawl_delay_seconds > 0 and idx < len(urls):
+            time.sleep(crawl_delay_seconds)
+    return {"processed": len(urls), "imported": imported, "failed": failed, "last_error": last_error}
+
+
 def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024") -> dict[str, Any]:
     started = time.time()
     model = runtime_openrouter_image_model()
@@ -5055,6 +5423,12 @@ def extract_from_url(url: str) -> tuple[str, str]:
     if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
         ocr_text, _, _ = extract_phrases_from_image(url)
         return "url_image", ocr_text
+    if "pritchi.ru/id_" in lower:
+        try:
+            data = scrape_pritchi_parable(url)
+            return "pritchi", (data.get("text_body") or "").strip()
+        except Exception:
+            logger.exception("extract_from_url_pritchi_failed url=%s", url)
     # MVP stub for HTML extraction. Replace with readability parser later.
     return "url_html", f"Текст, извлечённый из HTML-ссылки (заглушка)\nИсточник: {url}"
 
@@ -6356,45 +6730,54 @@ async def create_parable(request: Request, session_id: Optional[str] = Cookie(de
     title = (payload.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="title required")
-    created_at = now_iso()
     if mode == "manual":
         text_body = (payload.get("text_body") or "").strip()
         if not text_body:
             raise HTTPException(status_code=400, detail="text_body required")
-        source_kind = "parable_manual"
-        source_url = None
-        recognized_text = text_body
+        return upsert_parable(title=title, text_body=text_body)
     elif mode == "link":
         url = (payload.get("url") or "").strip()
         if not url:
             raise HTTPException(status_code=400, detail="url required")
+        if "pritchi.ru/id_" in url.lower():
+            data = scrape_pritchi_parable(url)
+            data["title"] = title or data["title"]
+            override_text = (payload.get("text_body") or "").strip()
+            if override_text:
+                data["text_body"] = override_text
+            return upsert_parable(**data)
         _, recognized_text = extract_from_url(url)
         text_body = (payload.get("text_body") or recognized_text or "").strip()
-        source_kind = "parable_link"
-        source_url = url
-    else:
-        raise HTTPException(status_code=400, detail="mode must be manual|link")
-    with db() as conn:
-        if DB_BACKEND == "postgres":
-            row = conn.execute(
-                """
-                INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
-                RETURNING id
-                """,
-                (title, text_body, source_url, source_kind, recognized_text, created_at, created_at),
-            ).fetchone()
-            post_id = row["id"]
-        else:
-            cur = conn.execute(
-                """
-                INSERT INTO posts (title, text_body, source_url, source_kind, status, recognized_text, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)
-                """,
-                (title, text_body, source_url, source_kind, recognized_text, created_at, created_at),
-            )
-            post_id = cur.lastrowid
-    return fetch_post(int(post_id))
+        if not text_body:
+            raise HTTPException(status_code=400, detail="text_body required")
+        return upsert_parable(title=title, text_body=text_body, source_url=url, source_site="external")
+    raise HTTPException(status_code=400, detail="mode must be manual|link")
+
+
+@app.post("/api/parables/import/pritchi")
+async def import_pritchi_parables_endpoint(
+    request: Request,
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    limit = int(payload.get("limit") or 0)
+    offset = int(payload.get("offset") or 0)
+    crawl_delay_seconds = float(payload.get("crawl_delay_seconds") or 3.0)
+    return import_pritchi_parables(
+        limit=max(0, limit),
+        offset=max(0, offset),
+        crawl_delay_seconds=max(0.0, crawl_delay_seconds),
+    )
+
+
+@app.post("/api/parables/{parable_id}/posts")
+def create_post_from_parable_endpoint(
+    parable_id: int,
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    ensure_auth(session_id)
+    return create_post_from_parable_entity(parable_id)
 
 
 @app.get("/api/parables")
@@ -6406,10 +6789,10 @@ def list_parables(
     ensure_auth(session_id)
     with db() as conn:
         rows = conn.execute(
-            "SELECT * FROM posts WHERE source_kind IN ('parable_manual','parable_link') ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM parables ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
-    return [row_to_post(r) for r in rows]
+    return [row_to_parable(r) for r in rows]
 
 
 @app.get("/api/posts")

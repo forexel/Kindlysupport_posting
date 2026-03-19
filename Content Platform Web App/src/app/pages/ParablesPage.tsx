@@ -16,7 +16,8 @@ interface ParablePost {
   title: string;
   text_body: string;
   created_at: string;
-  final_image_url?: string | null;
+  source_url?: string | null;
+  category?: string | null;
 }
 
 export function ParablesPage() {
@@ -33,6 +34,7 @@ export function ParablesPage() {
   const [postText, setPostText] = useState('');
   const [imageUrl, setImageUrl] = useState('');
   const [selectedParable, setSelectedParable] = useState<ParablePost | null>(null);
+  const [selectedPostId, setSelectedPostId] = useState<number | null>(null);
 
   const [channels, setChannels] = useState({ telegram: true, vk: false, vk_channel: false, max: false, ok: false, pinterest: false, instagram: false });
   const [scheduleType, setScheduleType] = useState<'now' | 'scheduled'>('now');
@@ -53,10 +55,12 @@ export function ParablesPage() {
   const handleCreateParable = async (mode: 'manual' | 'link') => {
     try {
       const p = await api<ParablePost>('/api/parables', 'POST', mode === 'manual' ? { mode, title, text_body: text } : { mode, title, url, text_body: text });
+      const post = await api<any>(`/api/parables/${p.id}/posts`, 'POST');
       toast.success('Притча создана');
       setSelectedParable(p);
-      setPostText(p.text_body || '');
-      setImageUrl(p.final_image_url || '');
+      setSelectedPostId(post.id);
+      setPostText(post.text_body || p.text_body || '');
+      setImageUrl(post.final_image_url || '');
       setCreateDialogOpen(false);
       setGenerateDialogOpen(true);
       setTitle('');
@@ -85,17 +89,24 @@ export function ParablesPage() {
   };
 
   const handleOpenGenerate = (parable: ParablePost) => {
-    setSelectedParable(parable);
-    setPostText(parable.text_body || '');
-    setImageUrl(parable.final_image_url || '');
-    setGenerateDialogOpen(true);
+    api<any>(`/api/parables/${parable.id}/posts`, 'POST')
+      .then((post) => {
+        setSelectedParable(parable);
+        setSelectedPostId(post.id);
+        setPostText(post.text_body || parable.text_body || '');
+        setImageUrl(post.final_image_url || '');
+        setGenerateDialogOpen(true);
+      })
+      .catch((e: any) => {
+        toast.error(String(e?.message || e));
+      });
   };
 
   const handleGenerateImage = async () => {
-    if (!selectedParable) return;
+    if (!selectedPostId) return;
     setGeneratingImage(true);
     try {
-      const p = await api<any>(`/api/posts/${selectedParable.id}/preview`, 'POST', { scenario: 'Кинематографичный, спокойный, реалистичный фон', regen_instruction: '' });
+      const p = await api<any>(`/api/posts/${selectedPostId}/preview`, 'POST', { scenario: 'Кинематографичный, спокойный, реалистичный фон', regen_instruction: '' });
       setImageUrl(p.final_image_url || '');
       setPostText(p.text_body || postText);
       toast.success('Изображение сгенерировано');
@@ -107,17 +118,17 @@ export function ParablesPage() {
   };
 
   const handlePublish = async () => {
-    if (!selectedParable) return;
+    if (!selectedPostId) return;
     const targets = Object.entries(channels).filter(([_, v]) => v).map(([k]) => k);
     if (!targets.length) return toast.error('Выберите хотя бы один канал для публикации');
     try {
       if (scheduleType === 'scheduled') {
         const iso = mskIso(scheduleDate, scheduleTime);
         if (!iso) return toast.error('Заполни дату и время');
-        await api(`/api/posts/${selectedParable.id}/publish`, 'POST', { mode: 'schedule', scheduled_for: iso });
+        await api(`/api/posts/${selectedPostId}/publish`, 'POST', { mode: 'schedule', scheduled_for: iso });
       } else {
-        if (targets.length === 1 && targets[0] === 'telegram') await api(`/api/posts/${selectedParable.id}/publish`, 'POST', { mode: 'now' });
-        else await api(`/api/posts/${selectedParable.id}/publish/multi`, 'POST', { targets });
+        if (targets.length === 1 && targets[0] === 'telegram') await api(`/api/posts/${selectedPostId}/publish`, 'POST', { mode: 'now' });
+        else await api(`/api/posts/${selectedPostId}/publish/multi`, 'POST', { targets });
       }
       toast.success('Публикация отправлена');
       setGenerateDialogOpen(false);
@@ -169,7 +180,11 @@ export function ParablesPage() {
         {parables.map((parable) => (
           <Card key={parable.id} className="bg-zinc-900 border-zinc-800 p-6 space-y-4 hover:border-zinc-700 transition-colors">
             <div className="flex items-start justify-between"><BookOpen className="h-5 w-5 text-zinc-500" /><span className="text-xs text-zinc-500">{(parable.created_at || '').slice(0,10)}</span></div>
-            <div><h3 className="text-lg font-semibold text-zinc-100 mb-2">{parable.title}</h3><p className="text-zinc-400 text-sm line-clamp-3">{parable.text_body}</p></div>
+            <div>
+              <h3 className="text-lg font-semibold text-zinc-100 mb-2">{parable.title}</h3>
+              <p className="text-zinc-400 text-sm line-clamp-3">{parable.text_body}</p>
+              {parable.category ? <p className="text-xs text-zinc-500 mt-2">{parable.category}</p> : null}
+            </div>
             <Button onClick={() => handleOpenGenerate(parable)} className="w-full bg-blue-600 hover:bg-blue-700 text-white">Генерировать пост</Button>
           </Card>
         ))}
