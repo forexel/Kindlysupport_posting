@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
@@ -33,14 +33,20 @@ interface Post {
 }
 
 export function GeneratePostPage() {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const preselectedPhraseId = searchParams.get('phraseId') || '';
+  const preselectedPostId = searchParams.get('postId');
+  const resolvedInitialPostId = useMemo(() => {
+    if (!preselectedPostId) return null;
+    const parsed = Number(preselectedPostId);
+    return Number.isFinite(parsed) ? parsed : null;
+  }, [preselectedPostId]);
 
   const [mode, setMode] = useState<'random' | 'selected'>(preselectedPhraseId ? 'selected' : 'random');
   const [selectedPhrase, setSelectedPhrase] = useState(preselectedPhraseId);
   const [phraseQuery, setPhraseQuery] = useState('');
   const [phrases, setPhrases] = useState<Phrase[]>([]);
-  const [postId, setPostId] = useState<number | null>(null);
+  const [postId, setPostId] = useState<number | null>(resolvedInitialPostId);
 
   const [generatingText, setGeneratingText] = useState(false);
   const [generatingPrompt, setGeneratingPrompt] = useState(false);
@@ -70,11 +76,42 @@ export function GeneratePostPage() {
     })();
   }, []);
 
+  useEffect(() => {
+    const restorePost = async () => {
+      const fallbackId = typeof window !== 'undefined' ? window.localStorage.getItem('generate-post:lastPostId') : null;
+      const candidateIds = [resolvedInitialPostId, fallbackId ? Number(fallbackId) : null]
+        .filter((value, index, array): value is number => Number.isFinite(value) && array.indexOf(value) === index);
+      if (!candidateIds.length) return;
+
+      for (const candidateId of candidateIds) {
+        try {
+          const restored = await api<Post>(`/api/posts/${candidateId}`);
+          syncFromPost(restored);
+          return;
+        } catch {
+          // Ignore stale ids and try the next stored candidate.
+        }
+      }
+    };
+
+    if (!postText && !imageUrl) {
+      void restorePost();
+    }
+  // We only want to restore persisted state when the page is effectively empty.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resolvedInitialPostId]);
+
   const syncFromPost = (p: Post) => {
     setPostId(p.id);
     setPostText(p.text_body || '');
     setImagePrompt(p.selected_scenario || 'Стандартный реалистичный природный фон, спокойный, квадратный');
     setImageUrl(p.final_image_url || '');
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('generate-post:lastPostId', String(p.id));
+    }
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.set('postId', String(p.id));
+    setSearchParams(nextParams, { replace: true });
   };
 
   const ensurePost = async (): Promise<number> => {

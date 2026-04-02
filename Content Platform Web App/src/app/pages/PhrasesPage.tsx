@@ -43,9 +43,16 @@ interface Phrase {
   created_at: string;
 }
 
+interface PhraseStats {
+  total: number;
+  new_count: number;
+  published_count: number;
+}
+
 export function PhrasesPage() {
   const navigate = useNavigate();
   const [phrases, setPhrases] = useState<Phrase[]>([]);
+  const [stats, setStats] = useState<PhraseStats>({ total: 0, new_count: 0, published_count: 0 });
   const [selectedPhrases, setSelectedPhrases] = useState<number[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | '0' | '1'>('0');
@@ -60,14 +67,42 @@ export function PhrasesPage() {
   const [actionsDialogOpen, setActionsDialogOpen] = useState(false);
   const [actionsPhrase, setActionsPhrase] = useState<Phrase | null>(null);
   const [loading, setLoading] = useState(false);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [addDialogOpen, setAddDialogOpen] = useState(false);
+  const [addingPhrase, setAddingPhrase] = useState(false);
+  const [newPhraseText, setNewPhraseText] = useState('');
+  const [newPhraseAuthor, setNewPhraseAuthor] = useState('');
+  const PAGE_SIZE = 100;
 
-  const loadPhrases = async () => {
+  const loadStats = async () => {
+    setStatsLoading(true);
+    try {
+      const rows = await api<PhraseStats>('/api/phrases/stats');
+      setStats(rows);
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setStatsLoading(false);
+    }
+  };
+
+  const loadPhrases = async (reset = true) => {
     setLoading(true);
     try {
       const params = new URLSearchParams();
-      params.set('limit', '2000');
+      params.set('limit', String(PAGE_SIZE));
+      params.set('offset', String(reset ? 0 : offset));
+      params.set('status', statusFilter);
+      params.set('search', searchQuery.trim());
+      params.set('sort_by', sortBy);
+      params.set('sort_direction', sortDirection);
       const rows = await api<Phrase[]>(`/api/phrases?${params.toString()}`);
-      setPhrases(rows);
+      setPhrases((prev) => (reset ? rows : [...prev, ...rows]));
+      setOffset((reset ? 0 : offset) + rows.length);
+      setHasMore(rows.length === PAGE_SIZE);
+      if (reset) setSelectedPhrases([]);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     } finally {
@@ -76,31 +111,19 @@ export function PhrasesPage() {
   };
 
   useEffect(() => {
-    loadPhrases();
+    loadStats();
   }, []);
 
-  const newPhrasesCount = phrases.filter((p) => p.is_published === 0).length;
-  const publishedPhrasesCount = phrases.filter((p) => p.is_published === 1).length;
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      loadPhrases(true);
+    }, 250);
+    return () => window.clearTimeout(t);
+  }, [searchQuery, statusFilter, sortBy, sortDirection]);
 
-  const filteredPhrases = phrases
-    .filter((phrase) => {
-      if (statusFilter === 'all') return true;
-      return String(phrase.is_published) === statusFilter;
-    })
-    .filter((phrase) =>
-      !searchQuery.trim() || phrase.text_body.toLowerCase().includes(searchQuery.toLowerCase())
-    )
-    .sort((a, b) => {
-      if (sortBy === 'text') {
-        const left = a.text_body.toLowerCase();
-        const right = b.text_body.toLowerCase();
-        const cmp = left.localeCompare(right, 'ru');
-        return sortDirection === 'asc' ? cmp : -cmp;
-      }
-      const left = new Date(a.created_at || 0).getTime();
-      const right = new Date(b.created_at || 0).getTime();
-      return sortDirection === 'asc' ? left - right : right - left;
-    });
+  const filteredPhrases = phrases;
+  const newPhrasesCount = stats.new_count;
+  const publishedPhrasesCount = stats.published_count;
 
   const toggleSort = (field: 'text' | 'created_at') => {
     if (sortBy === field) {
@@ -127,7 +150,7 @@ export function PhrasesPage() {
       await api('/api/phrases/bulk-status', 'PUT', { ids: selectedPhrases, is_published: 1 });
       toast.success(`Отмечено как опубликованные: ${selectedPhrases.length}`);
       setSelectedPhrases([]);
-      await loadPhrases();
+      await Promise.all([loadStats(), loadPhrases(true)]);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
@@ -139,7 +162,7 @@ export function PhrasesPage() {
       toast.success(`Удалено фраз: ${selectedPhrases.length}`);
       setSelectedPhrases([]);
       setDeleteDialogOpen(false);
-      await loadPhrases();
+      await Promise.all([loadStats(), loadPhrases(true)]);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
@@ -154,7 +177,7 @@ export function PhrasesPage() {
       if (selectedPhrases.includes(id)) {
         setSelectedPhrases((prev) => prev.filter((item) => item !== id));
       }
-      await loadPhrases();
+      await Promise.all([loadStats(), loadPhrases(true)]);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
@@ -169,7 +192,7 @@ export function PhrasesPage() {
     try {
       await api('/api/phrases/bulk-status', 'PUT', { ids: [id], is_published: isPublished });
       toast.success(isPublished === 1 ? 'Фраза отмечена опубликованной' : 'Фраза возвращена в новые');
-      await loadPhrases();
+      await Promise.all([loadStats(), loadPhrases(true)]);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
@@ -197,11 +220,41 @@ export function PhrasesPage() {
       setEditingPhraseId(null);
       setEditingText('');
       setEditingAuthor('');
-      await loadPhrases();
+      await loadPhrases(true);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     } finally {
       setSavingEdit(false);
+    }
+  };
+
+  const handleAddPhrase = async () => {
+    const text = newPhraseText.trim();
+    if (!text) {
+      toast.error('Текст фразы не может быть пустым');
+      return;
+    }
+    setAddingPhrase(true);
+    try {
+      const res = await api<any>('/api/phrases', 'POST', {
+        text_body: text,
+        author: newPhraseAuthor.trim(),
+      });
+      if (res?.created) {
+        toast.success('Фраза добавлена');
+        setAddDialogOpen(false);
+        setNewPhraseText('');
+        setNewPhraseAuthor('');
+        await Promise.all([loadStats(), loadPhrases(true)]);
+      } else if (res?.duplicate && res?.phrase) {
+        toast.error(`Похожая фраза уже есть: #${res.phrase.id}`);
+      } else {
+        toast.error('Фраза не добавлена');
+      }
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setAddingPhrase(false);
     }
   };
 
@@ -212,9 +265,12 @@ export function PhrasesPage() {
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-3xl font-bold text-zinc-50">Фразы</h1>
-          <p className="text-zinc-400 mt-1">Всего: {phrases.length} | Новые: {newPhrasesCount} | Опубликованные: {publishedPhrasesCount}</p>
+          <p className="text-zinc-400 mt-1">
+            {statsLoading ? 'Считаю фразы...' : `Всего: ${stats.total} | Новые: ${newPhrasesCount} | Опубликованные: ${publishedPhrasesCount}`}
+          </p>
         </div>
         <div className="flex gap-2">
+          <Button className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200" onClick={() => setAddDialogOpen(true)}>Добавить фразу</Button>
           <Link to="/phrases/import"><Button className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200"><Upload className="mr-2 h-4 w-4" />Импорт</Button></Link>
           <Link to="/phrases/generate"><Button className="bg-blue-600 hover:bg-blue-700 text-white"><Sparkles className="mr-2 h-4 w-4" />Генерировать пост</Button></Link>
         </div>
@@ -227,7 +283,7 @@ export function PhrasesPage() {
           onClick={() => setStatusFilter('all')}
           className={statusFilter === 'all' ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-zinc-900 border-zinc-700 text-zinc-200'}
         >
-          Все ({phrases.length})
+          Все ({stats.total})
         </Button>
         <Button
           size="sm"
@@ -252,7 +308,11 @@ export function PhrasesPage() {
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-500" />
           <Input placeholder="Поиск по тексту..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="pl-9 bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500" />
         </div>
-        <Button variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-200" onClick={loadPhrases}>Поиск</Button>
+        <Button variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-200" onClick={() => loadPhrases(true)}>Поиск</Button>
+      </div>
+
+      <div className="text-sm text-zinc-400">
+        {loading ? 'Загружаю список фраз...' : `Показано: ${phrases.length}${stats.total ? ` из ${stats.total}` : ''}`}
       </div>
 
       {selectedPhrases.length > 0 && (
@@ -333,6 +393,19 @@ export function PhrasesPage() {
         </Table>
       </div>
 
+      {hasMore && (
+        <div className="flex justify-center">
+          <Button
+            variant="outline"
+            className="bg-zinc-800 border-zinc-700 text-zinc-200"
+            onClick={() => loadPhrases(false)}
+            disabled={loading}
+          >
+            {loading ? 'Загрузка...' : 'Показать ещё 100'}
+          </Button>
+        </div>
+      )}
+
       <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
         <AlertDialogContent className="bg-zinc-900 border-zinc-800">
           <AlertDialogHeader>
@@ -372,6 +445,38 @@ export function PhrasesPage() {
             </Button>
             <Button className="bg-blue-600 hover:bg-blue-700 text-white" onClick={handleSaveEdit} disabled={savingEdit}>
               {savingEdit ? 'Сохранение...' : 'Сохранить'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={addDialogOpen} onOpenChange={setAddDialogOpen}>
+        <DialogContent className="bg-zinc-900 border-zinc-800 text-zinc-100">
+          <DialogHeader>
+            <DialogTitle>Добавить фразу</DialogTitle>
+            <DialogDescription className="text-zinc-400">
+              Новая фраза будет сохранена, только если в базе нет такой же или слишком похожей.
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            value={newPhraseText}
+            onChange={(e) => setNewPhraseText(e.target.value)}
+            rows={5}
+            placeholder="Текст фразы"
+            className="bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500"
+          />
+          <Input
+            value={newPhraseAuthor}
+            onChange={(e) => setNewPhraseAuthor(e.target.value)}
+            placeholder="Автор"
+            className="bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500"
+          />
+          <DialogFooter>
+            <Button variant="outline" className="bg-zinc-800 border-zinc-700 text-zinc-200" onClick={() => setAddDialogOpen(false)}>
+              Отмена
+            </Button>
+            <Button className="bg-blue-600 hover:bg-blue-700 text-white" onClick={handleAddPhrase} disabled={addingPhrase}>
+              {addingPhrase ? 'Сохраняю...' : 'Сохранить'}
             </Button>
           </DialogFooter>
         </DialogContent>

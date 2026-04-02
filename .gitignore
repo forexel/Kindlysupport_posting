@@ -32,5 +32,11 @@ Content Platform Web App/node_modules/
 # Local editor artifacts
 *.swp
 
+# Local temp/runtime artifacts
+tmp/
+content.db
+pritchi_from_185/
+recovered_pritchi_local_run/
+
 # Optional local archive
 Content Platform Web App.zip

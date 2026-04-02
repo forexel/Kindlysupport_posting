@@ -7,9 +7,9 @@ import { Card } from '../components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
 import { Checkbox } from '../components/ui/checkbox';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
-import { Plus, Link as LinkIcon, Loader2, Image as ImageIcon, Send, Calendar, BookOpen } from 'lucide-react';
+import { Plus, Link as LinkIcon, Loader2, Image as ImageIcon, Send, Calendar, BookOpen, Trash2, ScanText } from 'lucide-react';
 import { toast } from 'sonner';
-import { api, mskIso } from '../lib/api';
+import { api, mskIso, toDataUrl } from '../lib/api';
 
 interface ParablePost {
   id: number;
@@ -20,8 +20,29 @@ interface ParablePost {
   category?: string | null;
 }
 
+interface PostPreview {
+  id: number;
+  title: string;
+  text_body: string;
+  final_image_url?: string;
+  preview_payload?: {
+    social_image_url?: string;
+  } | null;
+}
+
+const initialChannels = {
+  telegram: true,
+  vk: false,
+  vk_channel: false,
+  max: false,
+  ok: false,
+  pinterest: false,
+  instagram: false,
+};
+
 export function ParablesPage() {
   const [parables, setParables] = useState<ParablePost[]>([]);
+  const [search, setSearch] = useState('');
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [generateDialogOpen, setGenerateDialogOpen] = useState(false);
 
@@ -29,44 +50,73 @@ export function ParablesPage() {
   const [text, setText] = useState('');
   const [url, setUrl] = useState('');
   const [recognizing, setRecognizing] = useState(false);
+  const [ocrFiles, setOcrFiles] = useState<File[]>([]);
 
   const [generatingImage, setGeneratingImage] = useState(false);
+  const [savingPost, setSavingPost] = useState(false);
   const [postText, setPostText] = useState('');
-  const [imageUrl, setImageUrl] = useState('');
+  const [telegramImageUrl, setTelegramImageUrl] = useState('');
+  const [socialImageUrl, setSocialImageUrl] = useState('');
   const [selectedParable, setSelectedParable] = useState<ParablePost | null>(null);
   const [selectedPostId, setSelectedPostId] = useState<number | null>(null);
 
-  const [channels, setChannels] = useState({ telegram: true, vk: false, vk_channel: false, max: false, ok: false, pinterest: false, instagram: false });
+  const [channels, setChannels] = useState(initialChannels);
   const [scheduleType, setScheduleType] = useState<'now' | 'scheduled'>('now');
   const [scheduleDate, setScheduleDate] = useState('');
   const [scheduleTime, setScheduleTime] = useState('');
 
-  const loadParables = async () => {
+  const loadParables = async (query = '') => {
     try {
-      const rows = await api<ParablePost[]>('/api/parables?limit=300');
+      const qs = new URLSearchParams({ limit: '50' });
+      if (query.trim()) qs.set('search', query.trim());
+      const rows = await api<ParablePost[]>(`/api/parables?${qs.toString()}`);
       setParables(rows);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
   };
 
-  useEffect(() => { loadParables(); }, []);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      loadParables(search);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+
+  useEffect(() => {
+    loadParables('');
+  }, []);
+
+  const resetCreateForm = () => {
+    setTitle('');
+    setText('');
+    setUrl('');
+    setOcrFiles([]);
+  };
+
+  const syncPreviewState = (post: PostPreview, parable?: ParablePost | null) => {
+    setSelectedParable(parable || selectedParable);
+    setSelectedPostId(post.id);
+    setPostText(post.text_body || '');
+    setTelegramImageUrl(post.final_image_url || '');
+    setSocialImageUrl(post.preview_payload?.social_image_url || post.final_image_url || '');
+  };
 
   const handleCreateParable = async (mode: 'manual' | 'link') => {
     try {
-      const p = await api<ParablePost>('/api/parables', 'POST', mode === 'manual' ? { mode, title, text_body: text } : { mode, title, url, text_body: text });
-      const post = await api<any>(`/api/parables/${p.id}/posts`, 'POST');
+      const images = ocrFiles.length ? await Promise.all(ocrFiles.map((file) => toDataUrl(file))) : [];
+      const payload =
+        mode === 'manual'
+          ? { mode, title, text_body: text, images }
+          : { mode, title, url, text_body: text };
+      const parable = await api<ParablePost>('/api/parables', 'POST', payload);
+      const post = await api<PostPreview>(`/api/parables/${parable.id}/posts`, 'POST');
       toast.success('Притча создана');
-      setSelectedParable(p);
-      setSelectedPostId(post.id);
-      setPostText(post.text_body || p.text_body || '');
-      setImageUrl(post.final_image_url || '');
+      syncPreviewState(post, parable);
       setCreateDialogOpen(false);
       setGenerateDialogOpen(true);
-      setTitle('');
-      setText('');
-      setUrl('');
-      await loadParables();
+      resetCreateForm();
+      await loadParables(search);
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
@@ -77,9 +127,8 @@ export function ParablesPage() {
     setRecognizing(true);
     try {
       const res = await api<any>('/api/phrases/import-image-url', 'POST', { image_url: url });
-      const candidate = (res.phrases && res.phrases[0]) || (res.ocr_text || '').split('\n')[0] || '';
       setTitle((prev) => prev || 'Притча');
-      setText(candidate || res.ocr_text || '');
+      setText(String(res.ocr_text || '').trim());
       toast.success('Текст распознан');
     } catch (e: any) {
       toast.error(String(e?.message || e));
@@ -88,13 +137,37 @@ export function ParablesPage() {
     }
   };
 
+  const handleRecognizeFromFiles = async (files: FileList | null) => {
+    const nextFiles = Array.from(files || []).filter((file) => file.type.startsWith('image/'));
+    setOcrFiles(nextFiles);
+    await runOcrForFiles(nextFiles);
+  };
+
+  const runOcrForFiles = async (files: File[]) => {
+    if (!files.length) return;
+    setRecognizing(true);
+    try {
+      const images = await Promise.all(files.map((file) => toDataUrl(file)));
+      const res = await api<any>('/api/parables/ocr-images-base64', 'POST', { images });
+      if (!title.trim()) setTitle('Притча');
+      setText(String(res.ocr_text || '').trim());
+      toast.success(`Распознано изображений: ${res.images_processed || files.length}`);
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setRecognizing(false);
+    }
+  };
+
+  const handleRerunOcr = async () => {
+    if (!ocrFiles.length) return toast.error('Сначала выбери изображения');
+    await runOcrForFiles(ocrFiles);
+  };
+
   const handleOpenGenerate = (parable: ParablePost) => {
-    api<any>(`/api/parables/${parable.id}/posts`, 'POST')
+    api<PostPreview>(`/api/parables/${parable.id}/posts`, 'POST')
       .then((post) => {
-        setSelectedParable(parable);
-        setSelectedPostId(post.id);
-        setPostText(post.text_body || parable.text_body || '');
-        setImageUrl(post.final_image_url || '');
+        syncPreviewState(post, parable);
         setGenerateDialogOpen(true);
       })
       .catch((e: any) => {
@@ -102,13 +175,46 @@ export function ParablesPage() {
       });
   };
 
+  const handleDeleteParable = async (parable: ParablePost) => {
+    if (!window.confirm(`Удалить притчу "${parable.title}"?`)) return;
+    try {
+      await api(`/api/parables/${parable.id}`, 'DELETE');
+      if (selectedParable?.id === parable.id) {
+        setGenerateDialogOpen(false);
+        setSelectedParable(null);
+        setSelectedPostId(null);
+      }
+      toast.success('Притча удалена');
+      await loadParables(search);
+    } catch (e: any) {
+      toast.error(String(e?.message || e));
+    }
+  };
+
+  const savePostDraft = async () => {
+    if (!selectedPostId) return;
+    setSavingPost(true);
+    try {
+      const post = await api<PostPreview>(`/api/posts/${selectedPostId}`, 'PUT', {
+        title: selectedParable?.title || '',
+        text_body: postText,
+      });
+      syncPreviewState(post, selectedParable);
+    } finally {
+      setSavingPost(false);
+    }
+  };
+
   const handleGenerateImage = async () => {
     if (!selectedPostId) return;
     setGeneratingImage(true);
     try {
-      const p = await api<any>(`/api/posts/${selectedPostId}/preview`, 'POST', { scenario: 'Кинематографичный, спокойный, реалистичный фон', regen_instruction: '' });
-      setImageUrl(p.final_image_url || '');
-      setPostText(p.text_body || postText);
+      await savePostDraft();
+      const post = await api<PostPreview>(`/api/posts/${selectedPostId}/preview`, 'POST', {
+        scenario: 'Кинематографичный, спокойный, реалистичный фон для длинной притчи',
+        regen_instruction: '',
+      });
+      syncPreviewState(post, selectedParable);
       toast.success('Изображение сгенерировано');
     } catch (e: any) {
       toast.error(String(e?.message || e));
@@ -119,16 +225,20 @@ export function ParablesPage() {
 
   const handlePublish = async () => {
     if (!selectedPostId) return;
-    const targets = Object.entries(channels).filter(([_, v]) => v).map(([k]) => k);
+    const targets = Object.entries(channels)
+      .filter(([_, v]) => v)
+      .map(([k]) => k);
     if (!targets.length) return toast.error('Выберите хотя бы один канал для публикации');
     try {
+      await savePostDraft();
       if (scheduleType === 'scheduled') {
         const iso = mskIso(scheduleDate, scheduleTime);
         if (!iso) return toast.error('Заполни дату и время');
         await api(`/api/posts/${selectedPostId}/publish`, 'POST', { mode: 'schedule', scheduled_for: iso });
+      } else if (targets.length === 1 && targets[0] === 'telegram') {
+        await api(`/api/posts/${selectedPostId}/publish`, 'POST', { mode: 'now' });
       } else {
-        if (targets.length === 1 && targets[0] === 'telegram') await api(`/api/posts/${selectedPostId}/publish`, 'POST', { mode: 'now' });
-        else await api(`/api/posts/${selectedPostId}/publish/multi`, 'POST', { targets });
+        await api(`/api/posts/${selectedPostId}/publish/multi`, 'POST', { targets });
       }
       toast.success('Публикация отправлена');
       setGenerateDialogOpen(false);
@@ -139,91 +249,216 @@ export function ParablesPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-2 text-sm text-zinc-400"><span>Главная</span><span>/</span><span className="text-zinc-200">Притчи</span></div>
+      <div className="flex items-center gap-2 text-sm text-zinc-400">
+        <span>Главная</span>
+        <span>/</span>
+        <span className="text-zinc-200">Притчи</span>
+      </div>
 
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div><h1 className="text-3xl font-bold text-zinc-50">Притчи</h1><p className="text-zinc-400 mt-1">Всего притч: {parables.length}</p></div>
+        <div>
+          <h1 className="text-3xl font-bold text-zinc-50">Притчи</h1>
+          <p className="mt-1 text-zinc-400">Показано притч: {parables.length}</p>
+        </div>
+        <div className="w-full sm:max-w-md">
+          <Input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Поиск по заголовку, тексту, категории..."
+            className="border-zinc-700 bg-zinc-800 text-zinc-100"
+          />
+        </div>
         <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-          <DialogTrigger asChild><Button className="bg-blue-600 hover:bg-blue-700 text-white"><Plus className="mr-2 h-4 w-4" />Создать притчу</Button></DialogTrigger>
-          <DialogContent className="bg-zinc-900 border-zinc-800 max-w-2xl max-h-[90vh] overflow-y-auto">
-            <DialogHeader><DialogTitle className="text-zinc-50">Создание притчи</DialogTitle></DialogHeader>
+          <DialogTrigger asChild>
+            <Button className="bg-blue-600 text-white hover:bg-blue-700">
+              <Plus className="mr-2 h-4 w-4" />
+              Создать притчу
+            </Button>
+          </DialogTrigger>
+          <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto border-zinc-800 bg-zinc-900">
+            <DialogHeader>
+              <DialogTitle className="text-zinc-50">Создание притчи</DialogTitle>
+            </DialogHeader>
             <Tabs defaultValue="manual" className="w-full">
-              <TabsList className="bg-zinc-800 border border-zinc-700">
-                <TabsTrigger value="manual" className="data-[state=active]:bg-zinc-700 data-[state=active]:text-zinc-100">Ручной ввод</TabsTrigger>
-                <TabsTrigger value="url" className="data-[state=active]:bg-zinc-700 data-[state=active]:text-zinc-100">Распознать по ссылке</TabsTrigger>
+              <TabsList className="border border-zinc-700 bg-zinc-800">
+                <TabsTrigger value="manual" className="data-[state=active]:bg-zinc-700 data-[state=active]:text-zinc-100">
+                  Ручной ввод
+                </TabsTrigger>
+                <TabsTrigger value="images" className="data-[state=active]:bg-zinc-700 data-[state=active]:text-zinc-100">
+                  Фото и картинки
+                </TabsTrigger>
+                <TabsTrigger value="url" className="data-[state=active]:bg-zinc-700 data-[state=active]:text-zinc-100">
+                  Распознать по ссылке
+                </TabsTrigger>
               </TabsList>
 
-              <TabsContent value="manual" className="space-y-4 mt-4">
-                <div className="space-y-2"><Label htmlFor="parable-title" className="text-zinc-200">Заголовок</Label><Input id="parable-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Введите заголовок притчи..." className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
-                <div className="space-y-2"><Label htmlFor="parable-text" className="text-zinc-200">Текст</Label><Textarea id="parable-text" value={text} onChange={(e) => setText(e.target.value)} rows={12} className="bg-zinc-800 border-zinc-700 text-zinc-100 resize-none" /></div>
-                <div className="flex justify-end"><Button onClick={() => handleCreateParable('manual')} className="bg-blue-600 hover:bg-blue-700 text-white">Создать</Button></div>
+              <TabsContent value="manual" className="mt-4 space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="parable-title" className="text-zinc-200">Заголовок</Label>
+                  <Input id="parable-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Введите заголовок притчи..." className="border-zinc-700 bg-zinc-800 text-zinc-100" />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="parable-text" className="text-zinc-200">Текст</Label>
+                  <Textarea id="parable-text" value={text} onChange={(e) => setText(e.target.value)} rows={12} className="resize-none border-zinc-700 bg-zinc-800 text-zinc-100" />
+                </div>
+                <div className="flex justify-end">
+                  <Button onClick={() => handleCreateParable('manual')} className="bg-blue-600 text-white hover:bg-blue-700">Создать</Button>
+                </div>
               </TabsContent>
 
-              <TabsContent value="url" className="space-y-4 mt-4">
+              <TabsContent value="images" className="mt-4 space-y-4">
+                <div className="space-y-2">
+                  <Label className="text-zinc-200">Заголовок</Label>
+                  <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Введите заголовок притчи..." className="border-zinc-700 bg-zinc-800 text-zinc-100" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-zinc-200">Изображения притчи</Label>
+                  <Input type="file" multiple accept="image/*" onChange={(e) => handleRecognizeFromFiles(e.target.files)} className="border-zinc-700 bg-zinc-800 text-zinc-100" />
+                  <p className="text-xs text-zinc-500">Можно выбрать несколько страниц. Они будут распознаны как один текст.</p>
+                </div>
+                {ocrFiles.length ? <p className="text-sm text-zinc-400">Файлов выбрано: {ocrFiles.length}</p> : null}
+                <div className="space-y-2">
+                  <Label className="text-zinc-200">Текст</Label>
+                  <Textarea value={text} onChange={(e) => setText(e.target.value)} rows={12} className="resize-none border-zinc-700 bg-zinc-800 text-zinc-100" />
+                </div>
+                <div className="flex justify-between">
+                  <Button type="button" variant="outline" onClick={handleRerunOcr} disabled={recognizing} className="border-zinc-700 bg-zinc-900 text-zinc-200 hover:bg-zinc-800">
+                    {recognizing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ScanText className="mr-2 h-4 w-4" />}
+                    Распознать заново
+                  </Button>
+                  <Button onClick={() => handleCreateParable('manual')} className="bg-blue-600 text-white hover:bg-blue-700">Создать</Button>
+                </div>
+              </TabsContent>
+
+              <TabsContent value="url" className="mt-4 space-y-4">
                 <div className="space-y-2">
                   <Label htmlFor="parable-url" className="text-zinc-200">Ссылка на источник</Label>
                   <div className="flex gap-2">
-                    <Input id="parable-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/parable" className="bg-zinc-800 border-zinc-700 text-zinc-100" />
-                    <Button onClick={handleRecognizeFromUrl} disabled={recognizing} className="bg-blue-600 hover:bg-blue-700 text-white">{recognizing ? <Loader2 className="h-4 w-4 animate-spin" /> : <LinkIcon className="h-4 w-4" />}</Button>
+                    <Input id="parable-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/parable" className="border-zinc-700 bg-zinc-800 text-zinc-100" />
+                    <Button onClick={handleRecognizeFromUrl} disabled={recognizing} className="bg-blue-600 text-white hover:bg-blue-700">
+                      {recognizing ? <Loader2 className="h-4 w-4 animate-spin" /> : <LinkIcon className="h-4 w-4" />}
+                    </Button>
                   </div>
                 </div>
-                <div className="space-y-2"><Label className="text-zinc-200">Заголовок</Label><Input value={title} onChange={(e) => setTitle(e.target.value)} className="bg-zinc-800 border-zinc-700 text-zinc-100" /></div>
-                <div className="space-y-2"><Label className="text-zinc-200">Текст</Label><Textarea value={text} onChange={(e) => setText(e.target.value)} rows={12} className="bg-zinc-800 border-zinc-700 text-zinc-100 resize-none" /></div>
-                <div className="flex justify-end"><Button onClick={() => handleCreateParable('link')} className="bg-blue-600 hover:bg-blue-700 text-white">Создать</Button></div>
+                <div className="space-y-2">
+                  <Label className="text-zinc-200">Заголовок</Label>
+                  <Input value={title} onChange={(e) => setTitle(e.target.value)} className="border-zinc-700 bg-zinc-800 text-zinc-100" />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-zinc-200">Текст</Label>
+                  <Textarea value={text} onChange={(e) => setText(e.target.value)} rows={12} className="resize-none border-zinc-700 bg-zinc-800 text-zinc-100" />
+                </div>
+                <div className="flex justify-end">
+                  <Button onClick={() => handleCreateParable('link')} className="bg-blue-600 text-white hover:bg-blue-700">Создать</Button>
+                </div>
               </TabsContent>
             </Tabs>
           </DialogContent>
         </Dialog>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
         {parables.map((parable) => (
-          <Card key={parable.id} className="bg-zinc-900 border-zinc-800 p-6 space-y-4 hover:border-zinc-700 transition-colors">
-            <div className="flex items-start justify-between"><BookOpen className="h-5 w-5 text-zinc-500" /><span className="text-xs text-zinc-500">{(parable.created_at || '').slice(0,10)}</span></div>
-            <div>
-              <h3 className="text-lg font-semibold text-zinc-100 mb-2">{parable.title}</h3>
-              <p className="text-zinc-400 text-sm line-clamp-3">{parable.text_body}</p>
-              {parable.category ? <p className="text-xs text-zinc-500 mt-2">{parable.category}</p> : null}
+          <Card key={parable.id} className="space-y-4 border-zinc-800 bg-zinc-900 p-6 transition-colors hover:border-zinc-700">
+            <div className="flex items-start justify-between">
+              <BookOpen className="h-5 w-5 text-zinc-500" />
+              <span className="text-xs text-zinc-500">{(parable.created_at || '').slice(0, 10)}</span>
             </div>
-            <Button onClick={() => handleOpenGenerate(parable)} className="w-full bg-blue-600 hover:bg-blue-700 text-white">Генерировать пост</Button>
+            <div>
+              <h3 className="mb-2 text-lg font-semibold text-zinc-100">{parable.title}</h3>
+              <p className="line-clamp-4 text-sm text-zinc-400">{parable.text_body}</p>
+              {parable.category ? <p className="mt-2 text-xs text-zinc-500">{parable.category}</p> : null}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Button onClick={() => handleOpenGenerate(parable)} className="bg-blue-600 text-white hover:bg-blue-700">Генерировать</Button>
+              <Button onClick={() => handleDeleteParable(parable)} variant="outline" className="border-red-900 bg-zinc-950 text-red-300 hover:bg-red-950/40">
+                <Trash2 className="mr-2 h-4 w-4" />
+                Удалить
+              </Button>
+            </div>
           </Card>
         ))}
       </div>
 
       <Dialog open={generateDialogOpen} onOpenChange={setGenerateDialogOpen}>
-        <DialogContent className="bg-zinc-900 border-zinc-800 max-w-4xl max-h-[90vh] overflow-y-auto">
-          <DialogHeader><DialogTitle className="text-zinc-50">{selectedParable?.title}</DialogTitle></DialogHeader>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <DialogContent className="max-h-[90vh] max-w-5xl overflow-y-auto border-zinc-800 bg-zinc-900">
+          <DialogHeader>
+            <DialogTitle className="text-zinc-50">{selectedParable?.title}</DialogTitle>
+          </DialogHeader>
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="space-y-4">
-              <div className="space-y-2"><Label className="text-zinc-200">Текст поста</Label><Textarea value={postText} onChange={(e) => setPostText(e.target.value)} rows={8} className="bg-zinc-800 border-zinc-700 text-zinc-100 resize-none" /></div>
-              <Button onClick={handleGenerateImage} disabled={generatingImage} className="w-full bg-blue-600 hover:bg-blue-700 text-white">{generatingImage ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Генерация...</> : <><ImageIcon className="mr-2 h-4 w-4" />Сгенерировать изображение</>}</Button>
-              {imageUrl && <img src={imageUrl} alt="Generated" className="w-full aspect-square object-cover rounded-lg" />}
+              <div className="space-y-2">
+                <Label className="text-zinc-200">Текст поста</Label>
+                <Textarea value={postText} onChange={(e) => setPostText(e.target.value)} rows={14} className="resize-none border-zinc-700 bg-zinc-800 text-zinc-100" />
+              </div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <Button onClick={handleGenerateImage} disabled={generatingImage || savingPost} className="bg-blue-600 text-white hover:bg-blue-700">
+                  {generatingImage ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Генерация...</> : <><ImageIcon className="mr-2 h-4 w-4" />Сгенерировать изображение</>}
+                </Button>
+                <Button onClick={savePostDraft} disabled={savingPost || !selectedPostId} variant="outline" className="border-zinc-700 bg-zinc-900 text-zinc-100 hover:bg-zinc-800">
+                  {savingPost ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Сохранить текст
+                </Button>
+              </div>
+
+              {telegramImageUrl ? (
+                <Card className="space-y-3 border-zinc-700 bg-zinc-800 p-4">
+                  <Label className="block text-zinc-200">Telegram</Label>
+                  <img src={telegramImageUrl} alt="Telegram preview" className="w-full rounded-lg object-contain" />
+                </Card>
+              ) : null}
+
+              {socialImageUrl ? (
+                <Card className="space-y-3 border-zinc-700 bg-zinc-800 p-4">
+                  <Label className="block text-zinc-200">Instagram и другие соцсети</Label>
+                  <img src={socialImageUrl} alt="Social preview" className="aspect-square w-full rounded-lg object-cover" />
+                </Card>
+              ) : null}
             </div>
 
             <div className="space-y-4">
-              <Card className="bg-zinc-800 border-zinc-700 p-4">
-                <Label className="text-zinc-200 mb-3 block">Превью поста</Label>
-                {imageUrl ? <div className="relative aspect-square rounded-lg overflow-hidden"><img src={imageUrl} alt="Preview" className="w-full h-full object-cover" /><div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/70 flex items-end p-4"><p className="text-white text-sm leading-relaxed line-clamp-3">{postText}</p></div></div> : <div className="aspect-square bg-zinc-900 rounded-lg flex items-center justify-center"><p className="text-zinc-500 text-sm">Изображение не сгенерировано</p></div>}
+              <Card className="border-zinc-700 bg-zinc-800 p-4">
+                <Label className="mb-3 block text-zinc-200">Полный пост</Label>
+                <div className="space-y-4 rounded-lg bg-zinc-900 p-4">
+                  {telegramImageUrl ? <img src={telegramImageUrl} alt="Post preview" className="w-full rounded-lg object-contain" /> : null}
+                  <div className="space-y-3">
+                    <h3 className="text-xl font-semibold text-zinc-50">{selectedParable?.title}</h3>
+                    <p className="whitespace-pre-wrap text-sm leading-7 text-zinc-300">{postText}</p>
+                  </div>
+                </div>
               </Card>
 
-              <Card className="bg-zinc-800 border-zinc-700 p-4 space-y-4">
+              <Card className="space-y-4 border-zinc-700 bg-zinc-800 p-4">
                 <Label className="text-zinc-200">Каналы</Label>
                 <div className="space-y-2">
                   {Object.entries(channels).map(([channel, checked]) => (
                     <div key={channel} className="flex items-center space-x-2">
                       <Checkbox id={`channel-${channel}`} checked={checked} onCheckedChange={(c) => setChannels({ ...channels, [channel]: c as boolean })} className="border-zinc-600" />
-                      <Label htmlFor={`channel-${channel}`} className="text-zinc-300 capitalize cursor-pointer">{channel}</Label>
+                      <Label htmlFor={`channel-${channel}`} className="cursor-pointer capitalize text-zinc-300">{channel}</Label>
                     </div>
                   ))}
                 </div>
 
                 <div className="space-y-2">
-                  <div className="flex items-center space-x-2"><Checkbox id="schedule-now" checked={scheduleType === 'now'} onCheckedChange={(c) => c && setScheduleType('now')} className="border-zinc-600" /><Label htmlFor="schedule-now" className="text-zinc-300 cursor-pointer">Опубликовать сейчас</Label></div>
-                  <div className="flex items-center space-x-2"><Checkbox id="schedule-later" checked={scheduleType === 'scheduled'} onCheckedChange={(c) => c && setScheduleType('scheduled')} className="border-zinc-600" /><Label htmlFor="schedule-later" className="text-zinc-300 cursor-pointer">Запланировать</Label></div>
-                  {scheduleType === 'scheduled' && <div className="grid grid-cols-2 gap-2 pt-2"><Input type="date" value={scheduleDate} onChange={(e) => setScheduleDate(e.target.value)} className="bg-zinc-900 border-zinc-600 text-zinc-100" /><Input type="time" value={scheduleTime} onChange={(e) => setScheduleTime(e.target.value)} className="bg-zinc-900 border-zinc-600 text-zinc-100" /></div>}
+                  <div className="flex items-center space-x-2">
+                    <Checkbox id="schedule-now" checked={scheduleType === 'now'} onCheckedChange={(c) => c && setScheduleType('now')} className="border-zinc-600" />
+                    <Label htmlFor="schedule-now" className="cursor-pointer text-zinc-300">Опубликовать сейчас</Label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox id="schedule-later" checked={scheduleType === 'scheduled'} onCheckedChange={(c) => c && setScheduleType('scheduled')} className="border-zinc-600" />
+                    <Label htmlFor="schedule-later" className="cursor-pointer text-zinc-300">Запланировать</Label>
+                  </div>
+                  {scheduleType === 'scheduled' ? (
+                    <div className="grid grid-cols-2 gap-2 pt-2">
+                      <Input type="date" value={scheduleDate} onChange={(e) => setScheduleDate(e.target.value)} className="border-zinc-600 bg-zinc-900 text-zinc-100" />
+                      <Input type="time" value={scheduleTime} onChange={(e) => setScheduleTime(e.target.value)} className="border-zinc-600 bg-zinc-900 text-zinc-100" />
+                    </div>
+                  ) : null}
                 </div>
 
-                <Button onClick={handlePublish} className="w-full bg-green-600 hover:bg-green-700 text-white">{scheduleType === 'now' ? <><Send className="mr-2 h-4 w-4" />Опубликовать</> : <><Calendar className="mr-2 h-4 w-4" />Запланировать</>}</Button>
+                <Button onClick={handlePublish} className="w-full bg-green-600 text-white hover:bg-green-700">
+                  {scheduleType === 'now' ? <><Send className="mr-2 h-4 w-4" />Опубликовать</> : <><Calendar className="mr-2 h-4 w-4" />Запланировать</>}
+                </Button>
               </Card>
             </div>
           </div>

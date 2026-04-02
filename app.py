@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import re
+import socket
 import hashlib
 import difflib
 import secrets
@@ -18,6 +19,7 @@ import io
 import binascii
 import textwrap
 import gzip
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread
@@ -222,6 +224,15 @@ def download_remote_image(url: str) -> tuple[bytes, str]:
     return data, ctype or "image/jpeg"
 
 
+def image_ext_from_content_type(content_type: str) -> str:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype == "image/png":
+        return ".png"
+    if ctype == "image/webp":
+        return ".webp"
+    return ".jpg"
+
+
 def normalize_image_to_square_1024(image_bytes: bytes, content_type: str = "image/jpeg") -> tuple[bytes, str]:
     if not image_bytes:
         raise RuntimeError("empty image bytes")
@@ -233,6 +244,25 @@ def normalize_image_to_square_1024(image_bytes: bytes, content_type: str = "imag
         top = max(0, (h - side) // 2)
         cropped = rgb.crop((left, top, left + side, top + side))
         resized = cropped.resize((1024, 1024), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        resized.save(out, format="JPEG", quality=92, optimize=True)
+        return out.getvalue(), "image/jpeg"
+
+
+def normalize_image_to_fit_box(
+    image_bytes: bytes,
+    max_width: int = 1024,
+    max_height: int = 1536,
+) -> tuple[bytes, str]:
+    if not image_bytes:
+        raise RuntimeError("empty image bytes")
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        rgb = img.convert("RGB")
+        w, h = rgb.size
+        if w <= 0 or h <= 0:
+            raise RuntimeError("invalid image size")
+        scale = min(max_width / float(w), max_height / float(h), 1.0)
+        resized = rgb.resize((max(1, int(round(w * scale))), max(1, int(round(h * scale)))), Image.Resampling.LANCZOS)
         out = io.BytesIO()
         resized.save(out, format="JPEG", quality=92, optimize=True)
         return out.getvalue(), "image/jpeg"
@@ -364,6 +394,11 @@ CORS_ALLOW_ORIGINS = [x.strip() for x in os.getenv("CORS_ALLOW_ORIGINS", APP_BAS
 ENABLE_DAILY_AUTOPREVIEW = os.getenv("ENABLE_DAILY_AUTOPREVIEW", "1").strip() in {"1", "true", "yes"}
 DAILY_AUTOPREVIEW_HOUR_MSK = int(os.getenv("DAILY_AUTOPREVIEW_HOUR_MSK", "9"))
 DAILY_AUTOPREVIEW_MINUTE_MSK = int(os.getenv("DAILY_AUTOPREVIEW_MINUTE_MSK", "0"))
+DAILY_AUTOPREVIEW_RETRY_BACKOFF_SECONDS = int(os.getenv("DAILY_AUTOPREVIEW_RETRY_BACKOFF_SECONDS", "600"))
+TELEGRAM_API_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_API_TIMEOUT_SECONDS", "60"))
+TELEGRAM_API_RETRIES = int(os.getenv("TELEGRAM_API_RETRIES", "4"))
+TELEGRAM_FORCE_IPV6 = os.getenv("TELEGRAM_FORCE_IPV6", "1").strip().lower() in {"1", "true", "yes"}
+TELEGRAM_API_BASE_URL = os.getenv("TELEGRAM_API_BASE_URL", "https://api.telegram.org").strip().rstrip("/")
 TELEGRAM_MODE = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()
 FRONTEND_DIST_DIR = Path(os.getenv("FRONTEND_DIST_DIR", "Content Platform Web App/dist")).resolve()
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "/tmp/generated_media")).resolve()
@@ -549,6 +584,8 @@ def init_db() -> None:
                     source_ref TEXT,
                     source_published_at TEXT,
                     tags_json TEXT NOT NULL DEFAULT '[]',
+                    is_stub INTEGER NOT NULL DEFAULT 0,
+                    last_import_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -566,6 +603,8 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_posts_scheduled_for ON posts(scheduled_for);
                 CREATE INDEX IF NOT EXISTS idx_phrases_published_id ON phrases(is_published, id);
                 CREATE INDEX IF NOT EXISTS idx_parables_source_site_id ON parables(source_site, source_external_id);
+                CREATE INDEX IF NOT EXISTS idx_parables_source_external_id ON parables(source_external_id);
+                CREATE INDEX IF NOT EXISTS idx_parables_category ON parables(category);
                 CREATE INDEX IF NOT EXISTS idx_image_logs_post_created ON image_generation_logs(post_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_films_title ON films(title);
                 """
@@ -658,6 +697,8 @@ def init_db() -> None:
                     source_ref TEXT,
                     source_published_at TEXT,
                     tags_json TEXT NOT NULL DEFAULT '[]',
+                    is_stub INTEGER NOT NULL DEFAULT 0,
+                    last_import_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -675,6 +716,9 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_posts_scheduled_for ON posts(scheduled_for);
                 CREATE INDEX IF NOT EXISTS idx_phrases_published_id ON phrases(is_published, id);
                 CREATE INDEX IF NOT EXISTS idx_parables_source_site_id ON parables(source_site, source_external_id);
+                CREATE INDEX IF NOT EXISTS idx_parables_source_external_id ON parables(source_external_id);
+                CREATE INDEX IF NOT EXISTS idx_parables_category ON parables(category);
+                CREATE INDEX IF NOT EXISTS idx_parables_title ON parables(title);
                 CREATE INDEX IF NOT EXISTS idx_image_logs_post_created ON image_generation_logs(post_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_films_title ON films(title);
                 """
@@ -693,6 +737,7 @@ def init_db() -> None:
                 except Exception:
                     pass
         if DB_BACKEND == "postgres":
+            conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
             conn.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS csrf_token TEXT")
             conn.execute("ALTER TABLE phrases ADD COLUMN IF NOT EXISTS author TEXT")
             conn.execute("ALTER TABLE phrases ADD COLUMN IF NOT EXISTS topic TEXT")
@@ -703,6 +748,39 @@ def init_db() -> None:
             conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS source_ref TEXT")
             conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS source_published_at TEXT")
             conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS tags_json TEXT NOT NULL DEFAULT '[]'")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS is_stub INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE parables ADD COLUMN IF NOT EXISTS last_import_error TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_phrases_author ON phrases(author)")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_phrases_text_trgm
+                ON phrases
+                USING GIN (text_body gin_trgm_ops)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_phrases_author_trgm
+                ON phrases
+                USING GIN (coalesce(author,'') gin_trgm_ops)
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_parables_source_external_id ON parables(source_external_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_parables_category ON parables(category)")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_parables_fts
+                ON parables
+                USING GIN (to_tsvector('russian', coalesce(title,'') || ' ' || coalesce(text_body,'')))
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_parables_title_trgm
+                ON parables
+                USING GIN (title gin_trgm_ops)
+                """
+            )
         else:
             try:
                 conn.execute("ALTER TABLE phrases ADD COLUMN author TEXT")
@@ -713,6 +791,14 @@ def init_db() -> None:
             except Exception:
                 pass
             for sql in (
+                "CREATE INDEX IF NOT EXISTS idx_phrases_author ON phrases(author)",
+                "CREATE INDEX IF NOT EXISTS idx_phrases_text ON phrases(text_body)",
+            ):
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
+            for sql in (
                 "ALTER TABLE parables ADD COLUMN source_site TEXT",
                 "ALTER TABLE parables ADD COLUMN source_external_id TEXT",
                 "ALTER TABLE parables ADD COLUMN category TEXT",
@@ -720,6 +806,8 @@ def init_db() -> None:
                 "ALTER TABLE parables ADD COLUMN source_ref TEXT",
                 "ALTER TABLE parables ADD COLUMN source_published_at TEXT",
                 "ALTER TABLE parables ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE parables ADD COLUMN is_stub INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE parables ADD COLUMN last_import_error TEXT",
             ):
                 try:
                     conn.execute(sql)
@@ -1310,6 +1398,8 @@ def row_to_parable(row: Any) -> dict[str, Any]:
         "source_ref": row["source_ref"],
         "source_published_at": row["source_published_at"],
         "tags": json.loads(row["tags_json"] or "[]"),
+        "is_stub": int(row["is_stub"] or 0),
+        "last_import_error": row["last_import_error"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -1364,12 +1454,14 @@ def http_json(
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
+    parsed_host = (urllib.parse.urlparse(url).hostname or "").strip().lower()
     for attempt in range(retries + 1):
         try:
-            if opener:
-                resp_ctx = opener.open(req, timeout=timeout)
-            else:
-                resp_ctx = urllib.request.urlopen(req, timeout=timeout)
+            with _prefer_ipv6_for_host(parsed_host) if TELEGRAM_FORCE_IPV6 and parsed_host == "api.telegram.org" else nullcontext():
+                if opener:
+                    resp_ctx = opener.open(req, timeout=timeout)
+                else:
+                    resp_ctx = urllib.request.urlopen(req, timeout=timeout)
             with resp_ctx as resp:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
@@ -1386,12 +1478,41 @@ def http_json(
             raise HTTPException(status_code=502, detail=f"HTTP request failed: {str(e)[:800]}")
 
 
+@contextmanager
+def _prefer_ipv6_for_host(hostname: str):
+    original_getaddrinfo = socket.getaddrinfo
+
+    def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        results = original_getaddrinfo(host, port, family, type, proto, flags)
+        if str(host).strip().lower() != hostname:
+            return results
+        ipv6_results = [item for item in results if item[0] == socket.AF_INET6]
+        return ipv6_results or results
+
+    socket.getaddrinfo = patched_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
+@contextmanager
+def nullcontext():
+    yield
+
+
 def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     tg_token = runtime_telegram_token()
     if not tg_token:
         raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN not set")
-    url = f"https://api.telegram.org/bot{tg_token}/{method}"
-    return http_json("POST", url, payload)
+    url = f"{TELEGRAM_API_BASE_URL}/bot{tg_token}/{method}"
+    return http_json(
+        "POST",
+        url,
+        payload,
+        timeout=TELEGRAM_API_TIMEOUT_SECONDS,
+        retries=TELEGRAM_API_RETRIES,
+    )
 
 
 def telegram_send_photo_bytes(
@@ -1447,7 +1568,62 @@ def telegram_send_photo_bytes(
         detail = e.read().decode("utf-8", errors="ignore")
         raise HTTPException(status_code=502, detail=f"HTTP {e.code}: {detail[:1200]}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"HTTP request failed: {str(e)[:800]}")
+        logger.warning("telegram_send_photo_bytes_primary_failed err=%s", str(e)[:400])
+        tmp_path: Optional[str] = None
+        try:
+            tmp_dir = Path("/tmp")
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = str(tmp_dir / f"tg-photo-{secrets.token_hex(8)}.jpg")
+            Path(tmp_path).write_bytes(image_bytes)
+            cmd = [
+                "curl",
+                "-6",
+                "--http1.1",
+                "-fsS",
+                f"https://api.telegram.org/bot{tg_token}/sendPhoto",
+                "-F",
+                f"chat_id={chat_id}",
+                "-F",
+                f"photo=@{tmp_path}",
+            ]
+            if caption:
+                cmd += ["-F", f"caption={caption}"]
+            if parse_mode:
+                cmd += ["-F", f"parse_mode={parse_mode}"]
+            if reply_markup:
+                cmd += ["-F", f"reply_markup={json.dumps(reply_markup, ensure_ascii=False)}"]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError((proc.stderr or proc.stdout or "curl sendPhoto failed")[:1200])
+            return json.loads((proc.stdout or "{}").strip() or "{}")
+        except Exception as curl_err:
+            raise HTTPException(status_code=502, detail=f"HTTP request failed: {str(curl_err)[:800]}")
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def telegram_send_photo_url(
+    chat_id: str | int,
+    photo_url: str,
+    caption: str = "",
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+    }
+    if caption:
+        payload["caption"] = caption
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api("sendPhoto", payload)
 
 
 def answer_callback(callback_query_id: str, text: str = "") -> None:
@@ -1629,18 +1805,69 @@ def build_manual_create_keyboard() -> dict[str, Any]:
     return tg_keyboard(
         [
             [("Сгенерить пост вручную", "ks:manual:0")],
+            [("Новая притча", "ks:newparable:0")],
             [("Добавить фразы", "ks:addphrases:0")],
         ]
     )
 
 
+def build_parable_draft_keyboard(can_generate: bool = False) -> dict[str, Any]:
+    rows: list[list[tuple[str, str]]] = []
+    if can_generate:
+        rows.append([("Сгенерировать пост", "ks:parablegen:0")])
+    rows.append([("Очистить черновик", "ks:parableclear:0"), ("Отмена", "ks:parablecancel:0")])
+    return tg_keyboard(rows)
+
+
 def build_daily_phrase_keyboard(phrase_id: int) -> dict[str, Any]:
     return tg_keyboard(
         [
-            [("Сменить фразу", f"ks:dailyswap:{phrase_id}")],
+            [("Заменить фразу", f"ks:dailyswap:{phrase_id}")],
             [("Сгенерировать пост", f"ks:dailygen:{phrase_id}")],
         ]
     )
+
+
+def _pick_random_unpublished_phrase(exclude_phrase_id: Optional[int] = None) -> Optional[dict[str, Any]]:
+    with db() as conn:
+        if exclude_phrase_id is not None:
+            row = conn.execute(
+                "SELECT id, text_body FROM phrases WHERE coalesce(is_published,0)=0 AND id <> ? ORDER BY random() LIMIT 1",
+                (exclude_phrase_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id, text_body FROM phrases WHERE coalesce(is_published,0)=0 ORDER BY random() LIMIT 1"
+            ).fetchone()
+        if not row:
+            row = conn.execute("SELECT id, text_body FROM phrases ORDER BY random() LIMIT 1").fetchone()
+    if not row:
+        return None
+    return {"id": int(row["id"]), "text_body": str(row["text_body"] or "").strip()}
+
+
+def _send_random_phrase_offer(chat_id: str | int, exclude_phrase_id: Optional[int] = None) -> bool:
+    phrase = _pick_random_unpublished_phrase(exclude_phrase_id=exclude_phrase_id)
+    if not phrase:
+        send_telegram_text(
+            chat_id,
+            "Фразы не найдены. Добавьте фразы через /add_phrases.",
+        )
+        return False
+    phrase_id = int(phrase["id"])
+    phrase_text = str(phrase["text_body"] or "").strip()
+    kv_set("daily_phrase_offer_date", now_msk().strftime("%Y-%m-%d"))
+    kv_set("daily_phrase_offer_phrase_id", str(phrase_id))
+    send_telegram_text(
+        chat_id,
+        (
+            "Выбрана фраза.\n\n"
+            f"{phrase_text}\n\n"
+            "Выберите действие:"
+        ),
+        reply_markup=build_daily_phrase_keyboard(phrase_id),
+    )
+    return True
 
 
 def telegram_file_data_url(file_id: str) -> str:
@@ -1666,32 +1893,71 @@ def telegram_file_data_url(file_id: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def _parable_draft_summary(payload: dict[str, Any]) -> str:
+    title = str((payload.get("title") or "")).strip()
+    text_body = str((payload.get("text_body") or "")).strip()
+    images = payload.get("images") or []
+    image_count = len(images) if isinstance(images, list) else 0
+    parts = [f"Заголовок: {title or 'не задан'}"]
+    if text_body:
+        preview = text_body[:500] + ("..." if len(text_body) > 500 else "")
+        parts.append(f"Текст:\n{preview}")
+    if image_count:
+        parts.append(f"Изображений в черновике: {image_count}")
+    parts.append("Можно прислать текст, одну или несколько картинок. Когда все готово — нажми «Сгенерировать пост».")
+    return "\n\n".join(parts)
+
+
 def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not runtime_telegram_token():
         return None
+    if post.get("id") and str(post.get("source_kind") or "") == "phrase":
+        post = ensure_phrase_post_ready_for_publish(int(post["id"]), post)
+    if str(post.get("source_kind") or "") == "phrase" and _phrase_post_needs_expansion(post):
+        raise HTTPException(status_code=502, detail="Phrase post text failed quality checks")
+    if not str(post.get("final_image_url") or "").strip():
+        raise HTTPException(status_code=502, detail="Preview requires final image")
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
-    use_md = (post.get("source_kind") or "").strip() == "phrase"
-    caption_md_limited = generate_post_caption_markdown_limited(post, max_len=1024) if use_md else ""
+    use_md = True
+    caption_md_limited = generate_post_caption_markdown_limited(post, max_len=1024)
     caption_plain = generate_post_caption_plain(post)
     keyboard = build_preview_keyboard(int(post["id"]))
 
-    def _send_text_only(chat_id: str | int) -> dict[str, Any]:
-        payload_msg: dict[str, Any] = {
-            "chat_id": chat_id,
-            "text": caption,
-            "reply_markup": keyboard,
-            "disable_web_page_preview": True,
-        }
-        if use_md:
-            payload_msg["parse_mode"] = "MarkdownV2"
-        return telegram_api("sendMessage", payload_msg)
+    def _send_parable_bundle(chat_id: str | int, image_bytes: bytes, filename: str) -> dict[str, Any]:
+        photo_res = telegram_send_photo_bytes(
+            chat_id=chat_id,
+            image_bytes=image_bytes,
+            filename=filename,
+            caption=(post.get("title") or "")[:1024],
+        )
+        try:
+            photo_mid = ((photo_res or {}).get("result") or {}).get("message_id")
+            if photo_mid is not None and post.get("id"):
+                _append_service_message_id_for_chat(int(post["id"]), post, chat_id, str(photo_mid))
+        except Exception:
+            logger.exception("telegram_parable_preview_track_photo_failed post_id=%s", post.get("id"))
+        return send_telegram_text(chat_id, caption_md_limited, reply_markup=keyboard, parse_mode="MarkdownV2") or {"ok": True}
 
     def _send(chat_id: str | int) -> dict[str, Any]:
         if post.get("final_image_url"):
+            remote_photo_url = str(post.get("final_image_url") or "").strip()
+            if remote_photo_url.startswith("http://") or remote_photo_url.startswith("https://"):
+                try:
+                    return telegram_send_photo_url(
+                        chat_id=chat_id,
+                        photo_url=remote_photo_url,
+                        caption=caption_md_limited if use_md else ((caption_plain[:1000] + "...") if len(caption_plain) > 1024 else caption_plain),
+                        parse_mode="MarkdownV2" if use_md else None,
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    logger.exception("telegram_preview_send_remote_url_failed url=%s", remote_photo_url)
             media_key = media_key_from_url(str(post["final_image_url"]))
             if media_key:
                 try:
                     image_bytes, _ = storage_get_bytes(media_key)
+                    if str(post.get("source_kind") or "") == "parable":
+                        return _send_parable_bundle(chat_id, image_bytes, Path(media_key).name or "preview.jpg")
                     return telegram_send_photo_bytes(
                         chat_id=chat_id,
                         image_bytes=image_bytes,
@@ -1726,9 +1992,11 @@ def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
                                 )
                     except Exception:
                         logger.exception("telegram_preview_self_heal_failed post_id=%s", post.get("id"))
-            # Fallback 1: download remote image and upload as multipart file.
-            try:
-                raw, _ctype = download_remote_image(str(post["final_image_url"]))
+        # Fallback 1: download remote image and upload as multipart file.
+        try:
+            raw, _ctype = download_remote_image(str(post["final_image_url"]))
+            if str(post.get("source_kind") or "") == "parable":
+                return _send_parable_bundle(chat_id, raw, "preview.jpg")
                 return telegram_send_photo_bytes(
                     chat_id=chat_id,
                     image_bytes=raw,
@@ -1737,10 +2005,9 @@ def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
                     parse_mode="MarkdownV2" if use_md else None,
                     reply_markup=keyboard,
                 )
-            except Exception:
-                logger.exception("telegram_preview_download_and_send_failed url=%s", post.get("final_image_url"))
-            raise HTTPException(status_code=502, detail="preview image unavailable")
-        return _send_text_only(chat_id)
+        except Exception:
+            logger.exception("telegram_preview_download_and_send_failed url=%s", post.get("final_image_url"))
+        raise HTTPException(status_code=502, detail="Preview image send failed")
 
     target_chat_id: str | int = runtime_telegram_preview_chat()
     try:
@@ -1757,27 +2024,65 @@ def telegram_send_preview(post: dict[str, Any]) -> Optional[dict[str, Any]]:
 def telegram_send_preview_to_chat(post: dict[str, Any], chat_id: str | int) -> Optional[dict[str, Any]]:
     if not runtime_telegram_token():
         return None
+    if post.get("id") and str(post.get("source_kind") or "") == "phrase":
+        post = ensure_phrase_post_ready_for_publish(int(post["id"]), post)
+    if str(post.get("source_kind") or "") == "phrase" and _phrase_post_needs_expansion(post):
+        raise HTTPException(status_code=502, detail="Phrase post text failed quality checks")
+    if not str(post.get("final_image_url") or "").strip():
+        raise HTTPException(status_code=502, detail="Preview requires final image")
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
-    use_md = (post.get("source_kind") or "").strip() == "phrase"
-    caption_md_limited = generate_post_caption_markdown_limited(post, max_len=1024) if use_md else ""
+    use_md = True
+    caption_md_limited = generate_post_caption_markdown_limited(post, max_len=1024)
     caption_plain = generate_post_caption_plain(post)
     keyboard = build_preview_keyboard(int(post["id"]))
-    def _send_text_only() -> dict[str, Any]:
-        payload_msg: dict[str, Any] = {
-            "chat_id": chat_id,
-            "text": caption,
-            "reply_markup": keyboard,
-            "disable_web_page_preview": True,
-        }
-        if use_md:
-            payload_msg["parse_mode"] = "MarkdownV2"
-        return telegram_api("sendMessage", payload_msg)
+
+    def _send_parable_bundle(image_bytes: bytes, filename: str) -> dict[str, Any]:
+        photo_res = telegram_send_photo_bytes(
+            chat_id=chat_id,
+            image_bytes=image_bytes,
+            filename=filename,
+            caption=(post.get("title") or "")[:1024],
+        )
+        try:
+            photo_mid = ((photo_res or {}).get("result") or {}).get("message_id")
+            if photo_mid is not None and post.get("id"):
+                _append_service_message_id_for_chat(int(post["id"]), post, chat_id, str(photo_mid))
+        except Exception:
+            logger.exception("telegram_parable_preview_track_photo_failed_to_chat post_id=%s chat_id=%s", post.get("id"), chat_id)
+        return send_telegram_text(chat_id, caption_md_limited, reply_markup=keyboard, parse_mode="MarkdownV2") or {"ok": True}
 
     if post.get("final_image_url"):
+        remote_photo_url = str(post.get("final_image_url") or "").strip()
+        if remote_photo_url.startswith("http://") or remote_photo_url.startswith("https://"):
+            try:
+                if str(post.get("source_kind") or "") == "parable":
+                    photo_res = telegram_send_photo_url(
+                        chat_id=chat_id,
+                        photo_url=remote_photo_url,
+                        caption=(post.get("title") or "")[:1024],
+                    )
+                    try:
+                        photo_mid = ((photo_res or {}).get("result") or {}).get("message_id")
+                        if photo_mid is not None and post.get("id"):
+                            _append_service_message_id_for_chat(int(post["id"]), post, chat_id, str(photo_mid))
+                    except Exception:
+                        logger.exception("telegram_parable_preview_track_remote_photo_failed_to_chat post_id=%s chat_id=%s", post.get("id"), chat_id)
+                    return send_telegram_text(chat_id, caption_md_limited, reply_markup=keyboard, parse_mode="MarkdownV2") or {"ok": True}
+                return telegram_send_photo_url(
+                    chat_id=chat_id,
+                    photo_url=remote_photo_url,
+                    caption=caption_md_limited if use_md else ((caption_plain[:1000] + "...") if len(caption_plain) > 1024 else caption_plain),
+                    parse_mode="MarkdownV2" if use_md else None,
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                logger.exception("telegram_preview_send_remote_url_failed_to_chat url=%s chat_id=%s", remote_photo_url, chat_id)
         media_key = media_key_from_url(str(post["final_image_url"]))
         if media_key:
             try:
                 image_bytes, _ = storage_get_bytes(media_key)
+                if str(post.get("source_kind") or "") == "parable":
+                    return _send_parable_bundle(image_bytes, Path(media_key).name or "preview.jpg")
                 return telegram_send_photo_bytes(
                     chat_id=chat_id,
                     image_bytes=image_bytes,
@@ -1815,6 +2120,8 @@ def telegram_send_preview_to_chat(post: dict[str, Any], chat_id: str | int) -> O
         # Fallback 1: download remote image and upload as multipart file.
         try:
             raw, _ctype = download_remote_image(str(post["final_image_url"]))
+            if str(post.get("source_kind") or "") == "parable":
+                return _send_parable_bundle(raw, "preview.jpg")
             return telegram_send_photo_bytes(
                 chat_id=chat_id,
                 image_bytes=raw,
@@ -1825,8 +2132,7 @@ def telegram_send_preview_to_chat(post: dict[str, Any], chat_id: str | int) -> O
             )
         except Exception:
             logger.exception("telegram_preview_download_and_send_failed_to_chat url=%s chat_id=%s", post.get("final_image_url"), chat_id)
-        raise HTTPException(status_code=502, detail="preview image unavailable")
-    return _send_text_only()
+        raise HTTPException(status_code=502, detail="Preview image send failed")
 
 
 def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1834,10 +2140,21 @@ def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
     chat_id = runtime_telegram_publish_chat()
     caption = post.get("telegram_caption") or generate_caption(post["title"], post["text_body"])
-    use_md = (post.get("source_kind") or "").strip() == "phrase"
-    caption_md_limited = generate_post_caption_markdown_limited(post, max_len=1024) if use_md else ""
+    use_md = True
+    caption_md_limited = generate_post_caption_markdown_limited(post, max_len=1024)
     caption_plain = generate_post_caption_plain(post)
     if post.get("final_image_url"):
+        remote_photo_url = str(post.get("final_image_url") or "").strip()
+        if remote_photo_url.startswith("http://") or remote_photo_url.startswith("https://"):
+            try:
+                return telegram_send_photo_url(
+                    chat_id=chat_id,
+                    photo_url=remote_photo_url,
+                    caption=caption_md_limited if use_md else ((caption_plain[:1000] + "...") if len(caption_plain) > 1024 else caption_plain),
+                    parse_mode="MarkdownV2" if use_md else None,
+                )
+            except Exception:
+                logger.exception("telegram_publish_send_remote_url_failed url=%s", remote_photo_url)
         media_key = media_key_from_url(str(post["final_image_url"]))
         if media_key:
             try:
@@ -1852,9 +2169,7 @@ def telegram_send_publish(post: dict[str, Any]) -> Optional[dict[str, Any]]:
             except Exception:
                 logger.exception("telegram_publish_send_file_failed media_key=%s", media_key)
         raise HTTPException(status_code=502, detail="publish image unavailable")
-    payload_text: dict[str, Any] = {"chat_id": chat_id, "text": caption, "disable_web_page_preview": True}
-    if use_md:
-        payload_text["parse_mode"] = "MarkdownV2"
+    payload_text: dict[str, Any] = {"chat_id": chat_id, "text": caption_md_limited, "disable_web_page_preview": True, "parse_mode": "MarkdownV2"}
     return telegram_api("sendMessage", payload_text)
 
 
@@ -1863,12 +2178,15 @@ def send_telegram_text(
     text: str,
     reply_markup: Optional[dict[str, Any]] = None,
     track_post_id: Optional[int] = None,
+    parse_mode: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     if not runtime_telegram_token():
         return None
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     res = telegram_api("sendMessage", payload)
     try:
         if track_post_id:
@@ -1881,6 +2199,51 @@ def send_telegram_text(
     return res
 
 
+def telegram_edit_text(
+    chat_id: str | int,
+    message_id: str | int,
+    text: str,
+    reply_markup: Optional[dict[str, Any]] = None,
+    parse_mode: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    if not runtime_telegram_token():
+        return None
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": int(message_id),
+        "text": text,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return telegram_api("editMessageText", payload)
+
+
+def telegram_upsert_status_message(
+    chat_id: str | int,
+    text: str,
+    current_message_id: Optional[str | int] = None,
+    track_post_id: Optional[int] = None,
+) -> Optional[str]:
+    if not runtime_telegram_token():
+        return None
+    if current_message_id is not None:
+        try:
+            telegram_edit_text(chat_id, current_message_id, text)
+            return str(current_message_id)
+        except Exception:
+            logger.exception("telegram_status_edit_failed chat_id=%s message_id=%s", chat_id, current_message_id)
+    try:
+        res = send_telegram_text(chat_id, text, track_post_id=track_post_id)
+        message_id = ((res or {}).get("result") or {}).get("message_id")
+        if message_id is not None:
+            return str(message_id)
+    except Exception:
+        logger.exception("telegram_status_send_failed chat_id=%s post_id=%s", chat_id, track_post_id)
+    return None
+
+
 def instagram_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     instagram_token = runtime_instagram_token()
     instagram_user_id = runtime_instagram_user_id()
@@ -1888,14 +2251,15 @@ def instagram_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     proxy_url = runtime_instagram_proxy_url()
     if not instagram_token or not instagram_user_id:
         raise HTTPException(status_code=400, detail="Instagram credentials not configured")
-    if not post.get("final_image_url"):
+    image_url = _social_image_url(post)
+    if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     base = f"https://graph.facebook.com/{graph_version}/{instagram_user_id}"
     create = http_json(
         "POST",
         f"{base}/media",
         {
-            "image_url": post["final_image_url"],
+            "image_url": image_url,
             "caption": instagram_caption_text(post),
             "access_token": instagram_token,
         },
@@ -1922,7 +2286,7 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Instagram queue settings not configured")
     if not re.fullmatch(r"[^/\s]+/[^/\s]+", queue_repo):
         raise HTTPException(status_code=400, detail="instagram_queue_repo must look like owner/repo")
-    image_url = (post.get("final_image_url") or "").strip()
+    image_url = _social_image_url(post)
     if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     caption = instagram_caption_text(post)
@@ -1954,22 +2318,26 @@ def instagram_enqueue_post(post: dict[str, Any]) -> dict[str, Any]:
     try:
         media_key = media_key_from_url(image_url)
         if media_key:
-            image_bytes, _ = storage_get_bytes(media_key)
+            image_bytes, image_ctype = storage_get_bytes(media_key)
         else:
-            image_bytes, _ = download_remote_image(image_url)
-        media_rel_path = f"{queue_path}/media/{now_tag}-{post_tag}.jpg".strip("/")
+            image_bytes, image_ctype = download_remote_image(image_url)
+        media_rel_path = f"{queue_path}/media/{now_tag}-{post_tag}{image_ext_from_content_type(image_ctype)}".strip("/")
         github_put_bytes(
             media_rel_path,
             image_bytes,
             f"chore: enqueue instagram media #{post.get('id') or 'unknown'}",
         )
         rehosted_image_url = f"https://raw.githubusercontent.com/{queue_repo}/{queue_branch}/{media_rel_path}"
-    except Exception:
+    except Exception as exc:
         logger.exception("instagram_enqueue_rehost_failed post_id=%s", post.get("id"))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Instagram queue media rehost failed: {str(exc)[:300]}",
+        ) from exc
 
     payload: dict[str, Any] = {
         "caption": caption,
-        "image_url": rehosted_image_url or image_url,
+        "image_url": rehosted_image_url,
         "publish_at": (post.get("scheduled_for") or ""),
     }
     file_name = f"{now_tag}-{post_tag}.json"
@@ -2013,7 +2381,8 @@ def pinterest_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     pinterest_board_id = runtime_pinterest_board_id()
     if not pinterest_token or not pinterest_board_id:
         raise HTTPException(status_code=400, detail="Pinterest credentials not configured")
-    if not post.get("final_image_url"):
+    image_url = _social_image_url(post)
+    if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     payload = {
         "board_id": pinterest_board_id,
@@ -2022,7 +2391,7 @@ def pinterest_publish_post(post: dict[str, Any]) -> dict[str, Any]:
         "link": post.get("source_url") or runtime_openrouter_site_url(),
         "media_source": {
             "source_type": "image_url",
-            "url": post["final_image_url"],
+            "url": image_url,
         },
     }
     res = http_json(
@@ -2273,10 +2642,11 @@ def vk_publish_post_to_group(
 ) -> dict[str, Any]:
     if not vk_token or not vk_group_id:
         raise HTTPException(status_code=400, detail=f"{profile_label} credentials not configured")
-    if not post.get("final_image_url"):
+    image_url = _social_image_url(post)
+    if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     caption = generate_vk_caption_plain(post)[:3500]
-    media_key = media_key_from_url(str(post["final_image_url"]))
+    media_key = media_key_from_url(image_url)
     if media_key:
         try:
             image_bytes, _ = storage_get_bytes(media_key)
@@ -2284,7 +2654,7 @@ def vk_publish_post_to_group(
             raise HTTPException(status_code=502, detail=f"VK image read failed: {str(e)[:800]}")
     else:
         try:
-            image_bytes, _ = download_remote_image(str(post["final_image_url"]))
+            image_bytes, _ = download_remote_image(image_url)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"VK image download failed: {str(e)[:800]}")
     try:
@@ -2374,10 +2744,11 @@ def vk_channel_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     wall_group_id = str(runtime_vk_group_id() or "").strip()
     if not token or not channel_id or not wall_group_id:
         raise HTTPException(status_code=400, detail="VK channel credentials not configured")
-    if not post.get("final_image_url"):
+    image_url = _social_image_url(post)
+    if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     caption = generate_vk_channel_caption(post)[:3500]
-    media_key = media_key_from_url(str(post["final_image_url"]))
+    media_key = media_key_from_url(image_url)
     if media_key:
         try:
             image_bytes, _ = storage_get_bytes(media_key)
@@ -2385,7 +2756,7 @@ def vk_channel_publish_post(post: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(status_code=502, detail=f"VK channel image read failed: {str(e)[:800]}")
     else:
         try:
-            image_bytes, _ = download_remote_image(str(post["final_image_url"]))
+            image_bytes, _ = download_remote_image(image_url)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"VK channel image download failed: {str(e)[:800]}")
     try:
@@ -2469,12 +2840,13 @@ def max_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     publish_url = runtime_max_publish_url()
     if not publish_url:
         raise HTTPException(status_code=400, detail="MAX publish URL not configured")
-    if not post.get("final_image_url"):
+    image_url = _social_image_url(post)
+    if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     payload = {
         "title": (post.get("title") or "")[:300],
         "text": (post.get("telegram_caption") or generate_post_caption_plain(post))[:5000],
-        "image_url": post["final_image_url"],
+        "image_url": image_url,
         "post_id": post.get("id"),
         "source": "kindlysupport_posting",
     }
@@ -2491,12 +2863,13 @@ def ok_publish_post(post: dict[str, Any]) -> dict[str, Any]:
     publish_url = runtime_ok_publish_url()
     if not publish_url:
         raise HTTPException(status_code=400, detail="OK publish URL not configured")
-    if not post.get("final_image_url"):
+    image_url = _social_image_url(post)
+    if not image_url:
         raise HTTPException(status_code=400, detail="Post has no final_image_url")
     payload = {
         "title": (post.get("title") or "")[:300],
         "text": (post.get("telegram_caption") or generate_post_caption_plain(post))[:5000],
-        "image_url": post["final_image_url"],
+        "image_url": image_url,
         "post_id": post.get("id"),
         "source": "kindlysupport_posting",
     }
@@ -2517,36 +2890,114 @@ def escape_markdown_v2(text: str) -> str:
 
 
 UNIVERSAL_CONTENT_SYSTEM_PROMPT = """
-You create content for a Russian psychological support Telegram channel.
+You write short original reflections in Russian for a warm, intelligent Telegram channel about inner life.
+
+Your task is to turn one phrase into a living, emotionally true text that feels written by a perceptive human.
+
+Core rule:
+The phrase is the hidden semantic core of the text. Do not explain it, repeat it, paraphrase it, or comment on it directly. The text must unfold its exact inner theme through lived human experience.
 
 Style:
 - warm
 - human
-- thoughtful
-- simple and natural
-- emotionally intelligent
-- write as if speaking quietly to a tired but thoughtful adult
-- no pathos
-- no moralizing
-- no motivational cliches
-- no abstract jargon
-- prefer direct meaning over rhetorical contrast
-- do not use "not this, but that" sentence patterns
-- avoid formulas like "Это не слабость, а свобода"
-- avoid heavy negation
-- normalize em dashes to short hyphens in Russian
+- precise
+- emotionally believable
+- grounded in lived experience
+- simple, natural Russian
+- deep, but without pathos
+- concrete when possible
+
+What to do:
+- before writing, silently identify the phrase's dominant inner mode and preserve it
+- possible modes include: tender, hard, forceful, vulnerable, paradoxical, grieving, longing, dependent, disciplined, active, still, fearful, controlling, accepting, transformative
+- first identify the exact emotional or human core of the phrase
+- if the phrase is abstract, motivational, lofty, or slogan-like, first internally ground it into a real human writing brief
+- reduce it to: exact human core, lived reality, one grounded emotional lens, and what generic interpretation to avoid
+- if the phrase contains a turn, condition, or reversal like "когда", "только когда", "лишь когда", "но", "пока не", or "если сможешь", treat the final clause as the true semantic center
+- for phrases about changing oneself, do not reduce the meaning to persistence or success; show what exactly changes in behavior, reaction, or choice
+- preserve the exact inner force of the phrase
+- if the phrase is about will, stubbornness, discipline, resistance, pride, fear, or control, do not soften it into self-care, healing, or emotional gentleness
+- do not replace hard inner energy with therapeutic softness
+- if the phrase describes a difficult trait, explore how that trait transforms, redirects, hardens, breaks, or becomes useful
+- keep the original psychological tension of the phrase
+- preserve not only meaning, but emotional direction: inward or outward, active or passive, soft or hard, calm or tense, yielding or resistant, wounded or willful
+- write from a real human scene, observation, memory, or concrete inner movement that matches that core
+- keep the text tightly connected to the phrase
+- let the second paragraph deepen the first through life, not through explanation
+- if the phrase is abstract or slogan-like, translate it into real life through routine, effort, setbacks, doubt, discipline, relationships, or daily choices
+- each paragraph should contain at least one recognizable emotional or everyday detail
+- show change through an observable action, choice, or behavior, not through vague revelation
+- when the phrase contains a paradox, hidden truth, or strong psychological claim, uncover the inner mechanism behind it
+- show how and why this becomes true in life
+- prefer reflective human observation over miniature fictional storytelling
+- do not default to a character-based dramatic scene unless necessary
+- if the phrase is about strength, weakness, success, worth, fear, or dependence, unpack the inner cost, dependency, distortion, or loss of freedom beneath it
+
+What to avoid:
+- mentioning the phrase inside the text
+- explaining the phrase from outside
+- openings like "эта фраза напоминает", "эта мысль говорит", "иногда сильнее всего цепляет"
+- generic self-help language
+- motivational poster tone
+- manifesto or destiny language
+- therapist article tone
+- coaching tone
+- abstract filler
+- polished, empty inspirational writing
+- replacing the meaning of the phrase with a nearby but different emotional theme
+- replacing the mode or direction of the phrase with an easier one
+- contrast templates built around "не ..., а ..." unless absolutely necessary
+- vague symbolic prose without a concrete life situation
+- floating metaphors like "что-то внутри отпустило", "стена стала прозрачной", "другой мир", "спасательный круг" when they replace real experience
+- defaulting to a fictional character story when reflective observation would fit the phrase better
+- defaulting to healing, pause, tenderness, or self-care unless they are truly central to the phrase
+- softening a hard phrase, hardening a tender phrase, or turning an active phrase into passive atmosphere
 
 Modes:
 
 TEXT:
-Write in Russian.
-2 paragraphs, 3-5 sentences each.
-Paragraph 1 - how the idea appears in life.
-Paragraph 2 - deeper meaning or invitation.
+Russian only.
+2 paragraphs.
+3-5 sentences per paragraph.
+No headings.
+No bullet points.
+No emojis.
+No signature.
+Normalize em dashes to short hyphens.
+Paragraph 1: begin inside a real human experience connected to the theme.
+Paragraph 1 must be a full paragraph, not a fragment, not a one-line intro, and not a single short sentence.
+Do not split off an atmospheric opener like "Вечер, за окном моросит." into its own paragraph.
+The first character of the final text must be an uppercase Russian letter.
+Paragraph 2: deepen the meaning through life, not through explanation.
+Each paragraph should contain at least one emotionally recognizable or concrete detail.
 Output must be plain text only.
 Do not add headings, markdown, bullets, labels, or intro lines.
 Never start with a title like "**...**".
 Respect any explicit character limit from the user prompt exactly.
+
+GROUNDING:
+Write in English.
+Do not write the final post.
+Convert the phrase into a grounded writing brief.
+Return plain text only in exactly 6 lines:
+1. mode: ...
+2. human core: ...
+3. lived reality: ...
+4. concrete scene: ...
+5. observable change: ...
+6. avoid: ...
+Rules:
+- no philosophy
+- no explanation of the phrase
+- no paraphrase of the phrase
+- translate big ideas into ordinary life
+- first identify the phrase's dominant inner mode and preserve it
+- possible modes include: tender, hard, forceful, vulnerable, paradoxical, grieving, longing, dependent, disciplined, active, still, fearful, controlling, accepting, transformative
+- if the phrase sounds lofty, reduce it to routine, conflict, effort, hesitation, repeated attempt, changed behavior, or a concrete choice
+- if the phrase contains a turn or condition like "когда", "только когда", "лишь когда", "но", "пока не", or "если сможешь", the last clause defines the real meaning
+- if the phrase is about changing oneself, the brief must center on self-change, not on persistence leading to success
+- for self-change phrases, explicitly avoid nearby misreadings like self-care, rest, softness toward oneself, or success-through-persistence if they are not the phrase's real meaning
+- if the phrase is hard, forceful, paradoxical, uncomfortable, or resistant, keep that hard energy and do not soften it into healing, comfort, or emotional gentleness
 
 SCENARIO:
 Write in English.
@@ -2567,7 +3018,9 @@ Square image, no text, realistic cinematic style, clean composition, emotional d
 
 
 TELEGRAM_PHRASE_POST_CHAR_LIMIT = 800
-CHANNEL_FOOTER = "@kindlysupport"
+TELEGRAM_CHANNEL_URL = "https://t.me/kindlysupport"
+CHANNEL_FOOTER = "🤗 Поддержу тебя нежно"
+CHANNEL_FOOTER_MD = "🤗 [Поддержу тебя нежно](https://t.me/kindlysupport)"
 
 
 def build_user_prompt_for_task(
@@ -2579,14 +3032,77 @@ def build_user_prompt_for_task(
     previous_text: str = "",
 ) -> str:
     mode = (task or "").strip().upper()
+    if mode == "GROUNDING":
+        parts = [
+            "Read the phrase and convert it into a grounded writing brief.",
+            "",
+            "Return exactly:",
+            "1. mode: ...",
+            "2. human core: ...",
+            "3. lived reality: ...",
+            "4. concrete scene: ...",
+            "5. observable change: ...",
+            "6. avoid: ...",
+            "",
+            "Rules:",
+            "- no philosophy",
+            "- no explanation of the phrase",
+            "- no paraphrase of the phrase",
+            "- translate big ideas into ordinary life",
+            "- first identify the phrase's dominant inner mode and preserve it",
+            "- possible modes include: tender, hard, forceful, vulnerable, paradoxical, grieving, longing, dependent, disciplined, active, still, fearful, controlling, accepting, transformative",
+            "- if the phrase sounds lofty, reduce it to routine, conflict, effort, hesitation, repeated attempt, changed behavior, or a concrete choice",
+            "- if the phrase contains a turn or condition like \"когда\", \"только когда\", \"лишь когда\", \"но\", \"пока не\", or \"если сможешь\", the last clause defines the real meaning",
+            "- if the phrase is about changing oneself, the brief must center on self-change, not on persistence leading to success or self-care",
+            "- if the phrase is hard, forceful, paradoxical, uncomfortable, or resistant, keep that hard energy and do not soften it into healing, comfort, or self-care",
+            "",
+            "Phrase:",
+            f"«{(phrase or '').strip()}»",
+        ]
+        if instruction.strip():
+            parts.append(f"EDITOR_INSTRUCTION: {instruction.strip()}")
+        return "\n".join(parts)
     if mode == "TEXT":
         parts = [
-            "TASK: TEXT",
-            f"PHRASE: {(phrase or '').strip()}",
+            "Write a short Russian reflection based on the grounded brief below.",
+            "",
+            "Requirements:",
+            "- do not explain, repeat, or paraphrase the phrase",
+            "- identify its exact human core and stay strictly connected to it",
+            "- preserve its emotional mode and direction",
+            "- preserve the exact inner force of the phrase",
+            "- start from life, not from interpretation",
+            "- make the text feel alive, intimate, and emotionally believable",
+            "- if the phrase is abstract, ground it in real life, routine, effort, doubt, relationships, or daily choices",
+            "- before writing, reduce the phrase to lived human reality and write from that grounded layer, not directly from the slogan or aphorism",
+            "- if the phrase contains a turn or condition, the final clause defines the meaning; do not build the text around the opening words if the transformation is stated later",
+            "- if the phrase is about changing oneself, show what changed in behavior, reaction, or choice; do not turn it into a story where persistence simply brings success",
+            "- if the phrase is about will, stubbornness, discipline, resistance, pride, fear, or control, do not soften it into self-care, healing, or emotional gentleness",
+            "- when the phrase contains a difficult or uncomfortable quality, do not resolve it too early into comfort or kindness",
+            "- if the phrase describes a difficult trait, show how that trait transforms, redirects, hardens, breaks, or becomes useful in life",
+            "- if the phrase contains a paradox, hidden truth, or strong psychological claim, uncover the inner mechanism that makes it true",
+            "- show the dependency, fear, distortion, or inner cost beneath the phrase when relevant",
+            "- prefer reflective human observation over fictional storytelling",
+            "- do not default to a character-based dramatic scene unless the phrase truly demands it",
+            "- show the idea through a concrete situation and an observable choice, not through vague inner revelation or decorative metaphor",
+            "- avoid generic warmth, poster-like motivation, and \"не ..., а ...\" contrast templates",
+            "- do not use floating symbolic metaphors like \"спасательный круг\", \"стена\", \"другой мир\", \"что-то внутри отпустило\" as a substitute for real life",
+            "- do not output a grounded brief, numbered list, labels like \"mode\", \"human core\", \"lived reality\", \"concrete scene\", \"observable change\", \"avoid\", or any English text",
+            "- the first character of the final text must be an uppercase Russian letter",
+            "",
+            "Phrase:",
+            f"«{(phrase or '').strip()}»",
         ]
+        if scenario.strip():
+            parts.extend([
+                "",
+                "Grounded brief:",
+                scenario.strip(),
+            ])
         char_budget = phrase_body_char_budget(phrase)
         if char_budget > 0:
             parts.append(
+                ""
                 "CHAR_LIMIT_RULE: "
                 f"the final Telegram post must be <= {TELEGRAM_PHRASE_POST_CHAR_LIMIT} characters total, "
                 f"including title, blank lines, and {CHANNEL_FOOTER}. "
@@ -2714,6 +3230,9 @@ def _normalize_generated_ru_text(text: str) -> str:
         ):
             lines = lines[1:]
     out = "\n".join(lines)
+    # Treat accidental blank lines inside direct speech as formatting noise, not paragraph breaks.
+    out = re.sub(r"([^\n])\n\s*\n(\s*[»”\"])", r"\1 \2", out)
+    out = re.sub(r"([«„“\"])\s*\n\s*\n([^\n])", r"\1\2", out)
     # Keep sentence dashes normalized, but don't break compound words.
     out = re.sub(r"\s+[—–-]\s+", " - ", out)
     out = re.sub(r"[—–]", "-", out)
@@ -2766,13 +3285,56 @@ def _split_two_paragraphs(text: str) -> tuple[str, str]:
     return flat, ""
 
 
+def _looks_like_grounding_brief(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if re.search(r"(^|\n)\s*[1-6]\.\s*(mode|human core|lived reality|concrete scene|observable change|avoid)\s*:", raw, flags=re.IGNORECASE):
+        return True
+    lowered = raw.lower()
+    markers = (
+        "mode:",
+        "human core:",
+        "lived reality:",
+        "concrete scene:",
+        "observable change:",
+        "avoid:",
+    )
+    if sum(1 for m in markers if m in lowered) >= 2:
+        return True
+    return False
+
+
 def _rich_text_quality_ok(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if re.search(r"[A-Za-z]{3,}", raw):
+        return False
     p1, p2 = _split_two_paragraphs(text)
     if not p1 or not p2:
         return False
     c1 = _sentence_count(p1)
     c2 = _sentence_count(p2)
-    return c1 >= 3 and c2 >= 3 and len(p1) >= 180 and len(p2) >= 180
+    if c1 < 3 or c2 < 3 or len(p1) < 180 or len(p2) < 180:
+        return False
+    stripped = (text or '').lstrip()
+    if not stripped or not re.match(r"[А-ЯЁ]", stripped[0]):
+        return False
+    if _looks_like_grounding_brief(text):
+        return False
+    flat = _norm_for_similarity(text)
+    if re.search(r"\bне\b[^.!?\n]{0,120}\bа\b", flat):
+        return False
+    banned_meta = (
+        'что-то внутри отпустило',
+        'стена стала прозрачной',
+        'другой мир',
+        'спасательный круг',
+    )
+    if any(b in flat for b in banned_meta):
+        return False
+    return True
 
 
 def _phrase_title_for_publish(text: str) -> str:
@@ -2796,12 +3358,89 @@ def _texts_too_similar(a: str, b: str, threshold: float = 0.90) -> bool:
     return m.size >= 180
 
 
+def _count_family_hits(text: str, markers: list[str]) -> int:
+    norm_text = _norm_for_similarity(text)
+    hits = 0
+    for marker in markers:
+        if re.search(rf"\b{re.escape(marker)}\b", norm_text):
+            hits += 1
+    return hits
+
+
+def _phrase_semantic_families(phrase: str) -> dict[str, list[str]]:
+    lowered = _norm_for_similarity(phrase)
+    families: dict[str, list[str]] = {}
+    if re.search(r"\b(получаеш|получить|теряеш|терять|потер|утрат|лиша|цена|плата|обмен)\b", lowered):
+        families["exchange_loss"] = [
+            "цена", "обмен", "терять", "потеря", "лишиться", "отдать", "расплатиться",
+            "выбор", "оставить", "утрата", "получить",
+        ]
+    if re.search(r"\b(дорог|путь|пути|нести|несешь|груз|багаж|рюкзак)\b", lowered):
+        families["burden_path"] = [
+            "нести", "тяжесть", "груз", "багаж", "дорога", "путь", "отпустить",
+            "плечи", "тащить", "легче",
+        ]
+    if re.search(r"\b(дом|возвращ|вернуться|приют|очаг)\b", lowered):
+        families["home_return"] = [
+            "дом", "вернуться", "дверь", "кухня", "свет", "тишина", "возвращаться",
+            "плед", "окно", "опора",
+        ]
+    if re.search(r"\b(чита|книга|вдохнов|встреч|человек|подсозн|бессозн|влиян|меняет)\b", lowered):
+        families["influence_change"] = [
+            "читать", "строка", "слово", "встреча", "человек", "голос", "внутри",
+            "меняться", "влияние", "мысль",
+        ]
+    if re.search(r"\b(вечност|сейчас|момент|мгновен|настоящ|сегодня|здесь|секунд|минут|время)\b", lowered):
+        families["present_moment"] = [
+            "сейчас", "момент", "мгновение", "сегодня", "утро", "вечер", "рядом",
+            "дыхание", "замечать", "присутствие", "минута", "секунда", "жить",
+        ]
+    return families
+
+
+def _text_has_generic_mismatch(text: str, phrase: str) -> bool:
+    families = _phrase_semantic_families(phrase)
+    normalized = _norm_for_similarity(text)
+    # Strong generic template families that must not dominate unrelated phrases.
+    generic_only_families = {
+        "influence_change": ["читать", "строка", "встреча", "голос", "меняться", "внутри", "мысль"],
+        "home_return": ["дом", "вернуться", "кухня", "дверь", "плед", "окно", "тишина"],
+        "present_moment": ["сейчас", "момент", "мгновение", "сегодня", "дыхание", "присутствие", "минута"],
+    }
+    for family_name, markers in generic_only_families.items():
+        if family_name in families:
+            continue
+        if _count_family_hits(normalized, markers) >= 3:
+            return True
+    phrase_norm = _norm_for_similarity(phrase)
+    if re.search(r"\b(изменить себя|менять себя|измениться|изменишься|изменение себя)\b", phrase_norm):
+        selfcare_markers = [
+            "усталость", "отдых", "отдыха", "потребности", "потребность",
+            "не ругать себя", "не корить себя", "быть мягче к себе",
+            "прислушиваться к себе", "день для отдыха", "лечь спать пораньше",
+            "забота о себе", "самозабота",
+        ]
+        selfchange_markers = [
+            "признать ошибку", "перестать спорить", "отпустить правоту", "извиниться",
+            "слушать другого", "пересмотреть", "переучиться", "изменить привычный способ",
+            "реагировать иначе", "сделать по-новому", "отказаться от старого способа",
+            "сломать свою жесткость", "перестать цепляться за старое",
+        ]
+        if _count_family_hits(normalized, selfcare_markers) >= 2 and _count_family_hits(normalized, selfchange_markers) == 0:
+            return True
+    return False
+
+
 def _phrase_expansion_quality_ok(text: str, phrase: str) -> bool:
     normalized = _force_two_clean_paragraphs(text)
+    if _looks_like_grounding_brief(normalized):
+        return False
     p1, p2 = _split_two_paragraphs(normalized)
     if not p1 or not p2:
         return False
     if len(p1) < 100 or len(p2) < 100:
+        return False
+    if _sentence_count(p1) < 3 or _sentence_count(p2) < 3:
         return False
     if _texts_too_similar(p1, p2, threshold=0.80):
         return False
@@ -2812,6 +3451,32 @@ def _phrase_expansion_quality_ok(text: str, phrase: str) -> bool:
         or _texts_too_similar(p2, phrase_clean, threshold=0.82)
     ):
         return False
+    if phrase_clean:
+        norm_phrase = _norm_for_similarity(phrase_clean)
+        norm_text = _norm_for_similarity(normalized)
+        if norm_phrase and norm_phrase in norm_text:
+            return False
+        phrase_words = [w for w in re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]+", norm_phrase) if len(w) >= 4]
+        if phrase_words:
+            if sum(1 for w in phrase_words if re.search(rf"\b{re.escape(w)}\b", norm_text)) >= max(2, min(3, len(phrase_words))):
+                return False
+        lowered = normalized.lower()
+        banned_openings = (
+            "эта фраза напоминает",
+            "эта мысль говорит",
+            "эти слова значат",
+            "иногда сильнее всего цепляет",
+        )
+        if any(b in lowered for b in banned_openings):
+            return False
+        if re.search(r"\bне\b[^.!?\n]{0,120}\bа\b", _norm_for_similarity(normalized)):
+            return False
+        families = _phrase_semantic_families(phrase_clean)
+        for markers in families.values():
+            if _count_family_hits(normalized, markers) < 2:
+                return False
+        if _text_has_generic_mismatch(normalized, phrase_clean):
+            return False
     return True
 
 
@@ -2837,6 +3502,9 @@ def _force_two_clean_paragraphs(text: str) -> str:
 def _phrase_post_needs_expansion(post: dict[str, Any]) -> bool:
     if (post.get("source_kind") or "").strip() != "phrase":
         return False
+    preview = _preview_payload_dict(post)
+    if bool(preview.get("manual_text_locked")):
+        return False
     title = _phrase_title_for_publish((post.get("title") or "").strip())
     body = (post.get("text_body") or "").strip()
     if not title:
@@ -2859,6 +3527,9 @@ def _phrase_post_needs_expansion(post: dict[str, Any]) -> bool:
 
 def ensure_phrase_post_ready_for_publish(post_id: int, post: dict[str, Any]) -> dict[str, Any]:
     if (post.get("source_kind") or "").strip() != "phrase":
+        return post
+    preview = _preview_payload_dict(post)
+    if bool(preview.get("manual_text_locked")):
         return post
     if not _phrase_post_needs_expansion(post):
         return post
@@ -2885,6 +3556,25 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
     if not clean:
         return ""
     body_budget = phrase_body_char_budget(clean)
+    grounded_brief = ""
+
+    try:
+        grounding_prompt = build_user_prompt_for_task(
+            "GROUNDING",
+            phrase=clean,
+            instruction=(instruction or "").strip(),
+        )
+        grounding_raw = openrouter_generate_text(
+            grounding_prompt,
+            temperature=0.4,
+            top_p=0.9,
+            system_prompt=UNIVERSAL_CONTENT_SYSTEM_PROMPT,
+            trace_label="TEXT:grounding:v1",
+        )
+        grounded_brief = re.sub(r"\s+", " ", grounding_raw or "").strip()
+        grounded_brief = grounded_brief.replace(" 1. ", "\n1. ").replace(" 2. ", "\n2. ").replace(" 3. ", "\n3. ").replace(" 4. ", "\n4. ").replace(" 5. ", "\n5. ")
+    except Exception:
+        logger.exception("phrase_grounding_failed phrase=%s", clean[:80])
 
     def _fit_phrase_body(raw_text: str) -> str:
         normalized = _force_two_clean_paragraphs(raw_text or "")
@@ -2893,6 +3583,7 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
     prompt = build_user_prompt_for_task(
         "TEXT",
         phrase=clean,
+        scenario=grounded_brief,
         instruction=(instruction or "").strip(),
         previous_text=(previous_text or "").strip(),
     )
@@ -2917,6 +3608,7 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
                 prompt_diff = build_user_prompt_for_task(
                     "TEXT",
                     phrase=clean,
+                    scenario=grounded_brief,
                     instruction=f"{(instruction or '').strip()} {force_diff_instruction}".strip(),
                     previous_text=(previous_text or "").strip(),
                 )
@@ -2930,16 +3622,27 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
                 text_diff = _fit_phrase_body(_normalize_generated_ru_text(raw_diff or ""))
                 if text_diff:
                     text = text_diff
-        if not _rich_text_quality_ok(text):
+        def _candidate_ok(candidate: str) -> bool:
+            return _rich_text_quality_ok(candidate) and _phrase_expansion_quality_ok(candidate, clean)
+
+        if not _candidate_ok(text):
             strict_instruction = (
-                "Сделай текст длиннее и живее. Ровно 2 абзаца. В каждом абзаце 4 предложения. "
-                "Без списков, без метакомментариев. Никаких шаблонов '..., а не ...'. "
+                "Сделай текст живым, узнаваемым и нестерильным. Ровно 2 абзаца. В каждом абзаце 4 предложения. "
+                "Начни из реального человеческого состояния или бытового момента, а не с обобщения. "
+                "В каждом абзаце должен быть хотя бы один конкретный жизненный или эмоциональный штрих. "
+                "Не пересказывай, не объясняй и не комментируй саму фразу. "
+                "Фраза должна оставаться скрытым смысловым ядром текста, а не предметом разбора. "
+                "Без списков, без метакомментариев, без канцелярского и книжного тона. "
+                "Никогда не возвращай служебный план, grounded brief, human core, lived reality, concrete scene, observable change или avoid. "
+                "Финальный ответ только на русском языке. "
+                "Никаких шаблонов '..., а не ...'. Не пиши как терапевтическая статья или мотивационный постер. "
                 "Без заголовков и markdown. Верни только 2 абзаца чистого текста. "
                 f"Тело текста должно поместиться в {body_budget} символов."
             )
             prompt2 = build_user_prompt_for_task(
                 "TEXT",
                 phrase=clean,
+                scenario=grounded_brief,
                 instruction=f"{(instruction or '').strip()} {strict_instruction}".strip(),
                 previous_text=(text or previous_text or "").strip(),
             )
@@ -2951,23 +3654,24 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
                 trace_label="TEXT:expand:retry_quality",
             )
             text2 = _fit_phrase_body(_normalize_generated_ru_text(raw2 or ""))
-            if _rich_text_quality_ok(text2):
+            if _candidate_ok(text2):
                 return text2
-            if text2.strip() and _phrase_expansion_quality_ok(text2, clean):
-                # Keep non-empty regenerated text instead of dropping to deterministic template.
-                return text2
-        if _rich_text_quality_ok(text) and _phrase_expansion_quality_ok(text, clean):
-            return text
-        if text.strip() and _phrase_expansion_quality_ok(text, clean):
+        if _candidate_ok(text):
             return text
         # Last attempt: hard reset from previous text to avoid template lock-in.
         prompt3 = build_user_prompt_for_task(
             "TEXT",
             phrase=clean,
+            scenario=grounded_brief,
             instruction=(
                 f"{(instruction or '').strip()} "
-                "Полный перезапуск текста с нуля. Ровно 2 абзаца по 4-5 предложений, "
-                f"без повторов прошлых формулировок. Тело текста должно поместиться в {body_budget} символов."
+                "Полный перезапуск текста с нуля. Ровно 2 абзаца по 4-5 предложений. "
+                "Сначала точно определи смысловое ядро фразы и держись только его. "
+                "Начни с прожитого момента, бытовой детали, встречи, наблюдения или внутреннего движения, которые прямо соответствуют этой теме. "
+                "Нужен живой тёплый текст, а не безопасное обобщение. "
+                "Без повторов прошлых формулировок, без пустой философии, без терапевтического тона и без подмены темы на соседнюю. "
+                "Не возвращай англоязычные слова, numbered list или служебные поля вроде human core / lived reality / concrete scene / observable change / avoid. "
+                f"Тело текста должно поместиться в {body_budget} символов."
             ).strip(),
             previous_text="",
         )
@@ -2979,8 +3683,35 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
             trace_label="TEXT:expand:hard_reset",
         )
         text3 = _fit_phrase_body(_normalize_generated_ru_text(raw3 or ""))
-        if text3.strip() and _phrase_expansion_quality_ok(text3, clean):
+        if _candidate_ok(text3):
             return text3
+        p1_3, p2_3 = _split_two_paragraphs(text3 or text or "")
+        if _sentence_count(p1_3) < 3 or _sentence_count(p2_3) < 3:
+            prompt4 = build_user_prompt_for_task(
+                "TEXT",
+                phrase=clean,
+                scenario=grounded_brief,
+                instruction=(
+                    f"{(instruction or '').strip()} "
+                    "Исправь только форму без потери смысла. "
+                    "Нужно ровно 2 абзаца. В каждом абзаце ровно 4 отдельных предложения. "
+                    "Каждое предложение должно быть коротким или средним по длине и заканчиваться точкой. "
+                    "Запрещены длинные слепленные периоды, где почти весь абзац состоит из одного предложения. "
+                    "Первый абзац должен начинаться с конкретной ситуации, а не с общего вывода. "
+                    "Верни только чистый русский текст без списков, без английского, без служебных меток."
+                ).strip(),
+                previous_text=(text3 or text or previous_text or "").strip(),
+            )
+            raw4 = openrouter_generate_text(
+                prompt4,
+                temperature=0.85,
+                top_p=0.92,
+                system_prompt=UNIVERSAL_CONTENT_SYSTEM_PROMPT,
+                trace_label="TEXT:expand:retry_structure",
+            )
+            text4 = _fit_phrase_body(_normalize_generated_ru_text(raw4 or ""))
+            if _candidate_ok(text4):
+                return text4
         p1_dbg, p2_dbg = _split_two_paragraphs(text)
         logger.warning(
             "expand_phrase_text_low_quality phrase=%s p1_sent=%s p2_sent=%s p1_len=%s p2_len=%s",
@@ -2992,17 +3723,79 @@ def expand_phrase_text(phrase: str, instruction: str = "", previous_text: str = 
         )
     except Exception:
         logger.exception("expand_phrase_text_failed phrase=%s", clean[:80])
-    # Deterministic fallback, neutral and phrase-centered.
-    fallback = (
-        f"Иногда одна короткая фраза помогает увидеть то, что мы долго не замечали. "
-        f"«{clean}» звучит просто, но в ней есть точка опоры для повседневных решений и внутренних сомнений. "
-        f"Когда мыслей слишком много, полезно вернуться к этой простой формулировке и проверить, где именно сейчас находится внимание. "
-        f"Так появляется ясность и спокойный контакт с реальностью.\n\n"
-        f"Эта мысль не требует резких шагов и больших обещаний, она работает через маленькие действия в текущем дне. "
-        f"Достаточно одного честного выбора, одного точного слова или одного аккуратного шага, чтобы почувствовать движение вперёд. "
-        f"Постепенно такие шаги собираются в устойчивое состояние и возвращают внутреннюю собранность. "
-        f"Именно из этого рождается ощущение, что жизнь снова становится живой и цельной."
+    raise ValueError(
+        f"Phrase text generation failed quality checks for phrase: {clean[:120]}"
     )
+
+
+def _deterministic_phrase_fallback(phrase: str, body_budget: int) -> str:
+    clean = (phrase or "").strip()
+    lowered = clean.lower()
+
+    # These fallbacks are theme-specific. A wrong-theme fallback is worse than a plain one.
+    if re.search(r"\bдом\b", lowered):
+        fallback = (
+            "Бывает, возвращаешься вечером уставшим, ставишь сумку у двери и только в этот момент замечаешь, "
+            "насколько долго держал себя собранным. На улице можно быть быстрым, вежливым, полезным, каким угодно - "
+            "но именно в знакомой тишине с тебя постепенно спадает всё лишнее. Здесь слышнее собственные мысли, "
+            "понятнее усталость, честнее пауза между делами. И иногда один тёплый свет в окне успокаивает сильнее, чем любые объяснения.\n\n"
+            "Есть места, из которых мы выходим в мир, и есть места, в которые возвращаемся, чтобы снова собрать себя по кусочкам. "
+            "Не всегда это про стены и мебель - иногда это человек, голос, кухня с ночным светом, привычный запах, старый плед на плечах. "
+            "То, куда можно прийти без роли и без защиты, остаётся самой тихой опорой. "
+            "Именно поэтому после долгих дорог так важно иметь то, где тебя не нужно заново объяснять."
+        )
+    elif re.search(r"(получа[её]ш|теря[её]ш|потер|утрат|лиша|цена|плат[аиы]|обмен)", lowered):
+        fallback = (
+            "Иногда это замечаешь не сразу. Сначала радуешься тому, что наконец получил желаемое - новую работу, чьё-то согласие, возможность, о которой долго думал. "
+            "А потом вдруг обнаруживаешь, что вместе с этим из жизни ушло что-то тихое, но важное: свободные вечера, лёгкость, прежняя близость с кем-то, способность не оглядываться на часы. "
+            "Потеря не всегда выглядит как драма, иногда она приходит почти незаметно. "
+            "Просто однажды понимаешь, что за новую опору уже расплатился чем-то живым.\n\n"
+            "Наверное, взрослая честность как раз в том, чтобы видеть обе стороны сразу. "
+            "Не обесценивать то, что пришло, но и не делать вид, будто за него ничего не отдано. "
+            "Тогда меньше обиды на жизнь и меньше лишних иллюзий. "
+            "И выбор становится не легче, но точнее - потому что ты понимаешь, что действительно готов оставить, а что нет."
+        )
+    elif re.search(r"(дорог|пут[ьи]|нести|груз|багаж|рюкзак)", lowered):
+        fallback = (
+            "Иногда человек долго тащит с собой что-то просто потому, что однажды решил: это важно. "
+            "Старые обещания, чужие ожидания, обиды, чувство вины - всё это сначала кажется частью пути, а потом начинает мешать идти. "
+            "И только когда устаёшь по-настоящему, приходит простая мысль: не всякая ноша заслуживает верности. "
+            "Некоторые вещи были нужны раньше, но дальше с ними уже тесно и тяжело.\n\n"
+            "Отпускать трудно не потому, что это действительно необходимо, а потому что жалко признавать перемену. "
+            "Кажется, будто вместе с этим исчезнет часть тебя, твоей истории, твоих усилий. "
+            "Но иногда верность себе как раз в том, чтобы перестать нести лишнее. "
+            "Когда плечам становится легче, дорога вдруг снова оказывается живой, а не только изматывающей."
+        )
+    elif re.search(r"(чита|книг|вдохнов|встреч|человек|подсозн|бессозн|влиян|меня[ею]т)", lowered):
+        fallback = (
+            "Иногда перемены начинаются почти незаметно. Прочитаешь несколько точных строк - и потом весь день ловишь себя на другой интонации в мыслях. "
+            "После разговора с важным человеком тоже что-то сдвигается: иначе смотришь на привычное, иначе подбираешь слова, иначе молчишь.\n\n"
+            "Мы меняемся не только от собственных решений, но и от того, что впускаем внутрь. "
+            "Одни встречи проходят мимо, а другие остаются в тебе еще долго - как след от голоса, взгляда, чужой ясности. "
+            "Поэтому так важно замечать, чем именно постепенно заполняется твоя внутренняя жизнь."
+        )
+    elif re.search(r"(вечност|сейчас|момент|мгновен|настоящ|сегодня|здесь|секунд|минут|время)", lowered):
+        fallback = (
+            "Иногда день проходит так плотно, что к вечеру почти нечего вспомнить, кроме списка дел и усталости. "
+            "А потом вдруг что-то задерживает тебя на секунду: тёплая чашка в руках, свет на стене, знакомый голос в трубке, короткая тишина перед тем как ответить. "
+            "И именно в такие маленькие остановки жизнь ощущается не как сплошная спешка, а как что-то настоящее, что уже происходит с тобой. "
+            "Не потом, не когда всё наладится, а прямо здесь.\n\n"
+            "Наверное, самое ценное редко приходит большими событиями. "
+            "Оно собирается из минут, в которых ты действительно присутствуешь в своей жизни, замечаешь человека рядом, слышишь себя яснее, не пролетаешь мимо собственного дня. "
+            "Из таких мгновений и складывается то, что потом кажется важным и прожитым по-настоящему. "
+            "И чем внимательнее ты к этому сейчас, тем меньше жизнь ускользает в пустую скорость."
+        )
+    else:
+        fallback = (
+            "Иногда смысл важной мысли доходит не сразу, а спустя какое-то время - уже в обычном дне, в разговоре, в неловкой паузе, в собственном неожиданном чувстве. "
+            "Снаружи всё может выглядеть как прежде, но внутри что-то уже сместилось, стало точнее, честнее, ближе к настоящему. "
+            "Именно так простые слова иногда оказываются глубже, чем кажутся в первую секунду.\n\n"
+            "По-настоящему важное редко остаётся только красивой формулировкой. "
+            "Оно начинает отзываться в выборе, в интонации, в том, на что ты больше не можешь смотреть по-старому. "
+            "И если мысль действительно попала в живое место, она ещё долго работает внутри. "
+            "Не как готовый ответ, а как тихое внутреннее движение, которое постепенно меняет тебя."
+        )
+
     return trim_phrase_body_to_budget(_force_two_clean_paragraphs(fallback), body_budget)
 
 
@@ -3080,6 +3873,18 @@ def split_quote_and_author(text: str) -> tuple[str, Optional[str]]:
             if not quote.endswith((".", "!", "?")):
                 quote += "."
             return quote, author
+    # "Цитата Автор" where author is appended without punctuation/dash.
+    m4 = re.match(
+        r"^(.*?\S)\s+([A-ZА-ЯЁ][A-Za-zА-Яа-яЁё.-]+(?:\s+[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё.-]+){1,3})$",
+        s,
+    )
+    if m4:
+        quote = m4.group(1).strip()
+        author = m4.group(2).strip()
+        if quote and _is_probable_author_line(author):
+            # Be conservative: only split when the left side really looks like a quote/thought.
+            if any(mark in quote for mark in ('"', "«", "»")) or len(quote) >= 24:
+                return quote, author
     return s, None
 
 
@@ -3297,9 +4102,9 @@ def generate_post_caption(post: dict[str, Any]) -> str:
         body = trim_phrase_body_to_budget((text_body or "").strip(), phrase_body_char_budget(title))
         phrase_md = f"*{escape_markdown_v2(phrase_title)}*"
         if author:
-            phrase_md = f"{phrase_md} — {escape_markdown_v2(author)}"
+            phrase_md = f"{phrase_md}\n{escape_markdown_v2(author)}"
         body_md = escape_markdown_v2(body)
-        return f"{phrase_md}\n\n{body_md}\n\n{CHANNEL_FOOTER}" if body_md else f"{phrase_md}\n\n{CHANNEL_FOOTER}"
+        return f"{phrase_md}\n\n{body_md}\n\n{CHANNEL_FOOTER_MD}" if body_md else f"{phrase_md}\n\n{CHANNEL_FOOTER_MD}"
     return generate_caption(title, text_body)
 
 
@@ -3313,7 +4118,7 @@ def generate_post_caption_plain(post: dict[str, Any]) -> str:
         body = trim_phrase_body_to_budget((text_body or "").strip(), phrase_body_char_budget(title))
         title_line = phrase_title
         if author:
-            title_line = f"{title_line} - {author}"
+            title_line = f"{title_line}\n{author}"
         return f"{title_line}\n\n{body}\n\n{CHANNEL_FOOTER}" if body else f"{title_line}\n\n{CHANNEL_FOOTER}"
     return generate_caption(title, text_body)
 
@@ -3370,6 +4175,17 @@ def _remember_previous_text(post_id: int, post: dict[str, Any], previous_text: s
     preview = _preview_payload_dict(post).copy()
     preview["previous_text_body"] = prev
     preview["previous_text_saved_at"] = now_iso()
+    update_post(post_id, preview_payload_json=preview)
+
+
+def _set_manual_text_lock(post_id: int, post: dict[str, Any], locked: bool) -> None:
+    preview = _preview_payload_dict(post).copy()
+    if locked:
+        preview["manual_text_locked"] = True
+        preview["manual_text_locked_at"] = now_iso()
+    else:
+        preview.pop("manual_text_locked", None)
+        preview.pop("manual_text_locked_at", None)
     update_post(post_id, preview_payload_json=preview)
 
 
@@ -3432,7 +4248,11 @@ def extract_manual_replacement_text(post: dict[str, Any], raw_text: str) -> str:
     lines = [line.rstrip() for line in raw.splitlines()]
     while lines and not lines[-1].strip():
         lines.pop()
-    while lines and lines[-1].strip().lower() == "@kindlysupport":
+    footer_tail = CHANNEL_FOOTER.strip().lower()
+    while lines and (
+        lines[-1].strip().lower() == "@kindlysupport"
+        or lines[-1].strip().lower() == footer_tail
+    ):
         lines.pop()
         while lines and not lines[-1].strip():
             lines.pop()
@@ -3466,6 +4286,31 @@ def _resend_preview_to_chat(post_id: int, chat_id: str | int) -> Optional[str]:
         return str(e)
 
 
+def _social_image_url(post: dict[str, Any]) -> str:
+    preview = _preview_payload_dict(post)
+    social_image_url = str(preview.get("social_image_url") or "").strip()
+    if social_image_url:
+        return social_image_url
+    return str(post.get("final_image_url") or "").strip()
+
+
+def _build_parable_image_variants(post_id: int, image_url: str) -> tuple[str, str]:
+    raw_url = (image_url or "").strip()
+    if not raw_url:
+        raise RuntimeError("empty image_url")
+    media_key = media_key_from_url(raw_url)
+    if media_key:
+        image_bytes, image_ctype = storage_get_bytes(media_key)
+    else:
+        image_bytes, image_ctype = download_remote_image(raw_url)
+    telegram_bytes, telegram_ctype = normalize_image_to_fit_box(image_bytes)
+    social_bytes, social_ctype = normalize_image_to_square_1024(image_bytes, image_ctype)
+    stamp = f"{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/post_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}"
+    telegram_url = storage_put_bytes(f"original/{stamp}_tg.jpg", telegram_bytes, telegram_ctype)
+    social_url = storage_put_bytes(f"original/{stamp}_social.jpg", social_bytes, social_ctype)
+    return telegram_url, social_url
+
+
 def _store_uploaded_image_data_url(post_id: int, image_data_url: str) -> str:
     raw = (image_data_url or "").strip()
     dm = re.match(r"^data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$", raw)
@@ -3487,8 +4332,28 @@ def generate_post_caption_markdown_limited(post: dict[str, Any], max_len: int = 
     title = (post.get("title") or "").strip()
     text_body = (post.get("text_body") or "").strip()
     if source_kind != "phrase":
-        raw = generate_caption(title, text_body)
-        return raw if len(raw) <= max_len else raw[: max_len - 1]
+        title_line = escape_markdown_v2(f"Притча: {title}")
+        tail = f"\n\n{CHANNEL_FOOTER_MD}"
+        available = max(0, max_len - len(title_line) - len("\n") - len(tail))
+        body_plain = (text_body or "").strip()
+        body_md = escape_markdown_v2(body_plain)
+        if len(body_md) > available:
+            trimmed = body_plain
+            while trimmed:
+                body_md = escape_markdown_v2(trimmed.rstrip())
+                if len(body_md) <= available:
+                    break
+                cut = max(0, min(len(trimmed) - 1, len(trimmed) - max(8, (len(body_md) - available))))
+                trimmed = trimmed[:cut].rstrip(" ,;:-")
+                trimmed = re.sub(r"\s+\S*$", "", trimmed).strip()
+            body_md = escape_markdown_v2(trimmed.rstrip()) if trimmed else ""
+        caption = f"{title_line}\n{body_md}{tail}" if body_md else f"{title_line}{tail}"
+        if len(caption) > max_len:
+            cap = caption[:max_len].rstrip("\\")
+            while cap.endswith("\\"):
+                cap = cap[:-1]
+            return cap
+        return caption
 
     quote, author = split_quote_and_author(title)
     phrase_title = _phrase_title_for_publish(quote or title)
@@ -3496,9 +4361,9 @@ def generate_post_caption_markdown_limited(post: dict[str, Any], max_len: int = 
 
     title_md = f"*{escape_markdown_v2(phrase_title)}*"
     if author:
-        title_md = f"{title_md} - {escape_markdown_v2(author)}"
+        title_md = f"{title_md}\n{escape_markdown_v2(author)}"
 
-    tail = f"\n\n{CHANNEL_FOOTER}"
+    tail = f"\n\n{CHANNEL_FOOTER_MD}"
     available = max(0, max_len - len(title_md) - len(tail) - 2)
     body_plain = body[:available].rstrip()
     # Keep paragraph break if truncation leaves enough content.
@@ -4989,18 +5854,34 @@ def local_ocr_extract_phrases_from_image(image_url: str, fast_mode: bool = False
 PRITCHI_SITEMAP_URL = "https://pritchi.ru/sitemap_parable.xml.gz"
 
 
-def _fetch_text_url(url: str, encoding: str = "utf-8", retries: int = 4) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+def _browser_headers(referer: str = "https://pritchi.ru/") -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": referer,
+    }
+
+
+def _fetch_text_url(url: str, encoding: str = "utf-8", retries: int = 6, max_bytes: int = 0) -> str:
+    req = urllib.request.Request(url, headers=_browser_headers())
+    if max_bytes > 0:
+        req.add_header("Range", f"bytes=0-{max(1024, max_bytes) - 1}")
     last_error: Optional[Exception] = None
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read()
+                raw = resp.read(max_bytes if max_bytes > 0 else -1)
             return raw.decode(encoding, errors="replace")
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code == 429:
-                time.sleep(min(30, 3 * (attempt + 1)))
+            if exc.code in {403, 429}:
+                time.sleep(min(90, 6 * (attempt + 1)))
                 continue
             if 500 <= exc.code < 600 and attempt + 1 < retries:
                 time.sleep(min(15, 2 * (attempt + 1)))
@@ -5018,7 +5899,7 @@ def _fetch_text_url(url: str, encoding: str = "utf-8", retries: int = 4) -> str:
 
 
 def fetch_pritchi_sitemap_urls() -> list[str]:
-    req = urllib.request.Request(PRITCHI_SITEMAP_URL, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(PRITCHI_SITEMAP_URL, headers=_browser_headers())
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read()
     try:
@@ -5033,6 +5914,27 @@ def fetch_pritchi_sitemap_urls() -> list[str]:
             seen.add(url)
             out.append(url)
     return out
+
+
+def scrape_pritchi_parable_title(url: str) -> dict[str, str]:
+    source_url = validate_public_http_url(url)
+    if "pritchi.ru/id_" not in source_url.lower():
+        raise HTTPException(status_code=400, detail="supported only for pritchi.ru/id_*")
+    html = _fetch_text_url(source_url, encoding="cp1251", max_bytes=65536)
+    title_match = re.search(r'<h1[^>]*class="[^"]*post-title[^"]*"[^>]*>(.*?)</h1>', html, flags=re.IGNORECASE | re.DOTALL)
+    if not title_match:
+        title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    ext_id_match = re.search(r"/id_(\d+)", source_url)
+    title = _strip_html_tags(title_match.group(1)) if title_match else ""
+    if title:
+        title = re.sub(r"\s*[|:-]\s*Притчи\.ру.*$", "", title, flags=re.IGNORECASE).strip()
+    if not title:
+        title = f"Притча #{ext_id_match.group(1)}" if ext_id_match else "Притча"
+    return {
+        "title": title,
+        "source_url": source_url,
+        "source_external_id": ext_id_match.group(1) if ext_id_match else "",
+    }
 
 
 def _strip_html_tags(html_fragment: str) -> str:
@@ -5111,6 +6013,8 @@ def upsert_parable(
     source_ref: str = "",
     source_published_at: str = "",
     tags: Optional[list[str]] = None,
+    is_stub: int = 0,
+    last_import_error: Optional[str] = None,
 ) -> dict[str, Any]:
     clean_title = re.sub(r"\s+", " ", (title or "").strip())
     clean_text = re.sub(r"\s+", " ", (text_body or "").strip())
@@ -5135,7 +6039,8 @@ def upsert_parable(
                 """
                 UPDATE parables
                 SET title = ?, text_body = ?, source_url = ?, source_site = ?, source_external_id = ?,
-                    category = ?, section_title = ?, source_ref = ?, source_published_at = ?, tags_json = ?, updated_at = ?
+                    category = ?, section_title = ?, source_ref = ?, source_published_at = ?, tags_json = ?,
+                    is_stub = ?, last_import_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -5149,6 +6054,8 @@ def upsert_parable(
                     source_ref.strip() or None,
                     source_published_at.strip() or None,
                     json.dumps(tags_json, ensure_ascii=False),
+                    int(is_stub),
+                    (last_import_error or "").strip() or None,
                     now,
                     existing["id"],
                 ),
@@ -5160,9 +6067,9 @@ def upsert_parable(
                 """
                 INSERT INTO parables (
                     title, text_body, source_url, source_site, source_external_id, category,
-                    section_title, source_ref, source_published_at, tags_json, created_at, updated_at
+                    section_title, source_ref, source_published_at, tags_json, is_stub, last_import_error, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING *
                 """,
                 (
@@ -5176,6 +6083,8 @@ def upsert_parable(
                     source_ref.strip() or None,
                     source_published_at.strip() or None,
                     json.dumps(tags_json, ensure_ascii=False),
+                    int(is_stub),
+                    (last_import_error or "").strip() or None,
                     now,
                     now,
                 ),
@@ -5185,9 +6094,9 @@ def upsert_parable(
             """
             INSERT INTO parables (
                 title, text_body, source_url, source_site, source_external_id, category,
-                section_title, source_ref, source_published_at, tags_json, created_at, updated_at
+                section_title, source_ref, source_published_at, tags_json, is_stub, last_import_error, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clean_title,
@@ -5200,6 +6109,82 @@ def upsert_parable(
                 source_ref.strip() or None,
                 source_published_at.strip() or None,
                 json.dumps(tags_json, ensure_ascii=False),
+                int(is_stub),
+                (last_import_error or "").strip() or None,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM parables WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return row_to_parable(row)
+
+
+def upsert_parable_stub(
+    *,
+    title: str,
+    source_url: str,
+    source_external_id: str = "",
+    source_site: str = "pritchi.ru",
+) -> dict[str, Any]:
+    clean_title = re.sub(r"\s+", " ", (title or "").strip())
+    clean_source_url = (source_url or "").strip()
+    if not clean_title or not clean_source_url:
+        raise HTTPException(status_code=400, detail="parable stub title and source_url required")
+    now = now_iso()
+    with db() as conn:
+        existing = conn.execute("SELECT * FROM parables WHERE source_url = ? LIMIT 1", (clean_source_url,)).fetchone()
+        if existing:
+            current_text = str(existing["text_body"] or "")
+            keep_text = current_text if current_text.strip() else ""
+            keep_stub = 0 if keep_text else 1
+            conn.execute(
+                """
+                UPDATE parables
+                SET title = ?, source_site = ?, source_external_id = ?, is_stub = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_title,
+                    source_site.strip() or None,
+                    source_external_id.strip() or None,
+                    keep_stub,
+                    now,
+                    existing["id"],
+                ),
+            )
+            row = conn.execute("SELECT * FROM parables WHERE id = ?", (existing["id"],)).fetchone()
+            return row_to_parable(row)
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO parables (
+                    title, text_body, source_url, source_site, source_external_id, tags_json, is_stub, created_at, updated_at
+                )
+                VALUES (?, '', ?, ?, ?, '[]', 1, ?, ?)
+                RETURNING *
+                """,
+                (
+                    clean_title,
+                    clean_source_url,
+                    source_site.strip() or None,
+                    source_external_id.strip() or None,
+                    now,
+                    now,
+                ),
+            ).fetchone()
+            return row_to_parable(row)
+        cur = conn.execute(
+            """
+            INSERT INTO parables (
+                title, text_body, source_url, source_site, source_external_id, tags_json, is_stub, created_at, updated_at
+            )
+            VALUES (?, '', ?, ?, ?, '[]', 1, ?, ?)
+            """,
+            (
+                clean_title,
+                clean_source_url,
+                source_site.strip() or None,
+                source_external_id.strip() or None,
                 now,
                 now,
             ),
@@ -5250,6 +6235,12 @@ def create_post_from_parable_entity(parable_id: int) -> dict[str, Any]:
     return fetch_post(post_id)
 
 
+def create_parable_post_and_preview(title: str, text_body: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    parable = upsert_parable(title=title, text_body=text_body)
+    post = create_post_from_parable_entity(int(parable["id"]))
+    return parable, post
+
+
 def import_pritchi_parables(limit: int = 0, offset: int = 0, crawl_delay_seconds: float = 3.0) -> dict[str, Any]:
     urls = fetch_pritchi_sitemap_urls()
     if offset > 0:
@@ -5274,7 +6265,82 @@ def import_pritchi_parables(limit: int = 0, offset: int = 0, crawl_delay_seconds
     return {"processed": len(urls), "imported": imported, "failed": failed, "last_error": last_error}
 
 
-def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024") -> dict[str, Any]:
+def seed_pritchi_parable_stubs(limit: int = 0, offset: int = 0, crawl_delay_seconds: float = 0.0) -> dict[str, Any]:
+    urls = fetch_pritchi_sitemap_urls()
+    if offset > 0:
+        urls = urls[offset:]
+    if limit and limit > 0:
+        urls = urls[:limit]
+    seeded = 0
+    failed = 0
+    last_error = ""
+    for idx, url in enumerate(urls, start=1):
+        try:
+            meta = scrape_pritchi_parable_title(url)
+            upsert_parable_stub(
+                title=meta["title"],
+                source_url=meta["source_url"],
+                source_external_id=meta.get("source_external_id") or "",
+            )
+            seeded += 1
+        except Exception as exc:
+            failed += 1
+            last_error = str(exc)[:300]
+            logger.exception("pritchi_seed_item_failed url=%s", url)
+        if idx % 200 == 0:
+            logger.info("pritchi_seed_progress processed=%s seeded=%s failed=%s", idx, seeded, failed)
+        if crawl_delay_seconds > 0 and idx < len(urls):
+            time.sleep(crawl_delay_seconds)
+    return {"processed": len(urls), "seeded": seeded, "failed": failed, "last_error": last_error}
+
+
+def import_pritchi_parables_resume(limit: int = 0, crawl_delay_seconds: float = 3.0) -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT source_url
+            FROM parables
+            WHERE coalesce(source_site,'') = 'pritchi.ru' AND (coalesce(is_stub,0) = 1 OR coalesce(text_body,'') = '')
+            ORDER BY CAST(coalesce(source_external_id,'0') AS INTEGER) ASC, id ASC
+            LIMIT ?
+            """,
+            (limit if limit > 0 else 1000000,),
+        ).fetchall()
+    imported = 0
+    failed = 0
+    last_error = ""
+    for idx, row in enumerate(rows, start=1):
+        source_url = str(row["source_url"] or "").strip()
+        if not source_url:
+            continue
+        try:
+            upsert_parable(**scrape_pritchi_parable(source_url), is_stub=0, last_import_error=None)
+            imported += 1
+        except Exception as exc:
+            failed += 1
+            last_error = str(exc)[:300]
+            logger.exception("pritchi_resume_item_failed url=%s", source_url)
+            try:
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE parables SET last_import_error = ?, updated_at = ? WHERE source_url = ?",
+                        (last_error, now_iso(), source_url),
+                    )
+            except Exception:
+                logger.exception("pritchi_resume_mark_error_failed url=%s", source_url)
+        if idx % 100 == 0:
+            logger.info("pritchi_resume_progress processed=%s imported=%s failed=%s", idx, imported, failed)
+        if crawl_delay_seconds > 0 and idx < len(rows):
+            time.sleep(crawl_delay_seconds)
+    return {"processed": len(rows), "imported": imported, "failed": failed, "last_error": last_error}
+
+
+def openrouter_generate_image(
+    post_id: int,
+    prompt: str,
+    size: str = "1024x1024",
+    normalize_square: bool = True,
+) -> dict[str, Any]:
     started = time.time()
     model = runtime_openrouter_image_model()
     status = "ok"
@@ -5365,7 +6431,10 @@ def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024"
                     except Exception:
                         pass
         if not image_url and image_bytes:
-            normalized_bytes, normalized_ctype = normalize_image_to_square_1024(image_bytes, image_mime)
+            if normalize_square:
+                normalized_bytes, normalized_ctype = normalize_image_to_square_1024(image_bytes, image_mime)
+            else:
+                normalized_bytes, normalized_ctype = normalize_image_to_fit_box(image_bytes)
             key = f"original/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/or_img_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
             image_url = storage_put_bytes(key, normalized_bytes, normalized_ctype)
         if image_url and isinstance(image_url, str) and image_url.startswith("data:image/"):
@@ -5375,7 +6444,10 @@ def openrouter_generate_image(post_id: int, prompt: str, size: str = "1024x1024"
                     raw_bytes = base64.b64decode(dm.group(2), validate=False)
                     mime_map = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg", "webp": "image/webp"}
                     detected_mime = mime_map.get(dm.group(1).lower(), "image/png")
-                    normalized_bytes, normalized_ctype = normalize_image_to_square_1024(raw_bytes, detected_mime)
+                    if normalize_square:
+                        normalized_bytes, normalized_ctype = normalize_image_to_square_1024(raw_bytes, detected_mime)
+                    else:
+                        normalized_bytes, normalized_ctype = normalize_image_to_fit_box(raw_bytes)
                     key = f"original/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/or_img_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
                     image_url = storage_put_bytes(key, normalized_bytes, normalized_ctype)
                 except Exception:
@@ -5928,6 +7000,43 @@ def extract_phrases_from_image(image_url: str, fast_mode: bool = False) -> tuple
     return llm_text or local_text, [], "llm"
 
 
+def extract_parable_text_from_images(images: list[str]) -> dict[str, Any]:
+    if not isinstance(images, list) or not images:
+        raise HTTPException(status_code=400, detail="images[] required")
+    texts: list[str] = []
+    engines: list[str] = []
+    for raw in images[:20]:
+        image_ref = str(raw or "").strip()
+        if not image_ref.startswith("data:image/"):
+            raise HTTPException(status_code=400, detail="each image must be data:image/* base64 URL")
+        text = ""
+        engine = ""
+        try:
+            text = local_ocr_extract_text_from_image(image_ref).strip()
+            engine = "local"
+        except Exception:
+            logger.exception("parable_local_ocr_failed")
+        if not text:
+            try:
+                text = openrouter_extract_text_from_image(image_ref).strip()
+                engine = "llm"
+            except Exception:
+                logger.exception("parable_llm_ocr_failed")
+        if text:
+            texts.append(text)
+            if engine:
+                engines.append(engine)
+    combined = "\n\n".join(part.strip() for part in texts if part and part.strip()).strip()
+    combined = re.sub(r"[ \t]+\n", "\n", combined)
+    combined = re.sub(r"\n{3,}", "\n\n", combined)
+    return {
+        "ok": True,
+        "ocr_text": combined,
+        "ocr_engine": "+".join(sorted(set(engines))) if engines else "",
+        "images_processed": min(len(images), 20),
+    }
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
         response = await call_next(request)
@@ -6032,6 +7141,7 @@ def startup() -> None:
     except Exception:
         logger.exception("phrase_author_backfill_failed")
     start_background_scheduler()
+    start_telegram_polling()
 
 
 @app.api_route("/media/{object_path:path}", methods=["GET", "HEAD"])
@@ -6085,6 +7195,14 @@ def run_daily_phrase_preview() -> bool:
     today_key = now_local.strftime("%Y-%m-%d")
     if kv_get("daily_phrase_offer_date") == today_key:
         return False
+    last_fail_raw = kv_get("daily_phrase_offer_last_fail_at")
+    if last_fail_raw:
+        try:
+            last_fail_dt = datetime.fromisoformat(last_fail_raw.replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - last_fail_dt.astimezone(timezone.utc)).total_seconds() < DAILY_AUTOPREVIEW_RETRY_BACKOFF_SECONDS:
+                return False
+        except Exception:
+            pass
 
     with db() as conn:
         phrase = conn.execute(
@@ -6115,10 +7233,37 @@ def run_daily_phrase_preview() -> bool:
         )
         kv_set("daily_phrase_offer_date", today_key)
         kv_set("daily_phrase_offer_phrase_id", str(phrase_id))
+        kv_delete("daily_phrase_offer_last_fail_at")
         return True
     except Exception:
         logger.exception("daily_phrase_offer_send_failed phrase_id=%s", phrase_id)
+        kv_set("daily_phrase_offer_last_fail_at", datetime.now(timezone.utc).isoformat())
         return False
+
+
+def _run_daily_phrase_generation_async(phrase_id: int, chat_id: str | int | None, source_message_id: Any) -> None:
+    try:
+        post = create_post_from_phrase(phrase_id, session_id="telegram-internal")
+        asyncio.run(
+            create_preview(
+                int(post["id"]),
+                _mock_request({"scenario": "", "regen_instruction": "", "text_idea": "", "scenario_idea": ""}),
+                session_id="telegram-internal",
+            )
+        )
+        if chat_id:
+            send_telegram_text(chat_id, f"Пост #{post['id']} сгенерирован и отправлен на согласование.")
+            if source_message_id is not None:
+                telegram_delete_message(chat_id, source_message_id)
+        kv_set("daily_phrase_offer_generated_date", now_msk().strftime("%Y-%m-%d"))
+        kv_set("daily_phrase_offer_generated_post_id", str(int(post["id"])))
+    except Exception as e:
+        logger.exception("daily_phrase_generate_failed phrase_id=%s", phrase_id)
+        if chat_id:
+            try:
+                send_telegram_text(chat_id, f"Не удалось сгенерировать пост по фразе: {str(e)[:220]}")
+            except Exception:
+                logger.exception("daily_phrase_generate_error_notify_failed phrase_id=%s", phrase_id)
 
 
 def scheduler_loop() -> None:
@@ -6137,6 +7282,49 @@ def start_background_scheduler() -> None:
     thread = Thread(target=scheduler_loop, daemon=True, name="ks-scheduler")
     thread.start()
     start_background_scheduler._started = True
+
+
+def telegram_polling_loop() -> None:
+    offset: int = 0
+    while True:
+        try:
+            updates = telegram_api(
+                "getUpdates",
+                {
+                    "offset": offset,
+                    "timeout": 30,
+                    "allowed_updates": ["message", "callback_query"],
+                },
+            )
+            items = ((updates or {}).get("result") or [])
+            for update in items:
+                try:
+                    update_id = int(update.get("update_id") or 0)
+                    if update_id >= offset:
+                        offset = update_id + 1
+                    if update.get("callback_query"):
+                        asyncio.run(_telegram_handle_callback(update))
+                    elif update.get("message"):
+                        asyncio.run(_telegram_handle_message(update))
+                except Exception:
+                    logger.exception("telegram_polling_update_failed update_id=%s", update.get("update_id"))
+        except Exception:
+            logger.exception("telegram_polling_loop_error")
+            time.sleep(5)
+
+
+def start_telegram_polling() -> None:
+    if getattr(start_telegram_polling, "_started", False):
+        return
+    if runtime_telegram_mode() != "polling" or not runtime_telegram_token():
+        return
+    try:
+        telegram_api("deleteWebhook", {"drop_pending_updates": False})
+    except Exception:
+        logger.exception("telegram_delete_webhook_before_polling_failed")
+    thread = Thread(target=telegram_polling_loop, daemon=True, name="ks-telegram-polling")
+    thread.start()
+    start_telegram_polling._started = True
 
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
@@ -6732,6 +7920,10 @@ async def create_parable(request: Request, session_id: Optional[str] = Cookie(de
         raise HTTPException(status_code=400, detail="title required")
     if mode == "manual":
         text_body = (payload.get("text_body") or "").strip()
+        images = payload.get("images") or []
+        if not text_body and images:
+            ocr = extract_parable_text_from_images(images if isinstance(images, list) else [])
+            text_body = str(ocr.get("ocr_text") or "").strip()
         if not text_body:
             raise HTTPException(status_code=400, detail="text_body required")
         return upsert_parable(title=title, text_body=text_body)
@@ -6754,6 +7946,18 @@ async def create_parable(request: Request, session_id: Optional[str] = Cookie(de
     raise HTTPException(status_code=400, detail="mode must be manual|link")
 
 
+@app.post("/api/parables/ocr-images-base64")
+async def ocr_parable_images_base64(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    images = payload.get("images") or []
+    if not isinstance(images, list) or not images:
+        raise HTTPException(status_code=400, detail="images[] required")
+    if len(images) > 20:
+        raise HTTPException(status_code=400, detail="max 20 images per batch")
+    return extract_parable_text_from_images(images)
+
+
 @app.post("/api/parables/import/pritchi")
 async def import_pritchi_parables_endpoint(
     request: Request,
@@ -6771,6 +7975,38 @@ async def import_pritchi_parables_endpoint(
     )
 
 
+@app.post("/api/parables/seed/pritchi")
+async def seed_pritchi_parables_endpoint(
+    request: Request,
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    limit = int(payload.get("limit") or 0)
+    offset = int(payload.get("offset") or 0)
+    crawl_delay_seconds = float(payload.get("crawl_delay_seconds") or 0.0)
+    return seed_pritchi_parable_stubs(
+        limit=max(0, limit),
+        offset=max(0, offset),
+        crawl_delay_seconds=max(0.0, crawl_delay_seconds),
+    )
+
+
+@app.post("/api/parables/import/pritchi-resume")
+async def import_pritchi_parables_resume_endpoint(
+    request: Request,
+    session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    limit = int(payload.get("limit") or 0)
+    crawl_delay_seconds = float(payload.get("crawl_delay_seconds") or 3.0)
+    return import_pritchi_parables_resume(
+        limit=max(0, limit),
+        crawl_delay_seconds=max(0.0, crawl_delay_seconds),
+    )
+
+
 @app.post("/api/parables/{parable_id}/posts")
 def create_post_from_parable_endpoint(
     parable_id: int,
@@ -6780,18 +8016,69 @@ def create_post_from_parable_endpoint(
     return create_post_from_parable_entity(parable_id)
 
 
+@app.delete("/api/parables/{parable_id}")
+def delete_parable_endpoint(parable_id: int, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    with db() as conn:
+        post_rows = conn.execute("SELECT id FROM posts WHERE source_url = ?", (f"parable:{parable_id}",)).fetchall()
+        conn.execute("DELETE FROM posts WHERE source_url = ?", (f"parable:{parable_id}",))
+        cur = conn.execute("DELETE FROM parables WHERE id = ?", (parable_id,))
+    if int(getattr(cur, "rowcount", 0) or 0) == 0:
+        raise HTTPException(status_code=404, detail="parable not found")
+    return {"ok": True, "parable_id": parable_id, "deleted_posts": len(post_rows)}
+
+
 @app.get("/api/parables")
 def list_parables(
     session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0, le=10000),
+    search: str = Query(default=""),
 ) -> list[dict[str, Any]]:
     ensure_auth(session_id)
     with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM parables ORDER BY id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
+        term = (search or "").strip()
+        if term:
+            if DB_BACKEND == "postgres":
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM parables
+                    WHERE
+                        to_tsvector('russian', coalesce(title,'') || ' ' || coalesce(text_body,'')) @@ plainto_tsquery('russian', ?)
+                        OR title ILIKE ?
+                        OR coalesce(category,'') ILIKE ?
+                        OR coalesce(source_ref,'') ILIKE ?
+                    ORDER BY
+                        ts_rank_cd(
+                            to_tsvector('russian', coalesce(title,'') || ' ' || coalesce(text_body,'')),
+                            plainto_tsquery('russian', ?)
+                        ) DESC,
+                        id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (term, f"%{term}%", f"%{term}%", f"%{term}%", term, limit, offset),
+                ).fetchall()
+            else:
+                like_q = f"%{term.lower()}%"
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM parables
+                    WHERE lower(title) LIKE ?
+                       OR lower(coalesce(text_body,'')) LIKE ?
+                       OR lower(coalesce(category,'')) LIKE ?
+                       OR lower(coalesce(source_ref,'')) LIKE ?
+                    ORDER BY id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (like_q, like_q, like_q, like_q, limit, offset),
+                ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM parables ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
     return [row_to_parable(r) for r in rows]
 
 
@@ -6829,6 +8116,9 @@ async def update_post_text(post_id: int, request: Request, session_id: Optional[
         _remember_previous_text(post_id, post, post.get("text_body") or "")
     update_post(post_id, **updates)
     latest = fetch_post(post_id)
+    if next_text is not None and next_text != (post.get("text_body") or ""):
+        _set_manual_text_lock(post_id, latest, True)
+        latest = fetch_post(post_id)
     if (
         "title" in updates
         and updates["title"] != (post.get("title") or "")
@@ -6860,11 +8150,15 @@ async def upload_post_image(post_id: int, request: Request, session_id: Optional
         raise HTTPException(status_code=400, detail="image_data_url required")
     original_image_url = _store_uploaded_image_data_url(post_id, image_data_url)
     final_image_url = original_image_url
+    social_image_url = ""
     if post.get("source_kind") == "phrase":
         final_image_url = render_phrase_card_image(str(post.get("title") or ""), original_image_url)
+    elif post.get("source_kind") == "parable":
+        final_image_url, social_image_url = _build_parable_image_variants(post_id, original_image_url)
     preview = _preview_payload_dict(post).copy()
     preview["original_image_url"] = original_image_url
     preview["base_image_url"] = original_image_url
+    preview["social_image_url"] = social_image_url
     preview["image_error"] = None
     preview["image_uploaded_manually_at"] = now_iso()
     update_post(
@@ -6922,109 +8216,182 @@ async def create_preview(post_id: int, request: Request, session_id: Optional[st
     ensure_auth(session_id)
     post = fetch_post(post_id)
     payload = await request.json()
-    scenario = (payload.get("scenario") or "").strip()
-    text_idea = (payload.get("text_idea") or "").strip()
-    scenario_idea = (payload.get("scenario_idea") or "").strip()
-    if text_idea and post.get("source_kind") == "phrase":
-        try:
-            new_text = expand_phrase_text(post["title"], instruction=text_idea, previous_text=post.get("text_body") or "")
-            if new_text:
-                update_post(post_id, text_body=new_text)
-                post = fetch_post(post_id)
-        except Exception:
-            logger.exception("preview_text_idea_failed post_id=%s", post_id)
-    post = ensure_phrase_post_ready_for_publish(post_id, post)
-    if not scenario:
-        scenario = generate_image_scenario(post["title"], post["text_body"], scenario_idea)
-    regen_instruction = (payload.get("regen_instruction") or "").strip()
-    caption = generate_caption(post["title"], post["text_body"])
-    if post.get("source_kind") == "phrase":
-        caption = generate_post_caption_plain(post)
-    image_prompt = generate_detailed_image_prompt(post["title"], post["text_body"], scenario, regen_instruction)
+    progress_chat_id = runtime_telegram_preview_chat() if runtime_telegram_token() else None
+    progress_message_id: Optional[str] = None
+    progress_text_stage = "pending"
+    progress_image_stage = "pending"
+    progress_build_stage = "pending"
 
-    image_url = None
-    prev_image_url = post.get("final_image_url")
-    original_image_url = None
-    image_error = None
+    def _progress_render() -> str:
+        icons = {"pending": "▫️", "running": "⏳", "done": "✅", "error": "❌", "skip": "➖"}
+        return "\n".join(
+            [
+                f"Пост #{post_id}",
+                f"{icons.get(progress_text_stage, '▫️')} Генерация текста",
+                f"{icons.get(progress_image_stage, '▫️')} Генерация картинки",
+                f"{icons.get(progress_build_stage, '▫️')} Сборка поста",
+            ]
+        )
+
+    def _progress_push() -> None:
+        nonlocal progress_message_id
+        if not progress_chat_id:
+            return
+        progress_message_id = telegram_upsert_status_message(
+            progress_chat_id,
+            _progress_render(),
+            current_message_id=progress_message_id,
+            track_post_id=post_id,
+        )
+
+    def _progress_finish(delete: bool = True) -> None:
+        if progress_chat_id and progress_message_id and delete:
+            telegram_delete_message(progress_chat_id, progress_message_id)
+
+    _progress_push()
     try:
-        result = openrouter_generate_image(post_id=post_id, prompt=image_prompt, size="1024x1024")
-        image_url = result["image_url"]
+        scenario = (payload.get("scenario") or "").strip()
+        text_idea = (payload.get("text_idea") or "").strip()
+        scenario_idea = (payload.get("scenario_idea") or "").strip()
+        if text_idea and post.get("source_kind") == "phrase":
+            try:
+                progress_text_stage = "running"
+                _progress_push()
+                new_text = expand_phrase_text(post["title"], instruction=text_idea, previous_text=post.get("text_body") or "")
+                if new_text:
+                    update_post(post_id, text_body=new_text)
+                    post = fetch_post(post_id)
+            except Exception:
+                progress_text_stage = "error"
+                _progress_push()
+                logger.exception("preview_text_idea_failed post_id=%s", post_id)
+                raise
+        if post.get("source_kind") == "phrase":
+            progress_text_stage = "running"
+            _progress_push()
+        post = ensure_phrase_post_ready_for_publish(post_id, post)
+        progress_text_stage = "done" if post.get("source_kind") == "phrase" else "skip"
+        _progress_push()
+        if not scenario:
+            scenario = generate_image_scenario(post["title"], post["text_body"], scenario_idea)
+        regen_instruction = (payload.get("regen_instruction") or "").strip()
+        caption = generate_caption(post["title"], post["text_body"])
+        if post.get("source_kind") == "phrase":
+            caption = generate_post_caption_plain(post)
+        image_prompt = generate_detailed_image_prompt(post["title"], post["text_body"], scenario, regen_instruction)
+        image_size = "1024x1536" if post.get("source_kind") == "parable" else "1024x1024"
+
+        image_url = None
+        social_image_url = ""
+        prev_image_url = post.get("final_image_url")
+        original_image_url = None
+        image_error = None
+        progress_image_stage = "running"
+        _progress_push()
         try:
-            existing_media_key = media_key_from_url(str(image_url))
-            if existing_media_key:
-                # Already stored in our media bucket.
-                original_image_url = str(image_url)
-            else:
-                original_bytes, original_ctype = download_remote_image(image_url)
-                normalized_bytes, normalized_ctype = normalize_image_to_square_1024(original_bytes, original_ctype)
-                original_key = f"original/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/post_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
-                original_image_url = storage_put_bytes(original_key, normalized_bytes, normalized_ctype)
-                image_url = original_image_url
+            result = openrouter_generate_image(
+                post_id=post_id,
+                prompt=image_prompt,
+                size=image_size,
+                normalize_square=post.get("source_kind") != "parable",
+            )
+            image_url = result["image_url"]
+            try:
+                existing_media_key = media_key_from_url(str(image_url))
+                if existing_media_key:
+                    original_image_url = str(image_url)
+                else:
+                    original_bytes, original_ctype = download_remote_image(image_url)
+                    if post.get("source_kind") == "parable":
+                        normalized_bytes, normalized_ctype = normalize_image_to_fit_box(original_bytes)
+                    else:
+                        normalized_bytes, normalized_ctype = normalize_image_to_square_1024(original_bytes, original_ctype)
+                    original_key = f"original/{datetime.now(MOSCOW_TZ).strftime('%Y/%m/%d')}/post_{post_id}_{int(time.time()*1000)}_{secrets.token_hex(4)}.jpg"
+                    original_image_url = storage_put_bytes(original_key, normalized_bytes, normalized_ctype)
+                    image_url = original_image_url
+            except Exception as e:
+                image_error = f"{image_error or ''} | original_store_error: {str(e)}".strip(" |")
+        except HTTPException as e:
+            image_error = e.detail
         except Exception as e:
-            image_error = f"{image_error or ''} | original_store_error: {str(e)}".strip(" |")
-    except HTTPException as e:
-        image_error = e.detail
-    except Exception as e:
-        image_error = str(e)
+            image_error = str(e)
 
-    # Phrase posts always get final local rendered card with dark overlay and title text.
-    if post.get("source_kind") == "phrase":
-        try:
-            image_url = render_phrase_card_image(post["title"], image_url)
-        except Exception as e:
-            image_error = f"{image_error or ''} | local_render_error: {str(e)}".strip(" |")
+        if post.get("source_kind") == "phrase":
+            try:
+                image_url = render_phrase_card_image(post["title"], image_url)
+            except Exception as e:
+                image_error = f"{image_error or ''} | local_render_error: {str(e)}".strip(" |")
+        progress_image_stage = "done" if (image_url or prev_image_url) else "error"
+        _progress_push()
 
-    # For phrase content we do not allow text-only preview: image is mandatory.
-    if post.get("source_kind") == "phrase" and not (image_url or prev_image_url):
-        raise HTTPException(status_code=502, detail=f"image generation failed: {image_error or 'no generated background image'}")
+        if post.get("source_kind") == "phrase" and not (image_url or prev_image_url):
+            progress_build_stage = "error"
+            _progress_push()
+            raise HTTPException(status_code=502, detail=f"image generation failed: {image_error or 'no generated background image'}")
 
-    base_image_url = original_image_url or image_url
+        if post.get("source_kind") == "parable" and image_url:
+            try:
+                image_url, social_image_url = _build_parable_image_variants(post_id, image_url)
+            except Exception as e:
+                image_error = f"{image_error or ''} | parable_variant_error: {str(e)}".strip(" |")
+                social_image_url = image_url or ""
 
-    preview = {
-        "chat": runtime_telegram_preview_chat(),
-        "buttons": ["Опубликовать", "Перегенерировать", "Заменить текст вручную", "Вернуть прошлый текст", "Отмена"],
-        "publish_options": ["Сейчас", "В указанное время и дату", "Заменить фразу"],
-        "regenerate_options": ["Текст", "Картинку", "И то и то"],
-        "note": "При перегенерации админ присылает текст-инструкцию, он учитывается в prompt изображения.",
-        "image_error": image_error,
-        "original_image_url": original_image_url,
-        "base_image_url": base_image_url,
-    }
-    update_post(
-        post_id,
-        status="preview_ready",
-        selected_scenario=scenario,
-        image_prompt=image_prompt,
-        final_image_url=image_url or prev_image_url,
-        telegram_caption=caption,
-        preview_payload_json=preview,
-        last_regen_instruction=regen_instruction or None,
-        published_message_id=None,
-        scheduled_for=None,
-    )
-    post = fetch_post(post_id)
-    tg_send = None
-    tg_error = None
-    try:
-        old_mid = get_preview_message_id_for_chat(post, runtime_telegram_preview_chat())
-        tg_send = telegram_send_preview(post)
-        result = (tg_send or {}).get("result") or {}
-        if result.get("message_id") is not None:
-            new_mid = str(result["message_id"])
-            set_preview_message_id_for_chat(post_id, post, runtime_telegram_preview_chat(), new_mid)
-            if old_mid and old_mid != new_mid:
-                telegram_delete_message(runtime_telegram_preview_chat(), old_mid)
-            post = fetch_post(post_id)
-    except HTTPException as e:
-        tg_error = e.detail
-    except Exception as e:
-        tg_error = str(e)
-    if tg_error:
-        preview = post.get("preview_payload") or {}
-        preview["telegram_send_error"] = tg_error
-        update_post(post_id, preview_payload_json=preview)
+        base_image_url = original_image_url or image_url
+
+        preview = {
+            "chat": runtime_telegram_preview_chat(),
+            "buttons": ["Опубликовать", "Перегенерировать", "Заменить текст вручную", "Вернуть прошлый текст", "Отмена"],
+            "publish_options": ["Сейчас", "В указанное время и дату", "Заменить фразу"],
+            "regenerate_options": ["Текст", "Картинку", "И то и то"],
+            "note": "При перегенерации админ присылает текст-инструкцию, он учитывается в prompt изображения.",
+            "image_error": image_error,
+            "original_image_url": original_image_url,
+            "base_image_url": base_image_url,
+            "social_image_url": social_image_url or "",
+        }
+        update_post(
+            post_id,
+            status="preview_ready",
+            selected_scenario=scenario,
+            image_prompt=image_prompt,
+            final_image_url=image_url or prev_image_url,
+            telegram_caption=caption,
+            preview_payload_json=preview,
+            last_regen_instruction=regen_instruction or None,
+            published_message_id=None,
+            scheduled_for=None,
+        )
         post = fetch_post(post_id)
-    return post
+        tg_error = None
+        progress_build_stage = "running"
+        _progress_push()
+        try:
+            old_mid = get_preview_message_id_for_chat(post, runtime_telegram_preview_chat())
+            tg_send = telegram_send_preview(post)
+            result = (tg_send or {}).get("result") or {}
+            if result.get("message_id") is not None:
+                new_mid = str(result["message_id"])
+                set_preview_message_id_for_chat(post_id, post, runtime_telegram_preview_chat(), new_mid)
+                if old_mid and old_mid != new_mid:
+                    telegram_delete_message(runtime_telegram_preview_chat(), old_mid)
+                post = fetch_post(post_id)
+        except HTTPException as e:
+            tg_error = e.detail
+        except Exception as e:
+            tg_error = str(e)
+        if tg_error:
+            progress_build_stage = "error"
+            _progress_push()
+            preview = post.get("preview_payload") or {}
+            preview["telegram_send_error"] = tg_error
+            update_post(post_id, preview_payload_json=preview)
+            post = fetch_post(post_id)
+            return post
+        progress_build_stage = "done"
+        _progress_push()
+        return post
+    finally:
+        _progress_finish(delete=True)
 
 
 @app.post("/api/posts/{post_id}/regenerate")
@@ -7038,13 +8405,24 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
     scenario_instruction = instr_parts.get("scenario") or instr_parts.get("common") or instruction
     progress_chat_id = payload.get("progress_chat_id")
     progress_enabled = bool(payload.get("progress"))
+    progress_message_id: Optional[str] = None
 
     def _progress(message: str) -> None:
+        nonlocal progress_message_id
         if progress_enabled and progress_chat_id:
             try:
-                send_telegram_text(progress_chat_id, message, track_post_id=post_id)
+                progress_message_id = telegram_upsert_status_message(
+                    progress_chat_id,
+                    message,
+                    current_message_id=progress_message_id,
+                    track_post_id=post_id,
+                )
             except Exception:
                 logger.exception("telegram_progress_send_failed post_id=%s message=%s", post_id, message)
+
+    def _progress_finish(delete: bool = True) -> None:
+        if progress_enabled and progress_chat_id and progress_message_id and delete:
+            telegram_delete_message(progress_chat_id, progress_message_id)
 
     post = fetch_post(post_id)
     if target not in ("text", "image", "both"):
@@ -7114,8 +8492,9 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
                 previous_text=previous_text_body,
             )
             text_body = (generated or "").strip() or text_body
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"text generation failed: {str(e)}")
+        except Exception:
+            logger.exception("phrase_regenerate_failed post_id=%s", post_id)
+            raise HTTPException(status_code=502, detail="Phrase text generation failed")
         # Rebuild scenario from fresh text for consistency in subsequent image regenerations.
         try:
             scenario = generate_image_scenario(title, text_body, scenario_instruction or "")
@@ -7124,6 +8503,8 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
         if text_body.strip() and text_body.strip() != previous_text_body:
             _remember_previous_text(post_id, post, previous_text_body)
         update_post(post_id, text_body=text_body)
+        latest = fetch_post(post_id)
+        _set_manual_text_lock(post_id, latest, False)
         if scenario:
             update_post(post_id, selected_scenario=scenario)
         # Text-only regeneration must not touch the image pipeline.
@@ -7209,6 +8590,7 @@ async def regenerate_preview(post_id: int, request: Request, session_id: Optiona
     _mark_post_dirty_for_republish(post_id, latest)
     latest = fetch_post(post_id)
     update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
+    _progress_finish(delete=True)
     return fetch_post(post_id)
 
 
@@ -7645,11 +9027,13 @@ def create_post_from_phrase(phrase_id: int, session_id: Optional[str] = Cookie(d
 @app.get("/api/phrases")
 def list_phrases(
     session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
-    limit: int = Query(default=1000, ge=1, le=5000),
+    limit: int = Query(default=100, ge=1, le=5000),
     offset: int = Query(default=0, ge=0, le=20000),
     status: str = Query(default="all"),
     search: str = Query(default=""),
     topic: str = Query(default=""),
+    sort_by: str = Query(default="created_at"),
+    sort_direction: str = Query(default="desc"),
 ) -> list[dict[str, Any]]:
     ensure_auth(session_id)
     where = []
@@ -7659,21 +9043,95 @@ def list_phrases(
         where.append("coalesce(is_published,0)=0")
     elif status in {"1", "published"}:
         where.append("coalesce(is_published,0)=1")
-    if search.strip():
-        where.append("(lower(text_body) LIKE ? OR lower(coalesce(author,'')) LIKE ?)")
-        like_q = f"%{search.strip().lower()}%"
+    term = search.strip()
+    if term:
+        if DB_BACKEND == "postgres":
+            where.append("(text_body ILIKE ? OR coalesce(author,'') ILIKE ?)")
+            like_q = f"%{term}%"
+        else:
+            where.append("(lower(text_body) LIKE ? OR lower(coalesce(author,'')) LIKE ?)")
+            like_q = f"%{term.lower()}%"
         params.append(like_q)
         params.append(like_q)
     if topic.strip():
         where.append("lower(coalesce(topic,'')) LIKE ?")
         params.append(f"%{topic.strip().lower()}%")
+    order_field = "text_body" if (sort_by or "").strip().lower() == "text" else "created_at"
+    order_dir = "ASC" if (sort_direction or "").strip().lower() == "asc" else "DESC"
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     with db() as conn:
         rows = conn.execute(
-            f"SELECT id, text_body, author, topic, is_published, created_at, updated_at FROM phrases {where_sql} ORDER BY id ASC LIMIT ? OFFSET ?",
+            f"SELECT id, text_body, author, topic, is_published, created_at, updated_at FROM phrases {where_sql} ORDER BY {order_field} {order_dir}, id DESC LIMIT ? OFFSET ?",
             (*params, limit, offset),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/phrases/stats")
+def phrases_stats(session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, int]:
+    ensure_auth(session_id)
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN coalesce(is_published,0)=0 THEN 1 ELSE 0 END) AS new_count,
+                SUM(CASE WHEN coalesce(is_published,0)=1 THEN 1 ELSE 0 END) AS published_count
+            FROM phrases
+            """
+        ).fetchone()
+    return {
+        "total": int((row["total"] if row and row["total"] is not None else 0) or 0),
+        "new_count": int((row["new_count"] if row and row["new_count"] is not None else 0) or 0),
+        "published_count": int((row["published_count"] if row and row["published_count"] is not None else 0) or 0),
+    }
+
+
+@app.post("/api/phrases")
+async def create_phrase(request: Request, session_id: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    ensure_auth(session_id)
+    payload = await request.json()
+    raw_text = str(payload.get("text_body") or "").strip()
+    author = str(payload.get("author") or "").strip()
+    is_published = int(payload.get("is_published", 0) or 0)
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="text_body is required")
+    quote_text, parsed_author = split_quote_and_author(raw_text)
+    text_body = quote_text.strip()
+    if parsed_author and not author:
+        author = parsed_author.strip()
+    if not text_body:
+        raise HTTPException(status_code=400, detail="empty phrase")
+    now = now_iso()
+    with db() as conn:
+        similar, score = find_similar_phrase_in_db(text_body, conn=conn)
+        if similar:
+            return {
+                "ok": True,
+                "created": False,
+                "duplicate": True,
+                "duplicate_score": round(float(score), 4),
+                "phrase": similar,
+            }
+        if DB_BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO phrases(text_body, author, is_published, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                RETURNING id, text_body, author, topic, is_published, created_at, updated_at
+                """,
+                (text_body, author or None, is_published, now, now),
+            ).fetchone()
+        else:
+            conn.execute(
+                "INSERT INTO phrases(text_body, author, is_published, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (text_body, author or None, is_published, now, now),
+            )
+            row = conn.execute(
+                "SELECT id, text_body, author, topic, is_published, created_at, updated_at FROM phrases WHERE text_body = ? LIMIT 1",
+                (text_body,),
+            ).fetchone()
+    return {"ok": True, "created": True, "phrase": dict(row) if row else None}
 
 
 @app.post("/api/phrases/backfill-authors")
@@ -8348,8 +9806,11 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
         )
         return {"ok": True}
     if text == "/new_post":
-        tg_state_set(int(user_id), "await_manual_phrase_text", {})
-        send_telegram_text(chat.get("id"), "Пришли текст фразы одним сообщением. Потом подтверждение Да/Нет.")
+        _send_random_phrase_offer(chat.get("id"))
+        return {"ok": True}
+    if text in {"/new_parable", "новая притча", "Новая притча"}:
+        tg_state_set(int(user_id), "await_parable_title", {})
+        send_telegram_text(chat.get("id"), "Пришли заголовок притчи одним сообщением.")
         return {"ok": True}
     if text == "/add_phrases":
         tg_state_set(int(user_id), "await_add_phrase_input", {})
@@ -8364,13 +9825,13 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
         if text and text.startswith("/"):
             send_telegram_text(
                 chat.get("id"),
-                "Команда не распознана. Доступно: /start, /new_post, /add_phrases",
+                "Команда не распознана. Доступно: /start, /new_post, /new_parable, /add_phrases",
                 reply_markup=build_manual_create_keyboard(),
             )
         elif text:
             send_telegram_text(
                 chat.get("id"),
-                "Готов к работе. Выбери действие кнопкой ниже или используй /new_post и /add_phrases.",
+                "Готов к работе. Выбери действие кнопкой ниже или используй /new_post, /new_parable и /add_phrases.",
                 reply_markup=build_manual_create_keyboard(),
             )
         else:
@@ -8448,6 +9909,8 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
         _remember_previous_text(post_id, post, post.get("text_body") or "")
         update_post(post_id, text_body=new_text_body)
         latest = fetch_post(post_id)
+        _set_manual_text_lock(post_id, latest, True)
+        latest = fetch_post(post_id)
         _mark_post_dirty_for_republish(post_id, latest)
         latest = fetch_post(post_id)
         update_post(post_id, telegram_caption=generate_post_caption_plain(latest))
@@ -8512,6 +9975,64 @@ async def _telegram_handle_message(update: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
     if st == "await_manual_phrase_confirm":
         send_telegram_text(chat.get("id"), "Нажми кнопку Да/Нет под сообщением, чтобы продолжить.")
+        return {"ok": True}
+    if st == "await_parable_title":
+        title = text.strip()
+        if not title:
+            send_telegram_text(chat.get("id"), "Заголовок пустой. Пришли заголовок притчи ещё раз.")
+            return {"ok": True}
+        tg_state_set(int(user_id), "await_parable_content", {"title": title, "images": []})
+        send_telegram_text(
+            chat.get("id"),
+            (
+                f"Заголовок сохранен: {title}\n\n"
+                "Теперь пришли текст притчи или фотографии страниц. Можно отправить несколько изображений подряд."
+            ),
+            reply_markup=build_parable_draft_keyboard(can_generate=False),
+        )
+        return {"ok": True}
+    if st == "await_parable_content":
+        draft = dict(payload)
+        draft_images = draft.get("images")
+        if not isinstance(draft_images, list):
+            draft_images = []
+        photos = msg.get("photo") or []
+        if photos:
+            best = photos[-1]
+            file_id = best.get("file_id")
+            if not file_id:
+                send_telegram_text(chat.get("id"), "Не нашёл file_id у картинки. Попробуй ещё раз.")
+                return {"ok": True}
+            try:
+                draft_images.append(telegram_file_data_url(str(file_id)))
+            except Exception as e:
+                send_telegram_text(chat.get("id"), f"Не удалось принять картинку: {str(e)[:220]}")
+                return {"ok": True}
+            draft["images"] = draft_images
+            tg_state_set(int(user_id), "await_parable_content", draft)
+            send_telegram_text(
+                chat.get("id"),
+                _parable_draft_summary(draft),
+                reply_markup=build_parable_draft_keyboard(can_generate=bool(draft.get("text_body") or draft_images)),
+            )
+            return {"ok": True}
+        raw = (text or "").strip()
+        if not raw:
+            send_telegram_text(
+                chat.get("id"),
+                "Пришли текст притчи или изображения страниц.",
+                reply_markup=build_parable_draft_keyboard(can_generate=bool(draft.get("text_body") or draft_images)),
+            )
+            return {"ok": True}
+        existing_text = str((draft.get("text_body") or "")).strip()
+        draft["text_body"] = f"{existing_text}\n\n{raw}".strip() if existing_text else raw
+        draft["images"] = draft_images
+        tg_state_set(int(user_id), "await_parable_content", draft)
+        send_telegram_text(
+            chat.get("id"),
+            _parable_draft_summary(draft),
+            reply_markup=build_parable_draft_keyboard(can_generate=True),
+        )
         return {"ok": True}
     if st == "await_manual_post_idea_decision":
         send_telegram_text(chat.get("id"), "Нажми Да/Нет: есть идеи для текста/картинки или генерируем автоматически.")
@@ -8622,7 +10143,7 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             answer_callback(cb_id, "Нет доступа")
         return {"ok": True}
     action, post_id, extra = _parse_callback_data(data)
-    if action in {"manual", "manualsave", "manualidea", "addphrases", "addphrase", "addbulk", "dailygen", "dailyswap"}:
+    if action in {"manual", "manualsave", "manualidea", "addphrases", "addphrase", "addbulk", "dailygen", "dailyswap", "newparable", "parablegen", "parableclear", "parablecancel"}:
         pass
     elif not post_id:
         if cb_id:
@@ -8635,6 +10156,86 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
         if chat_id:
             send_telegram_text(chat_id, "Пришли текст фразы одним сообщением. После этого спрошу подтверждение Да/Нет.")
         return {"ok": True}
+    if action == "newparable":
+        tg_state_set(int(user_id), "await_parable_title", {})
+        if cb_id:
+            answer_callback(cb_id, "Пришли заголовок")
+        if chat_id:
+            send_telegram_text(chat_id, "Пришли заголовок притчи одним сообщением.")
+        return {"ok": True}
+    if action == "parableclear":
+        state = tg_state_get(int(user_id))
+        if not state or state.get("state") != "await_parable_content":
+            if cb_id:
+                answer_callback(cb_id, "Нет черновика")
+            return {"ok": True}
+        title = str(((state.get("payload") or {}).get("title") or "")).strip()
+        tg_state_set(int(user_id), "await_parable_content", {"title": title, "images": []})
+        if cb_id:
+            answer_callback(cb_id, "Черновик очищен")
+        if chat_id:
+            send_telegram_text(
+                chat_id,
+                _parable_draft_summary({"title": title, "images": []}),
+                reply_markup=build_parable_draft_keyboard(can_generate=False),
+            )
+        return {"ok": True}
+    if action == "parablecancel":
+        tg_state_clear(int(user_id))
+        if cb_id:
+            answer_callback(cb_id, "Отменено")
+        if chat_id:
+            send_telegram_text(chat_id, "Создание притчи отменено.", reply_markup=build_manual_create_keyboard())
+        return {"ok": True}
+    if action == "parablegen":
+        state = tg_state_get(int(user_id))
+        if not state or state.get("state") != "await_parable_content":
+            if cb_id:
+                answer_callback(cb_id, "Нет черновика притчи")
+            if chat_id:
+                send_telegram_text(chat_id, "Нет черновика притчи. Нажми «Новая притча» и начни заново.")
+            return {"ok": True}
+        draft = dict(state.get("payload") or {})
+        title = str((draft.get("title") or "")).strip()
+        text_body = str((draft.get("text_body") or "")).strip()
+        images = draft.get("images") or []
+        if not text_body and images:
+            try:
+                ocr = extract_parable_text_from_images(images if isinstance(images, list) else [])
+                text_body = str(ocr.get("ocr_text") or "").strip()
+            except Exception as e:
+                if cb_id:
+                    answer_callback(cb_id, "Ошибка OCR")
+                if chat_id:
+                    send_telegram_text(chat_id, f"Не удалось распознать текст притчи: {str(e)[:220]}")
+                return {"ok": True}
+        if not title or not text_body:
+            if cb_id:
+                answer_callback(cb_id, "Не хватает данных")
+            if chat_id:
+                send_telegram_text(
+                    chat_id,
+                    "Нужны заголовок и текст притчи. Можно прислать текст руками или приложить изображения страниц.",
+                    reply_markup=build_parable_draft_keyboard(can_generate=bool(text_body or images)),
+                )
+            return {"ok": True}
+        tg_state_clear(int(user_id))
+        if cb_id:
+            answer_callback(cb_id, "Генерирую пост")
+        try:
+            parable, post = create_parable_post_and_preview(title, text_body)
+            await create_preview(
+                int(post["id"]),
+                _mock_request({"scenario": "", "regen_instruction": ""}),
+                session_id="telegram-internal",
+            )  # type: ignore[arg-type]
+            if chat_id:
+                send_telegram_text(chat_id, f"Создано: притча #{parable['id']}, пост #{post['id']}. Превью отправлено.")
+            return {"ok": True}
+        except Exception as e:
+            if chat_id:
+                send_telegram_text(chat_id, f"Ошибка создания притчи: {str(e)[:300]}")
+            return {"ok": True}
     if action == "manualsave":
         decision = (extra or "").strip().lower()
         state = tg_state_get(int(user_id))
@@ -8798,33 +10399,16 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
     if action == "dailyswap":
         _delete_callback_source_message(cq)
         current_phrase_id = int(post_id or 0)
-        with db() as conn:
-            phrase = conn.execute(
-                "SELECT id, text_body FROM phrases WHERE coalesce(is_published,0)=0 AND id <> ? ORDER BY random() LIMIT 1",
-                (current_phrase_id,),
-            ).fetchone()
+        phrase = _pick_random_unpublished_phrase(exclude_phrase_id=current_phrase_id)
         if not phrase:
             if cb_id:
                 answer_callback(cb_id, "Других новых фраз пока нет")
             return {"ok": True}
-        new_phrase_id = int(phrase["id"])
-        new_phrase_text = str(phrase["text_body"] or "").strip()
-        today_key = now_msk().strftime("%Y-%m-%d")
-        kv_set("daily_phrase_offer_date", today_key)
-        kv_set("daily_phrase_offer_phrase_id", str(new_phrase_id))
         if cb_id:
             answer_callback(cb_id, "Фраза заменена")
         if chat_id:
             old_mid = msg.get("message_id")
-            send_telegram_text(
-                chat_id,
-                (
-                    "Фраза дня обновлена.\n\n"
-                    f"{new_phrase_text}\n\n"
-                    "Выберите действие:"
-                ),
-                reply_markup=build_daily_phrase_keyboard(new_phrase_id),
-            )
+            _send_random_phrase_offer(chat_id, exclude_phrase_id=current_phrase_id)
             if old_mid is not None:
                 telegram_delete_message(chat_id, old_mid)
         return {"ok": True}
@@ -8839,24 +10423,12 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             answer_callback(cb_id, "Генерация запущена")
         if chat_id:
             send_telegram_text(chat_id, "Запускаю генерацию поста по выбранной фразе...")
-        try:
-            post = create_post_from_phrase(phrase_id, session_id="telegram-internal")
-            await create_preview(
-                int(post["id"]),
-                _mock_request({"scenario": "", "regen_instruction": "", "text_idea": "", "scenario_idea": ""}),
-                session_id="telegram-internal",
-            )  # type: ignore[arg-type]
-            if chat_id:
-                send_telegram_text(chat_id, f"Пост #{post['id']} сгенерирован и отправлен на согласование.")
-                old_mid = msg.get("message_id")
-                if old_mid is not None:
-                    telegram_delete_message(chat_id, old_mid)
-            kv_set("daily_phrase_offer_generated_date", now_msk().strftime("%Y-%m-%d"))
-            kv_set("daily_phrase_offer_generated_post_id", str(int(post["id"])))
-        except Exception as e:
-            logger.exception("daily_phrase_generate_failed phrase_id=%s", phrase_id)
-            if chat_id:
-                send_telegram_text(chat_id, f"Не удалось сгенерировать пост по фразе: {str(e)[:220]}")
+        Thread(
+            target=_run_daily_phrase_generation_async,
+            args=(phrase_id, chat_id, msg.get("message_id")),
+            daemon=True,
+            name=f"dailygen-{phrase_id}",
+        ).start()
         return {"ok": True}
     if action == "cancel":
         update_post(post_id, status="cancelled")
@@ -8883,21 +10455,37 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
             )
         return {"ok": True}
     if action == "edittext":
-        _delete_callback_source_message(cq)
         tg_state_set(int(user_id), "await_manual_text_replace", {"post_id": post_id})
-        if cb_id:
-            answer_callback(cb_id, "Пришли новый текст")
-        if chat_id:
-            send_telegram_text(
-                chat_id,
-                (
-                    "Пришли текст для ручной замены.\n"
-                    "Можно отправить только тело поста.\n"
-                    "Если пришлёшь весь пост целиком, система возьмёт текст между заголовком и @kindlysupport.\n"
-                    "LLM здесь не используется."
-                ),
-                track_post_id=post_id,
-            )
+        def _send_edittext_prompt() -> None:
+            try:
+                if cb_id:
+                    answer_callback(cb_id, "Пришли новый текст")
+            except Exception:
+                logger.exception("edittext_answer_callback_failed post_id=%s", post_id)
+            try:
+                _delete_callback_source_message(cq)
+            except Exception:
+                logger.exception("edittext_delete_source_failed post_id=%s", post_id)
+            if chat_id:
+                try:
+                    send_telegram_text(
+                        chat_id,
+                        (
+                            "Пришли текст для ручной замены.\n"
+                            "Можно отправить только тело поста.\n"
+                            "Если пришлёшь весь пост целиком, система возьмёт текст между заголовком и @kindlysupport.\n"
+                            "LLM здесь не используется."
+                        ),
+                        track_post_id=post_id,
+                    )
+                except Exception:
+                    logger.exception("edittext_prompt_send_failed post_id=%s", post_id)
+
+        Thread(
+            target=_send_edittext_prompt,
+            daemon=True,
+            name=f"edittext-{post_id}",
+        ).start()
         return {"ok": True}
     if action == "restoretext":
         _delete_callback_source_message(cq)
@@ -8918,6 +10506,8 @@ async def _telegram_handle_callback(update: dict[str, Any]) -> dict[str, Any]:
         preview["previous_text_body"] = current_text
         preview["previous_text_saved_at"] = now_iso()
         update_post(post_id, text_body=previous_text, preview_payload_json=preview)
+        latest = fetch_post(post_id)
+        _set_manual_text_lock(post_id, latest, True)
         latest = fetch_post(post_id)
         _mark_post_dirty_for_republish(post_id, latest, preview_override=preview)
         latest = fetch_post(post_id)

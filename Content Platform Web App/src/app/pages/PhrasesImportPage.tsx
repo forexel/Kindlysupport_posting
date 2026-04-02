@@ -27,6 +27,7 @@ interface OCRResult {
 
 export function PhrasesImportPage() {
   const [textInput, setTextInput] = useState('');
+  const [textImportAuthor, setTextImportAuthor] = useState('');
   const [defaultStatus, setDefaultStatus] = useState<'0' | '1'>('0');
   const [files, setFiles] = useState<OCRResult[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -35,12 +36,14 @@ export function PhrasesImportPage() {
     const lines = textInput.split('\n').filter((line) => line.trim());
     if (!lines.length) return;
     try {
+      const commonAuthor = textImportAuthor.trim();
       const res = await api<{ parsed: number; inserted: number; updated: number }>('/api/phrases/import-text', 'POST', {
-        raw_text: lines.join('\n'),
+        phrases_struct: lines.map((line) => ({ text_body: line.trim(), author: commonAuthor })),
         is_published: Number(defaultStatus),
       });
       toast.success(`Импорт: parsed=${res.parsed}, inserted=${res.inserted}, updated=${res.updated}`);
       setTextInput('');
+      setTextImportAuthor('');
     } catch (e: any) {
       toast.error(String(e?.message || e));
     }
@@ -301,6 +304,18 @@ export function PhrasesImportPage() {
               <Label htmlFor="phrases-text" className="text-zinc-200">Текст фраз (одна фраза = одна строка)</Label>
               <Textarea id="phrases-text" value={textInput} onChange={(e) => setTextInput(e.target.value)} placeholder="Введите фразы, каждая с новой строки..." rows={10} className="bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 resize-none" />
               <p className="text-sm text-zinc-500">Обнаружено строк: {linesCount}</p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="phrases-author" className="text-zinc-200">Автор для всех строк</Label>
+              <Input
+                id="phrases-author"
+                value={textImportAuthor}
+                onChange={(e) => setTextImportAuthor(e.target.value)}
+                placeholder="Например: Омар Хайям"
+                className="bg-zinc-800 border-zinc-700 text-zinc-100 placeholder:text-zinc-500"
+              />
+              <p className="text-sm text-zinc-500">Если автор уже указан внутри строки, он всё равно будет распознан отдельно на сервере.</p>
             </div>
 
             <div className="space-y-3">

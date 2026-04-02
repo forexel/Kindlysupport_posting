@@ -28,6 +28,11 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-kindlysupport-media}
       MINIO_SECURE: ${MINIO_SECURE:-0}
       INSTAGRAM_PROXY_URL: ${INSTAGRAM_PROXY_URL:-}
+      TELEGRAM_API_BASE_URL: ${TELEGRAM_API_BASE_URL:-https://api.telegram.org}
+    volumes:
+      - ./app.py:/app/app.py:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${APP_PORT:-18210}:8000"
     networks:
